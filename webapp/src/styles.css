@@ -287,3 +287,14 @@ input.field:focus { border-color: var(--accent); }
   50% { transform: rotate(2deg) scale(1.06); }
   100% { transform: rotate(-2deg) scale(1.03); }
 }
+
+/* ---------- drag-n-drop на merge-доске ---------- */
+.board { touch-action: none; position: relative; user-select: none; }
+.cell.drag-source { border-color: var(--accent); }
+.cell.drop-over { border-color: rgba(255,255,255,0.35); transform: scale(1.05); }
+.drag-ghost {
+  position: absolute; z-index: 30; font-size: 38px;
+  transform: translate(-50%, -60%) scale(1.15);
+  pointer-events: none;
+  filter: drop-shadow(0 6px 10px rgba(0,0,0,0.45));
+}

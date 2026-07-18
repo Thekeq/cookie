@@ -40,7 +40,7 @@ const dict = {
   passive_hint: { en: 'Cookies lvl 3+ generate income', uk: 'Печиво 3+ рівня приносить дохід', ru: 'Печеньки 3+ уровня приносят доход' },
   board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },
   buy_cookie: { en: 'Buy cookie', uk: 'Купити печиво', ru: 'Купить печеньку' },
-  merge_hint: { en: 'Tap a cookie, then another same one to merge. Max unlocked:', uk: 'Тапни печиво, потім таке саме — вони зіллються. Максимум відкрито:', ru: 'Тапни печеньку, потом вторую такую же — они сольются. Максимум открыт:' },
+  merge_hint: { en: 'Drag a cookie onto the same one to merge. Max unlocked:', uk: 'Перетягни печиво на таке саме — вони зіллються. Максимум відкрито:', ru: 'Перетащи печеньку на такую же — они сольются. Максимум открыт:' },
   merged_lvl: { en: 'Created a level {n} cookie!', uk: 'Створено печиво {n} рівня!', ru: 'Создана печенька {n} уровня!' },
 
   // уровни
@@ -196,7 +196,7 @@ const dict = {
   tut_1_title: { en: 'Tap the cookie!', uk: 'Тапай печиво!', ru: 'Тапай печеньку!' },
   tut_1_text: { en: 'Every tap gives you cookies — the main currency. Taps use energy, which refills over time.', uk: 'Кожен тап дає печиво — головну валюту. Тапи витрачають енергію, вона відновлюється з часом.', ru: 'Каждый тап даёт печеньки — основную валюту. Тапы тратят энергию, она восстанавливается со временем.' },
   tut_2_title: { en: 'Merge cookies', uk: "З'єднуй печиво", ru: 'Соединяй печеньки' },
-  tut_2_text: { en: 'Buy cookies on the 5×5 board and merge two identical ones into a higher level. Level 3+ cookies earn passive income!', uk: 'Купуй печиво на дошці 5×5 та з\'єднуй два однакових у вищий рівень. Печиво 3+ рівня приносить пасивний дохід!', ru: 'Покупай печеньки на доске 5×5 и соединяй две одинаковые в более высокий уровень. Печеньки 3+ уровня приносят пассивный доход!' },
+  tut_2_text: { en: 'Buy cookies on the 5×5 board and drag one onto an identical one to merge into a higher level. Level 3+ cookies earn passive income!', uk: 'Купуй печиво на дошці 5×5 і перетягуй одне на таке саме, щоб з\'єднати у вищий рівень. Печиво 3+ рівня приносить пасивний дохід!', ru: 'Покупай печеньки на доске 5×5 и перетаскивай одну на такую же, чтобы соединить в более высокий уровень. Печеньки 3+ уровня приносят пассивный доход!' },
   tut_3_title: { en: 'Build your farm', uk: 'Будуй ферму', ru: 'Строй ферму' },
   tut_3_text: { en: 'Buy buildings that bake cookies automatically — even while you are offline. Upgrades and skins are there too!', uk: 'Купуй будівлі, що печуть печиво автоматично — навіть коли ти офлайн. Там же покращення та скіни!', ru: 'Покупай здания, которые пекут печеньки автоматически — даже когда ты оффлайн. Там же улучшения и скины!' },
   tut_4_title: { en: 'Level up & earn', uk: 'Прокачуйся та заробляй', ru: 'Прокачивайся и зарабатывай' },
