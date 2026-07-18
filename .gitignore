@@ -1,0 +1,24 @@
+# секреты и данные — НИКОГДА не коммитить
+.env
+data.db
+data.db-shm
+data.db-wal
+*.db.bak
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# node / сборка фронта
+webapp/node_modules/
+webapp/dist/
+
+# ide
+.idea/
+.vscode/
+
+# служебное
+.claude/
+*.tsbuildinfo
