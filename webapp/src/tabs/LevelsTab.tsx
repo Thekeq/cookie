@@ -4,8 +4,7 @@ import { fmt, useGame } from '../App'
 import { useT } from '../i18n'
 import { sfxError, sfxFanfare } from '../sound'
 import type { LevelNode } from '../types'
-
-const COOKIE_SKINS = ['', '🍪', '🥠', '🧁', '🍩', '🎂', '🍰', '🥮', '🍮', '🍫', '🍯', '👑', '💎']
+import { COOKIE_SKINS } from '../cookieSkins'
 
 export default function LevelsTab() {
   const { state, setState, toast } = useGame()

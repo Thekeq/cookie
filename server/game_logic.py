@@ -552,6 +552,15 @@ def full_state(user_id: int) -> dict:
         "skins_owned": sorted(owned_skins),
         "board": board,
         "spawn_cost": cfg.spawn_cost(items_count),
+        # прямая покупка печенек выше 1 lvl: доступные уровни и цены
+        "spawn_direct": {
+            "max_level": max(1, max(
+                (l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
+                 if cfg.item_unlock_level(l) <= user["level"]), default=1)
+                - cfg.SPAWN_DIRECT_GAP),
+            "costs": {str(l): cfg.direct_spawn_cost(l, items_count)
+                      for l in range(1, cfg.MAX_ITEM_LEVEL + 1)},
+        },
         "passive_per_hour": passive_per_hour(user_id),
         "boosts": [
             {"key": r["boost_key"], "expires_at": r["expires_at"]}

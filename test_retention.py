@@ -89,6 +89,8 @@ check("prestige locked early", r.json()["can_prestige"] is False)
 r = c.post("/api/prestige", headers=H)
 check("prestige blocked early", r.status_code == 400)
 # нафармили 25M — престиж доступен
+# (снимаем бусты: если golden выпал frenzy, его x7 исказил бы проверку множителя)
+db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
 db.update_user(UID, total_earned=25_000_000, cookies=123, level=10, click_level=8)
 db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'granny', 5)", (UID,))
 db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, 'donut')", (UID,))
@@ -110,8 +112,34 @@ check("total_earned kept", u["total_earned"] == 25_000_000)
 r = c.post("/api/prestige", headers=H)
 check("re-prestige blocked (no new points)", r.status_code == 400)
 
+# --- прямая покупка печенек высокого уровня ---
+db.update_user(UID, level=11, cookies=10_000_000)
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+r = c.get("/api/state", headers=H)
+sd = r.json()["spawn_direct"]
+# на 11 уровне игрока открыт item 10 => напрямую можно до 10-3=7
+check("direct max = unlocked-3", sd["max_level"] == 7, str(sd["max_level"]))
+check("direct pricing has premium",
+      sd["costs"]["3"] > sd["costs"]["1"] * 4, str(sd["costs"]["3"]))
+r = c.post("/api/merge/spawn", json={"level": 5}, headers=H)
+check("direct spawn lvl5", r.status_code == 200
+      and any(b["item_level"] == 5 for b in r.json()["board"]), r.text[:200])
+r = c.post("/api/merge/spawn", json={"level": 8}, headers=H)
+check("direct spawn above cap blocked", r.status_code == 400)
+r = c.post("/api/merge/spawn", json={"level": 1}, headers=H)
+check("plain spawn still works", r.status_code == 200, r.text[:200])
+# слияние выше 12 работает (потолок теперь 24)
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.update_user(UID, level=30)
+db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, 0, 12)", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, 1, 12)", (UID,))
+r = c.post("/api/merge/move", json={"from_cell": 0, "to_cell": 1}, headers=H)
+check("merge to lvl13 works", r.status_code == 200
+      and r.json().get("merged_level") == 13, r.text[:200])
+
 # --- level-up рефилл энергии ---
-db.update_user(UID, xp=cfg.xp_for_level(2) + 1, energy=3, energy_updated_at=time.time())
+db.update_user(UID, level=1, xp=cfg.xp_for_level(2) + 1, energy=3,
+               energy_updated_at=time.time())
 r = c.post("/api/levels/claim", headers=H)
 check("level claim", r.status_code == 200, r.text[:200])
 check("energy refilled on level-up",

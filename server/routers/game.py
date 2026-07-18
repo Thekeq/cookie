@@ -174,19 +174,34 @@ def _board_map(user_id: int) -> dict[int, int]:
             for r in db.q("SELECT cell, item_level FROM board WHERE user_id = ?", (user_id,))}
 
 
+class SpawnIn(BaseModel):
+    level: int = 1  # прямая покупка печеньки уровня N (дорого, экономит слияния)
+
+
 @router.post("/merge/spawn")
-async def spawn(tg: dict = Depends(tg_user)):
+async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
     board = _board_map(tg["id"])
     if len(board) >= cfg.BOARD_SIZE:
         raise HTTPException(400, "Доска заполнена")
-    cost = cfg.spawn_cost(len(board))
+
+    level = max(1, body.level)
+    # прямой спавн ограничен: топ-тиры только слиянием
+    max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
+                        if cfg.item_unlock_level(l) <= user["level"]), default=1)
+    max_direct = max(1, max_unlocked - cfg.SPAWN_DIRECT_GAP)
+    if level > max_direct:
+        raise HTTPException(400, f"Напрямую можно купить максимум {max_direct} lvl — "
+                                 f"выше только слиянием")
+
+    cost = cfg.direct_spawn_cost(level, len(board))
     if user["cookies"] < cost:
         raise HTTPException(400, "Не хватает печенек")
     free_cells = [c for c in range(cfg.BOARD_SIZE) if c not in board]
     cell = free_cells[0]
     db.update_user(tg["id"], cookies=user["cookies"] - cost)
-    db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, 1)", (tg["id"], cell))
+    db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
+            (tg["id"], cell, level))
     gl.quest_progress(tg["id"], "spawns", 1)
     return gl.full_state(tg["id"])
 

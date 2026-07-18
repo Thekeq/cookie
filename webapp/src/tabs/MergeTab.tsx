@@ -3,9 +3,7 @@ import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useT } from '../i18n'
 import { sfxBuy, sfxError, sfxMerge } from '../sound'
-
-// эмодзи-скины печенек по уровням (1..12)
-const COOKIE_SKINS = ['', '🍪', '🥠', '🧁', '🍩', '🎂', '🍰', '🥮', '🍮', '🍫', '🍯', '👑', '💎']
+import { COOKIE_SKINS } from '../cookieSkins'
 
 interface Drag {
   from: number
@@ -21,6 +19,7 @@ export default function MergeTab() {
   const t = useT()
   const [drag, setDrag] = useState<Drag | null>(null)
   const [popCell, setPopCell] = useState<number | null>(null)
+  const [buyLevel, setBuyLevel] = useState(1) // уровень покупаемой печеньки
   const busy = useRef(false)
   const boardRef = useRef<HTMLDivElement>(null)
 
@@ -101,7 +100,7 @@ export default function MergeTab() {
 
   const spawn = async () => {
     try {
-      const s = await api.post('/api/merge/spawn')
+      const s = await api.post('/api/merge/spawn', { level: buyLevel })
       setState(s)
       haptic('medium')
       sfxBuy()
@@ -110,6 +109,10 @@ export default function MergeTab() {
       toast(e.detail || t('error'), true)
     }
   }
+
+  const maxDirect = state.spawn_direct?.max_level || 1
+  const safeBuyLevel = Math.min(buyLevel, maxDirect)
+  const buyCost = state.spawn_direct?.costs?.[String(safeBuyLevel)] ?? state.spawn_cost
 
   return (
     <div>
@@ -169,14 +172,30 @@ export default function MergeTab() {
         )}
       </div>
 
+      {/* выбор уровня покупаемой печеньки: топ-тиры только слиянием */}
+      {maxDirect > 1 && (
+        <div className="spawn-levels">
+          {Array.from({ length: maxDirect }, (_, i) => i + 1).map((l) => (
+            <button
+              key={l}
+              className={'spawn-lvl' + (safeBuyLevel === l ? ' active' : '')}
+              onClick={() => setBuyLevel(l)}
+            >
+              <span>{COOKIE_SKINS[l]}</span>
+              <span className="spawn-lvl-n">{l}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       <button
         className="btn"
         onClick={spawn}
-        disabled={state.board.length >= 25 || state.user.cookies < state.spawn_cost}
+        disabled={state.board.length >= 25 || state.user.cookies < buyCost}
       >
         {state.board.length >= 25
           ? t('board_full')
-          : `${t('buy_cookie')} 🍪 ${fmt(state.spawn_cost)}`}
+          : `${t('buy_cookie')} ${COOKIE_SKINS[safeBuyLevel]} ${safeBuyLevel} · 🍪 ${fmt(buyCost)}`}
       </button>
       <div className="hint" style={{ textAlign: 'center', marginTop: 8 }}>
         {t('merge_hint')} {COOKIE_SKINS[state.max_item_unlocked]} {state.max_item_unlocked}

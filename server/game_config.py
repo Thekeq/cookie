@@ -20,27 +20,45 @@ def click_upgrade_cost(click_level: int) -> float:
 
 # ---------- Merge ----------
 BOARD_SIZE = 25                 # 5x5
-MAX_ITEM_LEVEL = 12
+MAX_ITEM_LEVEL = 24
 
 def spawn_cost(items_on_board: int) -> float:
     """Цена спавна печеньки lvl1, растёт от заполненности доски"""
     return 50 * (1.15 ** items_on_board)
 
+# Прямая покупка печеньки уровня N: «честная» цена lvl1-эквивалента x премия.
+# 2.8^(N-1) против фактических 2^(N-1) слияний — дорого, но экономит время.
+SPAWN_LEVEL_FACTOR = 2.8
+# топ-тиры только слиянием: напрямую можно купить максимум unlocked - 3
+SPAWN_DIRECT_GAP = 3
+
+def direct_spawn_cost(level: int, items_on_board: int) -> float:
+    return spawn_cost(items_on_board) * (SPAWN_LEVEL_FACTOR ** (level - 1))
+
 def merge_reward_xp(new_level: int) -> float:
-    """XP за создание печеньки уровня new_level"""
-    return 10 * (2 ** (new_level - 2))
+    """XP за создание печеньки уровня new_level. После 10 lvl рост гасим,
+    иначе одно топ-слияние закрывало бы весь батл-пасс."""
+    if new_level <= 10:
+        return 10 * (2 ** (new_level - 2))
+    return 10 * (2 ** 8) * (1.25 ** (new_level - 10))
 
 def passive_income_per_hour(item_level: int) -> float:
-    """Пассивный доход cookies/час от печеньки на доске"""
+    """Пассивный доход cookies/час от печеньки на доске. После 12 lvl рост
+    мягче, чтобы пара топ-печенек не обгоняла всю ферму на порядки."""
     if item_level < 3:
         return 0
-    return 20 * (2.2 ** (item_level - 3))
+    if item_level <= 12:
+        return 20 * (2.2 ** (item_level - 3))
+    return 20 * (2.2 ** 9) * (1.6 ** (item_level - 12))
 
 PASSIVE_CAP_HOURS = 3           # оффлайн-доход копится максимум 3 часа
 
 def item_unlock_level(item_level: int) -> int:
-    """С какого уровня игрока доступна печенька item_level (спавн/merge выше — нельзя)"""
-    unlocks = {1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 5, 7: 7, 8: 10, 9: 13, 10: 16, 11: 20, 12: 25}
+    """С какого уровня игрока доступна печенька item_level (спавн/merge выше — нельзя).
+    Щедрее ранних анлоков: над текущим потолком всегда есть 2-3 непокорённых тира."""
+    unlocks = {1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 7, 9: 9, 10: 11,
+               11: 13, 12: 15, 13: 17, 14: 19, 15: 21, 16: 22, 17: 23, 18: 24,
+               19: 25, 20: 26, 21: 27, 22: 28, 23: 29, 24: 30}
     return unlocks.get(item_level, 99)
 
 # ---------- Уровни (тропинка) ----------

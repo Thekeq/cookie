@@ -98,6 +98,7 @@ export interface GameState {
   skins_owned: string[]
   board: BoardCell[]
   spawn_cost: number
+  spawn_direct: { max_level: number; costs: Record<string, number> }
   passive_per_hour: number
   passive_collected?: number
   boosts: { key: string; expires_at: number }[]
