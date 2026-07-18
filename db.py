@@ -61,6 +61,9 @@ class DataBase:
                 # --- престиж ---
                 'prestige_points': 'REAL DEFAULT 0',
                 'prestige_count': 'INTEGER DEFAULT 0',
+                # --- дневной кап XP за клики ---
+                'clicks_day': 'TEXT',                   # 'YYYY-MM-DD' (UTC)
+                'clicks_day_count': 'INTEGER DEFAULT 0',
             },
             'farm': {  # здания автофарма: одна строка = тип здания у юзера
                 'id': 'INTEGER PRIMARY KEY',

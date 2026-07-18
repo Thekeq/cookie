@@ -82,18 +82,46 @@ def level_reward(level: int) -> dict:
 SEASON_EPOCH = 1783900800        # 2026-07-13 00:00 UTC, понедельник
 SEASON_LENGTH_DAYS = 14
 
-# Награды топ-10 лидерборда в конце сезона (место -> печеньки)
+# Награды топ-10 лидерборда: доля от season_earned победителя (масштабируется
+# с инфляцией сама) с абсолютным минимумом для холодного старта.
+# место -> (доля от собственного заработка за сезон, минимум печенек)
 SEASON_TOP_REWARDS = {
-    1: 100_000, 2: 60_000, 3: 40_000,
-    4: 25_000, 5: 20_000, 6: 15_000, 7: 12_000, 8: 10_000, 9: 8_000, 10: 6_000,
+    1: (0.30, 100_000), 2: (0.25, 60_000), 3: (0.20, 40_000),
+    4: (0.15, 25_000), 5: (0.12, 20_000), 6: (0.10, 15_000),
+    7: (0.08, 12_000), 8: (0.07, 10_000), 9: (0.06, 8_000), 10: (0.05, 6_000),
 }
+
+def season_reward(rank: int, earned: float) -> float:
+    if rank not in SEASON_TOP_REWARDS:
+        return 0
+    share, minimum = SEASON_TOP_REWARDS[rank]
+    return max(earned * share, minimum)
 
 # ---------- Батл-пасс ----------
 BP_MAX_LEVEL = 30
-# 2500/ур.: активный игрок (~9-10k XP/день) закрывает 30 уровней за ~8 дней
-# из 14 дней сезона — премиум есть смысл покупать, но и халявщик успевает
-BP_XP_PER_LEVEL = 2500
 BP_PREMIUM_STARS = 100          # цена premium-пасса в Stars
+
+def bp_xp_for_level(level: int) -> float:
+    """Сколько XP стоит взять уровень level (не кумулятивно).
+    Прогрессия level*400: ранние уровни щёлкаются за сессию, полный пасс
+    (186k суммарно) — ~13 дней активной игры (~14k XP/день) из 14 дней сезона."""
+    return level * 400
+
+def bp_total_xp(level: int) -> float:
+    """Кумулятивный XP до уровня level включительно."""
+    return 200 * level * (level + 1)  # сумма арифм. прогрессии x400
+
+def bp_level_for_xp(xp: float) -> int:
+    lvl = 0
+    while lvl < BP_MAX_LEVEL and xp >= bp_total_xp(lvl + 1):
+        lvl += 1
+    return lvl
+
+# Дневной кап XP за клики: после CLICK_XP_SOFT_CAP кликов в день клик даёт
+# вчетверо меньше XP — мягкий тормоз для автокликеров, честным не мешает
+CLICK_XP_SOFT_CAP = 10_000
+CLICK_XP_RATE = 0.5
+CLICK_XP_RATE_CAPPED = 0.125
 
 def bp_reward(bp_level: int, premium: bool) -> dict:
     if premium:
@@ -162,9 +190,15 @@ COMBO_MAX_MULT = 2.0
 # ---------- Престиж ----------
 # Сброс прогресса (кроме Stars-покупок, скинов, стрика, рефералов) за постоянный
 # множитель ко ВСЕМУ доходу. Очки престижа = sqrt(total_earned / PRESTIGE_BASE).
-PRESTIGE_MIN_EARNED = 10_000_000    # раньше — кнопка неактивна
+# Порог растёт с каждым престижем: N-й требует 10M * 15^N — каждый престиж событие.
+PRESTIGE_MIN_EARNED = 10_000_000
+PRESTIGE_THRESHOLD_GROWTH = 15
 PRESTIGE_BASE = 1_000_000
 PRESTIGE_MULT_PER_POINT = 0.02      # +2% дохода за очко
+
+def prestige_threshold(prestige_count: int) -> float:
+    """Сколько total_earned нужно для престижа номер prestige_count+1."""
+    return PRESTIGE_MIN_EARNED * (PRESTIGE_THRESHOLD_GROWTH ** prestige_count)
 
 def prestige_points(total_earned: float) -> int:
     if total_earned < PRESTIGE_MIN_EARNED:
@@ -197,13 +231,16 @@ ACHIEVEMENTS = {
 }
 
 # ---------- Магазин за Stars ----------
+# Пачки печенек масштабируются под доход покупателя: amount игнорируется, если
+# задан income_hours — реальная сумма = max(min_amount, часовой доход * hours).
+# Часовой доход = ферма + пассивка доски + клики (см. game_logic.hourly_income).
 # item_key: (название, описание, цена Stars, эффект)
 SHOP_ITEMS = {
     "energy_full":   ("Полная энергия",  "Мгновенно восстановить энергию",        25,  {"type": "energy_full"}),
     "boost_x2_1h":   ("Буст x2 (1 час)", "Клики дают x2 печенек 1 час",           50,  {"type": "boost", "key": "click_x2", "hours": 1}),
     "boost_x2_24h":  ("Буст x2 (24 ч)",  "Клики дают x2 печенек 24 часа",         200, {"type": "boost", "key": "click_x2", "hours": 24}),
-    "cookies_5k":    ("5 000 печенек",   "Пачка печенек на счёт",                 75,  {"type": "cookies", "amount": 5000}),
-    "cookies_25k":   ("25 000 печенек",  "Большая пачка печенек",                 300, {"type": "cookies", "amount": 25000}),
+    "cookies_pack":  ("Пачка печенек",   "2 часа твоего дохода мгновенно",        75,  {"type": "cookies", "income_hours": 2, "min_amount": 5000}),
+    "cookies_crate": ("Ящик печенек",    "10 часов твоего дохода мгновенно",      300, {"type": "cookies", "income_hours": 10, "min_amount": 25000}),
     "bp_premium":    ("Premium Пасс",    "Открывает premium-награды батл-пасса",  BP_PREMIUM_STARS, {"type": "bp_premium"}),
 }
 
@@ -222,7 +259,9 @@ FARM_BUILDINGS = {
     "moonbase": {"base_cost": 60_000_000,  "cps": 35000,  "req_level": 24},
     "singularity": {"base_cost": 400_000_000, "cps": 180000, "req_level": 28},
 }
-FARM_COST_GROWTH = 1.15          # цена растёт x1.15 за каждое купленное здание
+# 1.18: при 1.15 симуляция показала 90+ курсоров у топов и гиперинфляцию
+# (8.2B за 72ч); 1.18 режет late-game доход в ~2.5 раза, ранний темп не трогает
+FARM_COST_GROWTH = 1.18          # цена растёт за каждое купленное здание
 FARM_OFFLINE_CAP_HOURS = 3       # оффлайн-фарм копится максимум 3 часа
 
 def building_cost(key: str, owned: int) -> float:

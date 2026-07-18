@@ -21,7 +21,6 @@ interface LBData {
   players_total: number
   season: number
   season_ends_at: number
-  top_rewards: Record<string, number>
   last_result: { season_id: number; rank: number; reward_cookies: number } | null
 }
 

@@ -137,6 +137,46 @@ r = c.post("/api/merge/move", json={"from_cell": 0, "to_cell": 1}, headers=H)
 check("merge to lvl13 works", r.status_code == 200
       and r.json().get("merged_level") == 13, r.text[:200])
 
+# --- перебаланс: прогрессивный БП, кап XP, динамический магазин, престиж-порог ---
+# прогрессивная цена уровня БП
+check("bp lvl1 costs 400", cfg.bp_xp_for_level(1) == 400)
+check("bp lvl30 costs 12000", cfg.bp_xp_for_level(30) == 12000)
+check("bp cumulative consistent",
+      cfg.bp_total_xp(30) == sum(cfg.bp_xp_for_level(l) for l in range(1, 31)))
+check("bp_level_for_xp", cfg.bp_level_for_xp(cfg.bp_total_xp(5)) == 5
+      and cfg.bp_level_for_xp(cfg.bp_total_xp(5) - 1) == 4)
+
+# дневной кап XP кликов: после 10k кликов XP режется вчетверо
+db.update_user(UID, energy=200000, clicks_day=gl._utc_day(time.time()),
+               clicks_day_count=cfg.CLICK_XP_SOFT_CAP, combo_last_at=0)
+xp_before = db.get_user(UID)["xp"]
+db.exec("DELETE FROM daily_quests WHERE user_id = ?", (UID,))
+import server.routers.game as game_router
+game_router._click_windows.pop(UID, None)
+r = c.post("/api/click", json={"clicks": 40}, headers=H)
+accepted = r.json()["accepted"]
+xp_gained = db.get_user(UID)["xp"] - xp_before
+check("click xp capped to 0.125",
+      abs(xp_gained - accepted * cfg.CLICK_XP_RATE_CAPPED) < 0.01,
+      f"{xp_gained} за {accepted}")
+
+# магазин: пачки показывают персональную сумму (минимум при нулевом доходе)
+r = c.get("/api/shop", headers=H)
+pack = next(i for i in r.json()["items"] if i["key"] == "cookies_pack")
+check("shop pack has amount", pack.get("amount", 0) >= 5000, str(pack.get("amount")))
+
+# растущий порог престижа: после 1-го нужен уже 150M
+u = db.get_user(UID)
+check("prestige threshold grows",
+      cfg.prestige_threshold(u["prestige_count"]) == 10_000_000 * 15 ** u["prestige_count"])
+r = c.get("/api/prestige", headers=H)
+check("2nd prestige needs 150M", r.json()["min_earned"] == 150_000_000
+      and r.json()["can_prestige"] is False, str(r.json()["min_earned"]))
+
+# сезонные призы масштабируются от заработка
+check("season reward scales", cfg.season_reward(1, 10_000_000) == 3_000_000)
+check("season reward has floor", cfg.season_reward(1, 1000) == 100_000)
+
 # --- level-up рефилл энергии ---
 db.update_user(UID, level=1, xp=cfg.xp_for_level(2) + 1, energy=3,
                energy_updated_at=time.time())

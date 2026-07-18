@@ -104,13 +104,21 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
     combo = gl.update_combo(user, clicks, now)
     earned = (clicks * cfg.click_power(user["click_level"])
               * gl.click_multiplier(tg["id"]) * combo)
+
+    # дневной счётчик кликов: после мягкого капа XP за клик режется вчетверо
+    today = gl._utc_day(now)
+    day_count = user["clicks_day_count"] if user["clicks_day"] == today else 0
+    under_cap = max(0, min(clicks, cfg.CLICK_XP_SOFT_CAP - day_count))
+    xp = under_cap * cfg.CLICK_XP_RATE + (clicks - under_cap) * cfg.CLICK_XP_RATE_CAPPED
+
     db.update_user(
         tg["id"],
         energy=user["energy"] - clicks * cfg.ENERGY_PER_CLICK,
         total_clicks=user["total_clicks"] + clicks,
+        clicks_day=today, clicks_day_count=day_count + clicks,
     )
     gl.add_cookies(tg["id"], earned)
-    gl.add_xp(db.get_user(tg["id"]), clicks * 0.5)
+    gl.add_xp(db.get_user(tg["id"]), xp)
     gl.quest_progress(tg["id"], "clicks", clicks)
 
     fresh = db.get_user(tg["id"])

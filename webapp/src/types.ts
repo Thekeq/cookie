@@ -154,4 +154,5 @@ export interface ShopItem {
   title: string
   desc: string
   stars: number
+  amount?: number // персональная сумма пачки (часы дохода покупателя)
 }

@@ -34,7 +34,7 @@ def finalize_seasons():
             "ORDER BY season_earned DESC LIMIT 10", (season,))
         now = time.time()
         for i, u in enumerate(top):
-            reward = cfg.SEASON_TOP_REWARDS.get(i + 1, 0)
+            reward = cfg.season_reward(i + 1, u["season_earned"])
             db.exec(
                 "INSERT INTO season_results (season_id, user_id, rank, earned, "
                 "reward_cookies, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -46,7 +46,7 @@ def finalize_seasons():
             "WHERE season_id = ?", (cur, season))
         # награды топам — уже после сброса, чтобы не попали в новый сезон
         for i, u in enumerate(top):
-            reward = cfg.SEASON_TOP_REWARDS.get(i + 1, 0)
+            reward = cfg.season_reward(i + 1, u["season_earned"])
             if reward:
                 add_cookies(u["user_id"], reward, count_earned=False)
 
@@ -114,6 +114,12 @@ def _ensure_quest_rows(user_id: int, day: str, keys: list[str]):
                 "VALUES (?, ?, ?)", (user_id, day, key))
 
 
+def quest_reward_cookies(user_id: int, base: float) -> float:
+    """Награда квеста: базовая сумма ИЛИ полчаса дохода игрока — что больше.
+    Так квесты не превращаются в мусор для прокачанных игроков."""
+    return max(base, hourly_income(user_id) * 0.5)
+
+
 def quests_state(user_id: int) -> list[dict]:
     day = _utc_day(time.time())
     keys = todays_quest_keys(day)
@@ -127,7 +133,8 @@ def quests_state(user_id: int) -> list[dict]:
         r = rows.get(key, {"progress": 0, "claimed": 0})
         out.append({
             "key": key, "metric": q["metric"], "goal": q["goal"],
-            "reward_cookies": q["reward_cookies"], "reward_bp_xp": q["reward_bp_xp"],
+            "reward_cookies": quest_reward_cookies(user_id, q["reward_cookies"]),
+            "reward_bp_xp": q["reward_bp_xp"],
             "progress": min(r["progress"], q["goal"]),
             "done": r["progress"] >= q["goal"], "claimed": bool(r["claimed"]),
         })
@@ -163,9 +170,10 @@ def claim_quest(user: dict, key: str) -> dict:
     if row["claimed"]:
         raise ValueError("Уже получено")
     db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ?", (row["id"],))
-    add_cookies(user["user_id"], q["reward_cookies"], count_earned=False)
+    reward = quest_reward_cookies(user["user_id"], q["reward_cookies"])
+    add_cookies(user["user_id"], reward, count_earned=False)
     db.update_user(user["user_id"], bp_xp=db.get_user(user["user_id"])["bp_xp"] + q["reward_bp_xp"])
-    return {"reward_cookies": q["reward_cookies"], "reward_bp_xp": q["reward_bp_xp"]}
+    return {"reward_cookies": reward, "reward_bp_xp": q["reward_bp_xp"]}
 
 
 def claimable_quests_count(user_id: int) -> int:
@@ -348,13 +356,14 @@ def update_combo(user: dict, clicks: int, now: float) -> float:
 def prestige_state(user: dict) -> dict:
     total_pts = cfg.prestige_points(user["total_earned"])
     gain = max(0, total_pts - int(user["prestige_points"]))
+    threshold = cfg.prestige_threshold(user["prestige_count"])
     return {
         "points": int(user["prestige_points"]),
         "count": user["prestige_count"],
         "multiplier": cfg.prestige_multiplier(user["prestige_points"]),
         "gain_available": gain,
-        "min_earned": cfg.PRESTIGE_MIN_EARNED,
-        "can_prestige": gain >= 1 and user["total_earned"] >= cfg.PRESTIGE_MIN_EARNED,
+        "min_earned": threshold,
+        "can_prestige": gain >= 1 and user["total_earned"] >= threshold,
         "mult_per_point": cfg.PRESTIGE_MULT_PER_POINT,
     }
 
@@ -457,6 +466,15 @@ def collect_passive(user: dict) -> float:
     if income > 0:
         add_cookies(user["user_id"], income)
     return income
+
+
+def hourly_income(user_id: int) -> float:
+    """Оценка часового дохода игрока для масштабируемых наград:
+    ферма + пассивка доски + скромная оценка кликов (5 мин активного тапа)."""
+    user = db.get_user(user_id)
+    clicks_estimate = (cfg.click_power(user["click_level"])
+                       * click_multiplier(user_id) * 5 * 60)
+    return farm_cps(user_id) * 3600 + passive_per_hour(user_id) + clicks_estimate
 
 
 def passive_per_hour(user_id: int) -> float:

@@ -39,7 +39,13 @@ async def on_paid(message: Message):
 
     title, _desc, _stars, effect = cfg.SHOP_ITEMS[item_key]
     if effect["type"] == "cookies":
-        gl.add_cookies(user_id, effect["amount"], count_earned=False)
+        # пачка масштабируется под доход покупателя (часы дохода, с минимумом)
+        if "income_hours" in effect:
+            amount = max(effect["min_amount"],
+                         gl.hourly_income(user_id) * effect["income_hours"])
+        else:
+            amount = effect["amount"]
+        gl.add_cookies(user_id, amount, count_earned=False)
     elif effect["type"] == "energy_full":
         user = db.get_user(user_id)
         db.update_user(user_id, energy=cfg.max_energy(user["level"]),

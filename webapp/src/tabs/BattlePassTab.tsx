@@ -10,6 +10,7 @@ interface BPData {
   season_ends_at: number
   bp_xp: number
   bp_level: number
+  xp_in_level: number
   xp_per_level: number
   premium: boolean
   premium_price_stars: number
@@ -63,7 +64,7 @@ export default function BattlePassTab() {
       </div>
     )
 
-  const progressInLevel = bp.bp_xp - bp.bp_level * bp.xp_per_level
+  const progressInLevel = bp.xp_in_level ?? bp.bp_xp - bp.bp_level * bp.xp_per_level
 
   return (
     <div>

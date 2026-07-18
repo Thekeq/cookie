@@ -106,7 +106,8 @@ u = db.get_user(UID)
 check("season_earned counted", u["season_earned"] > 0, str(u["season_earned"]))
 r = c.get("/api/leaderboard", headers=H(UID))
 lb = r.json()
-check("lb has season fields", "season_ends_at" in lb and "top_rewards" in lb)
+check("lb has season fields", "season_ends_at" in lb and "season" in lb)
+check("lb top has prizes", all("prize" in row for row in lb["top"]))
 check("lb top has me", any(row["is_me"] for row in lb["top"]))
 
 # --- season rollover ---

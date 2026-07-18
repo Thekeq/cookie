@@ -126,7 +126,7 @@ async def battlepass(tg: dict = Depends(tg_user)):
     user = db.get_user(tg["id"])
     if not user:
         raise HTTPException(404, "No user")
-    bp_level = min(cfg.BP_MAX_LEVEL, int(user["bp_xp"] // cfg.BP_XP_PER_LEVEL))
+    bp_level = cfg.bp_level_for_xp(user["bp_xp"])
     claimed_free = json.loads(user["bp_claimed_free"] or "[]")
     claimed_prem = json.loads(user["bp_claimed_premium"] or "[]")
     levels = []
@@ -139,12 +139,15 @@ async def battlepass(tg: dict = Depends(tg_user)):
             "free_claimed": lvl in claimed_free,
             "premium_claimed": lvl in claimed_prem,
         })
+    next_lvl = min(cfg.BP_MAX_LEVEL, bp_level + 1)
     return {
         "season": gl.current_season() + 1,  # людям показываем с 1, не с 0
         "season_ends_at": gl.season_end_ts(gl.current_season()),
         "bp_xp": user["bp_xp"],
         "bp_level": bp_level,
-        "xp_per_level": cfg.BP_XP_PER_LEVEL,
+        # прогресс внутри текущего уровня — фронт рисует бар по этим двум числам
+        "xp_in_level": user["bp_xp"] - cfg.bp_total_xp(bp_level),
+        "xp_per_level": cfg.bp_xp_for_level(next_lvl),
         "premium": bool(user["bp_premium"]),
         "premium_price_stars": cfg.BP_PREMIUM_STARS,
         "levels": levels,
@@ -159,7 +162,7 @@ class BPClaim(BaseModel):
 @router.post("/battlepass/claim")
 async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
     user = db.get_user(tg["id"])
-    bp_level = min(cfg.BP_MAX_LEVEL, int(user["bp_xp"] // cfg.BP_XP_PER_LEVEL))
+    bp_level = cfg.bp_level_for_xp(user["bp_xp"])
     if body.level < 1 or body.level > bp_level:
         raise HTTPException(400, "Уровень ещё не достигнут")
     if body.track == "premium" and not user["bp_premium"]:
@@ -184,10 +187,17 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
 
 @router.get("/shop")
 async def shop(tg: dict = Depends(tg_user)):
-    return {"items": [
-        {"key": k, "title": t, "desc": d, "stars": s}
-        for k, (t, d, s, _effect) in cfg.SHOP_ITEMS.items()
-    ]}
+    """Для пачек с income_hours считаем персональную сумму — покупатель видит,
+    сколько конкретно печенек получит именно он."""
+    income = gl.hourly_income(tg["id"])
+    items = []
+    for k, (title, d, s, effect) in cfg.SHOP_ITEMS.items():
+        item = {"key": k, "title": title, "desc": d, "stars": s}
+        if effect.get("type") == "cookies" and "income_hours" in effect:
+            item["amount"] = max(effect["min_amount"],
+                                 income * effect["income_hours"])
+        items.append(item)
+    return {"items": items}
 
 
 class BuyIn(BaseModel):
@@ -228,7 +238,7 @@ async def leaderboard(tg: dict = Depends(tg_user)):
         row["name"] = row.pop("first_name") or row.pop("username") or "Player"
         row.pop("username", None)
         row["is_me"] = row["user_id"] == tg["id"]
-        row["prize"] = cfg.SEASON_TOP_REWARDS.get(i + 1, 0)
+        row["prize"] = cfg.season_reward(i + 1, row["season_earned"])
 
     me = db.get_user(tg["id"])
     my_rank = None
@@ -243,7 +253,6 @@ async def leaderboard(tg: dict = Depends(tg_user)):
                                (season,))["c"],
         "season": season + 1,
         "season_ends_at": gl.season_end_ts(season),
-        "top_rewards": cfg.SEASON_TOP_REWARDS,
         "last_result": gl.my_last_season_result(tg["id"]),
     }
 

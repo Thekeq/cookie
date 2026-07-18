@@ -119,6 +119,8 @@ if first_wall:
           f"{first_wall[0] % 60}м, длилась {first_wall[1]} мин")
 
 # батл-пасс: xp игрока ~= bp_xp (клики+мерджи капают в оба) + квесты ~750/день
-bp_days = (cfg.BP_MAX_LEVEL * cfg.BP_XP_PER_LEVEL) / max(1, state["xp"] / (SIM_HOURS / 24) + 750)
-print(f"\nБатл-пасс (30 ур. x {cfg.BP_XP_PER_LEVEL} XP): ~{bp_days:.1f} дней "
-      f"такого темпа (сезон {cfg.SEASON_LENGTH_DAYS} дн.)")
+bp_total = cfg.bp_total_xp(cfg.BP_MAX_LEVEL)
+xp_per_day = state["xp"] / (SIM_HOURS / 24) + 750
+bp_days = bp_total / max(1, xp_per_day)
+print(f"\nБатл-пасс ({cfg.BP_MAX_LEVEL} ур., всего {bp_total:,.0f} XP): "
+      f"~{bp_days:.1f} дней такого темпа (сезон {cfg.SEASON_LENGTH_DAYS} дн.)")

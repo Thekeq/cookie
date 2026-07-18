@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, openInvoice } from '../api'
-import { useGame } from '../App'
+import { fmt, useGame } from '../App'
 import { useT } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { ShopItem } from '../types'
@@ -9,8 +9,8 @@ const ICONS: Record<string, string> = {
   energy_full: '⚡',
   boost_x2_1h: '🔥',
   boost_x2_24h: '🚀',
-  cookies_5k: '🍪',
-  cookies_25k: '🧺',
+  cookies_pack: '🍪',
+  cookies_crate: '🧺',
   bp_premium: '🎖️',
 }
 
@@ -48,6 +48,11 @@ export default function ShopTab() {
           <div style={{ flex: 1 }}>
             <b>{it.title}</b>
             <div className="hint">{it.desc}</div>
+            {it.amount != null && (
+              <div style={{ fontWeight: 800, color: 'var(--good)', fontSize: 13 }}>
+                ≈ +{fmt(it.amount)} 🍪
+              </div>
+            )}
           </div>
           <button
             className="claim-chip"
