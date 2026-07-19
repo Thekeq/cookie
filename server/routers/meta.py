@@ -116,14 +116,15 @@ async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
     if db.q1("SELECT id FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, tg["id"])):
         raise HTTPException(400, "err_promo_already")
 
-    db.exec("INSERT INTO promo_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
-            (code, tg["id"], time.time()))
-    db.exec("UPDATE promo_codes SET uses = uses + 1 WHERE code = ?", (code,))
-    if promo["reward_cookies"]:
-        gl.add_cookies(tg["id"], promo["reward_cookies"], count_earned=False)
-    if promo["reward_energy"]:
-        user = gl.refresh_energy(db.get_user(tg["id"]))
-        db.update_user(tg["id"], energy=user["energy"] + promo["reward_energy"])
+    with db.tx():  # отметка активации + счётчик + награды — одним куском
+        db.exec("INSERT INTO promo_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
+                (code, tg["id"], time.time()))
+        db.exec("UPDATE promo_codes SET uses = uses + 1 WHERE code = ?", (code,))
+        if promo["reward_cookies"]:
+            gl.add_cookies(tg["id"], promo["reward_cookies"], count_earned=False)
+        if promo["reward_energy"]:
+            user = gl.refresh_energy(db.get_user(tg["id"]))
+            db.update_user(tg["id"], energy=user["energy"] + promo["reward_energy"])
     return {"reward_cookies": promo["reward_cookies"], "reward_energy": promo["reward_energy"],
             "cookies": db.get_user(tg["id"])["cookies"]}
 
@@ -182,14 +183,14 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
     if body.level in claimed:
         raise HTTPException(400, "err_claimed")
     claimed.append(body.level)
-    db.update_user(tg["id"], **{col: json.dumps(claimed)})
-
     reward = cfg.bp_reward(body.level, body.track == "premium")
-    if reward["cookies"]:
-        gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
-    if reward.get("energy"):
-        fresh = gl.refresh_energy(db.get_user(tg["id"]))
-        db.update_user(tg["id"], energy=fresh["energy"] + reward["energy"])
+    with db.tx():  # отметка о клейме и награда — одним куском
+        db.update_user(tg["id"], **{col: json.dumps(claimed)})
+        if reward["cookies"]:
+            gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
+        if reward.get("energy"):
+            fresh = gl.refresh_energy(db.get_user(tg["id"]))
+            db.update_user(tg["id"], energy=fresh["energy"] + reward["energy"])
     return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}
 
 
@@ -308,6 +309,7 @@ async def channel_claim(tg: dict = Depends(tg_user)):
     if member.status in ("left", "kicked"):
         raise HTTPException(400, "err_not_subscribed")
 
-    db.update_user(tg["id"], channel_claimed=1)
-    gl.add_cookies(tg["id"], cfg.CHANNEL_REWARD, count_earned=False)
+    with db.tx():  # отметка и награда — одним куском
+        db.update_user(tg["id"], channel_claimed=1)
+        gl.add_cookies(tg["id"], cfg.CHANNEL_REWARD, count_earned=False)
     return {"reward": cfg.CHANNEL_REWARD, "cookies": db.get_user(tg["id"])["cookies"]}

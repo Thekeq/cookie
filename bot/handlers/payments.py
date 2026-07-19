@@ -78,14 +78,17 @@ async def on_paid(message: Message):
     if existing and existing["status"] == "fulfilled":
         return  # полный дубль — уже выдано
 
-    # запись платежа и выдача — атомарно: упадём посреди — статус останется
-    # 'paid', и следующий successful_payment (или ручной повтор) довыдаст
+    # факт оплаты фиксируем СРАЗУ отдельным коммитом: даже если выдача упадёт,
+    # запись 'paid' переживёт сбой и покупка будет довыдана при повторе
+    if not existing:
+        db.exec(
+            "INSERT OR IGNORE INTO purchases (user_id, item_key, stars_amount, "
+            "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'paid', ?)",
+            (user_id, item_key, sp.total_amount, charge_id, time.time()))
+
+    # выдача товара + статус 'fulfilled' — атомарно: упали посреди —
+    # покупка осталась 'paid', следующий successful_payment довыдаст
     with db.tx():
-        if not existing:
-            db.exec(
-                "INSERT INTO purchases (user_id, item_key, stars_amount, "
-                "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'paid', ?)",
-                (user_id, item_key, sp.total_amount, charge_id, time.time()))
         _fulfill(user_id, item_key)
         db.exec("UPDATE purchases SET status = 'fulfilled' WHERE tg_payment_id = ?",
                 (charge_id,))

@@ -30,27 +30,31 @@ def finalize_seasons():
     stale = db.q("SELECT DISTINCT season_id s FROM users WHERE season_id < ?", (cur,))
     for row in stale:
         season = row["s"]
-        top = db.q(
-            "SELECT user_id, season_earned FROM users "
-            "WHERE season_id = ? AND season_earned > 0 "
-            "ORDER BY level DESC, season_earned DESC LIMIT 10", (season,))
-        now = time.time()
-        for i, u in enumerate(top):
-            reward = cfg.season_reward(i + 1, u["season_earned"])
+        # весь ролловер сезона — одна транзакция: снапшот, сброс и награды
+        # либо происходят целиком, либо откатываются и повторятся при
+        # следующем запросе. OR IGNORE добивает частичные снапшоты прошлых сбоев.
+        with db.tx():
+            top = db.q(
+                "SELECT user_id, season_earned FROM users "
+                "WHERE season_id = ? AND season_earned > 0 "
+                "ORDER BY level DESC, season_earned DESC LIMIT 10", (season,))
+            now = time.time()
+            for i, u in enumerate(top):
+                reward = cfg.season_reward(i + 1, u["season_earned"])
+                db.exec(
+                    "INSERT OR IGNORE INTO season_results (season_id, user_id, rank, "
+                    "earned, reward_cookies, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (season, u["user_id"], i + 1, u["season_earned"], reward, now))
+            # сброс сезонного прогресса всем игрокам этого сезона
             db.exec(
-                "INSERT INTO season_results (season_id, user_id, rank, earned, "
-                "reward_cookies, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (season, u["user_id"], i + 1, u["season_earned"], reward, now))
-        # сброс сезонного прогресса всем игрокам этого сезона
-        db.exec(
-            "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
-            "bp_premium = 0, bp_claimed_free = '[]', bp_claimed_premium = '[]' "
-            "WHERE season_id = ?", (cur, season))
-        # награды топам — уже после сброса, чтобы не попали в новый сезон
-        for i, u in enumerate(top):
-            reward = cfg.season_reward(i + 1, u["season_earned"])
-            if reward:
-                add_cookies(u["user_id"], reward, count_earned=False)
+                "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
+                "bp_premium = 0, bp_claimed_free = '[]', bp_claimed_premium = '[]' "
+                "WHERE season_id = ?", (cur, season))
+            # награды топам — уже после сброса, чтобы не попали в новый сезон
+            for i, u in enumerate(top):
+                reward = cfg.season_reward(i + 1, u["season_earned"])
+                if reward:
+                    add_cookies(u["user_id"], reward, count_earned=False)
 
 
 def my_last_season_result(user_id: int) -> dict | None:
@@ -96,8 +100,9 @@ def claim_daily(user: dict) -> dict:
     yesterday = _utc_day(now - 86400)
     streak = user["daily_streak"] + 1 if last_day == yesterday else 1
     reward = cfg.daily_reward(streak)
-    db.update_user(user["user_id"], daily_streak=streak, daily_claimed_at=now)
-    add_cookies(user["user_id"], reward, count_earned=False)
+    with db.tx():  # отметка о получении и деньги — одним куском
+        db.update_user(user["user_id"], daily_streak=streak, daily_claimed_at=now)
+        add_cookies(user["user_id"], reward, count_earned=False)
     return {"streak": streak, "reward": reward}
 
 
@@ -171,10 +176,12 @@ def claim_quest(user: dict, key: str) -> dict:
         raise ValueError("err_not_done")
     if row["claimed"]:
         raise ValueError("err_claimed")
-    db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ?", (row["id"],))
     reward = quest_reward_cookies(user["user_id"], q["reward_cookies"])
-    add_cookies(user["user_id"], reward, count_earned=False)
-    db.update_user(user["user_id"], bp_xp=db.get_user(user["user_id"])["bp_xp"] + q["reward_bp_xp"])
+    with db.tx():  # отметка + печеньки + BP XP — одним куском
+        db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ?", (row["id"],))
+        add_cookies(user["user_id"], reward, count_earned=False)
+        db.update_user(user["user_id"],
+                       bp_xp=db.get_user(user["user_id"])["bp_xp"] + q["reward_bp_xp"])
     return {"reward_cookies": reward, "reward_bp_xp": q["reward_bp_xp"]}
 
 
@@ -207,16 +214,17 @@ def claim_ref_milestone(user: dict, key: str) -> dict:
         raise ValueError("err_not_done")
     if state["claimed"]:
         raise ValueError("err_claimed")
-    db.exec("INSERT INTO ref_claims (user_id, milestone_key, claimed_at) VALUES (?, ?, ?)",
-            (user["user_id"], key, time.time()))
-    if ms["type"] == "boost":
-        db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
-                (user["user_id"], "click_x2", time.time() + ms["hours"] * 3600))
-    elif ms["type"] == "skin":
-        db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?)",
-                (user["user_id"], ms["skin"]))
-    elif ms["type"] == "bp_premium":
-        db.update_user(user["user_id"], bp_premium=1)
+    with db.tx():  # отметка и награда — одним куском
+        db.exec("INSERT INTO ref_claims (user_id, milestone_key, claimed_at) VALUES (?, ?, ?)",
+                (user["user_id"], key, time.time()))
+        if ms["type"] == "boost":
+            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
+                    (user["user_id"], "click_x2", time.time() + ms["hours"] * 3600))
+        elif ms["type"] == "skin":
+            db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
+                    (user["user_id"], ms["skin"]))
+        elif ms["type"] == "bp_premium":
+            db.update_user(user["user_id"], bp_premium=1)
     return {"type": ms["type"]}
 
 
@@ -327,16 +335,19 @@ def claim_golden(user: dict) -> dict:
     if now >= user["golden_expires_at"]:
         raise ValueError("err_golden_gone")
     effect = user["golden_effect"] or "chain"
-    db.update_user(user["user_id"], golden_expires_at=0)
     if effect == "frenzy":
         e = cfg.GOLDEN_EFFECTS["frenzy"]
-        db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
-                (user["user_id"], "golden_frenzy", now + e["seconds"]))
+        with db.tx():
+            db.update_user(user["user_id"], golden_expires_at=0)
+            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
+                    (user["user_id"], "golden_frenzy", now + e["seconds"]))
         return {"effect": "frenzy", "mult": e["mult"], "seconds": e["seconds"]}
     e = cfg.GOLDEN_EFFECTS["chain"]
     bonus = max(passive_per_hour(user["user_id"]) * e["passive_hours"],
                 e["min_per_level"] * user["level"])
-    add_cookies(user["user_id"], bonus)
+    with db.tx():
+        db.update_user(user["user_id"], golden_expires_at=0)
+        add_cookies(user["user_id"], bonus)
     return {"effect": "chain", "cookies": bonus}
 
 
@@ -385,19 +396,21 @@ def do_prestige(user: dict) -> dict:
         raise ValueError("err_prestige_early")
     new_points = user["prestige_points"] + st["gain_available"]
     uid = user["user_id"]
-    # сохраняем: скины, ачивки, рефералов, стрик, БП сезона, покупки Stars, бусты
-    db.exec("DELETE FROM board WHERE user_id = ?", (uid,))
-    db.exec("DELETE FROM farm WHERE user_id = ?", (uid,))
-    db.exec("DELETE FROM upgrades WHERE user_id = ?", (uid,))
-    db.update_user(
-        uid,
-        cookies=0, click_level=1, level=1, xp=0,
-        energy=cfg.max_energy(1), energy_updated_at=time.time(),
-        passive_collected_at=time.time(), farm_collected_at=time.time(),
-        combo_mult=1,
-        prestige_points=new_points,
-        prestige_count=user["prestige_count"] + 1,
-    )
+    # сохраняем: скины, ачивки, рефералов, стрик, БП сезона, покупки Stars, бусты.
+    # Сброс и начисление очков — одна транзакция: полустёртого профиля не бывает
+    with db.tx():
+        db.exec("DELETE FROM board WHERE user_id = ?", (uid,))
+        db.exec("DELETE FROM farm WHERE user_id = ?", (uid,))
+        db.exec("DELETE FROM upgrades WHERE user_id = ?", (uid,))
+        db.update_user(
+            uid,
+            cookies=0, click_level=1, level=1, xp=0,
+            energy=cfg.max_energy(1), energy_updated_at=time.time(),
+            passive_collected_at=time.time(), farm_collected_at=time.time(),
+            combo_mult=1,
+            prestige_points=new_points,
+            prestige_count=user["prestige_count"] + 1,
+        )
     return {"gained": st["gain_available"], "points": int(new_points),
             "multiplier": cfg.prestige_multiplier(new_points)}
 
@@ -524,9 +537,11 @@ def claim_achievement(user: dict, key: str) -> float:
                 raise ValueError("err_not_done")
             if a["claimed"]:
                 raise ValueError("err_claimed")
-            db.exec("INSERT INTO achievements (user_id, key, claimed) VALUES (?, ?, 1)",
-                    (user["user_id"], key))
-            add_cookies(user["user_id"], a["reward"], count_earned=False)
+            with db.tx():  # отметка и награда — одним куском
+                db.exec("INSERT INTO achievements (user_id, key, claimed) VALUES (?, ?, 1) "
+                        "ON CONFLICT(user_id, key) DO UPDATE SET claimed = 1",
+                        (user["user_id"], key))
+                add_cookies(user["user_id"], a["reward"], count_earned=False)
             return a["reward"]
     raise ValueError("err_no_item")
 

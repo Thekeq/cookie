@@ -87,19 +87,19 @@ db.update_user(UID, combo_last_at=time.time() - cfg.COMBO_WINDOW - 2)
 r = c.post("/api/click", json={"clicks": 10}, headers=H)
 check("combo resets after pause", r.json().get("combo") == 1.0, str(r.json().get("combo")))
 
-# --- дедупликация клик-батчей по seq ---
+# --- дедупликация клик-батчей по batch_id ---
 db.update_user(UID, energy=2000)
 time.sleep(1.0)  # даём CPS-окну накопить allowance
-seq = int(time.time() * 1000)
-r = c.post("/api/click", json={"clicks": 5, "seq": seq}, headers=H)
-check("seq batch accepted", r.json()["accepted"] == 5, r.text[:120])
+r = c.post("/api/click", json={"clicks": 5, "batch_id": "batch-A"}, headers=H)
+check("batch accepted", r.json()["accepted"] == 5, r.text[:120])
 cookies_after = db.get_user(UID)["cookies"]
-r = c.post("/api/click", json={"clicks": 5, "seq": seq}, headers=H)  # повтор (ретрай)
-check("duplicate seq not credited",
+r = c.post("/api/click", json={"clicks": 5, "batch_id": "batch-A"}, headers=H)  # ретрай
+check("duplicate batch not credited",
       r.json().get("duplicate") is True and r.json()["accepted"] == 0, r.text[:120])
 check("cookies unchanged on dup", db.get_user(UID)["cookies"] == cookies_after)
-r = c.post("/api/click", json={"clicks": 5, "seq": seq - 100}, headers=H)  # устаревший
-check("stale seq not credited", r.json()["accepted"] == 0)
+time.sleep(0.7)
+r = c.post("/api/click", json={"clicks": 3, "batch_id": "batch-B"}, headers=H)  # другой батч
+check("new batch credited", r.json()["accepted"] == 3, r.text[:120])
 
 # --- престиж ---
 r = c.get("/api/prestige", headers=H)

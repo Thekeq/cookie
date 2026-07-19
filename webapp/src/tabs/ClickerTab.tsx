@@ -56,9 +56,10 @@ export default function ClickerTab() {
     return () => clearInterval(timer)
   }, [combo])
 
-  // батч-отправка кликов раз в 1.5 сек; seq = метка времени батча:
-  // потерянный ответ ретраится тем же seq, сервер не начислит дважды
-  const retryBatch = useRef<{ seq: number; n: number } | null>(null)
+  // батч-отправка кликов раз в 1.5 сек; у каждого батча уникальный id:
+  // потерянный ответ ретраится тем же id, сервер не начислит дважды,
+  // а батчи с других устройств не конфликтуют (id не глобальный счётчик)
+  const retryBatch = useRef<{ id: string; n: number } | null>(null)
   const inflight = useRef(false)
   useEffect(() => {
     const timer = setInterval(async () => {
@@ -68,11 +69,11 @@ export default function ClickerTab() {
         const n = pending.current
         if (!n) return
         pending.current = 0
-        batch = { seq: Date.now(), n }
+        batch = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, n }
       }
       inflight.current = true
       try {
-        const r = await api.post('/api/click', { clicks: batch.n, seq: batch.seq })
+        const r = await api.post('/api/click', { clicks: batch.n, batch_id: batch.id })
         retryBatch.current = null
         // серверное комбо принимаем, только если игрок ещё тапает —
         // иначе устаревший ответ «воскресит» уже погасшее комбо

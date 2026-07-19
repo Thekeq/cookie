@@ -91,14 +91,12 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
     cost = cfg.building_cost(body.key, owned)
     if user["cookies"] < cost:
         raise HTTPException(400, "err_no_cookies")
-    db.update_user(tg["id"], cookies=user["cookies"] - cost)
-    if owned:
-        db.exec("UPDATE farm SET count = count + 1 WHERE user_id = ? AND building_key = ?",
+    with db.tx():  # списание и здание — одним куском
+        db.update_user(tg["id"], cookies=user["cookies"] - cost)
+        db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, ?, 1) "
+                "ON CONFLICT(user_id, building_key) DO UPDATE SET count = count + 1",
                 (tg["id"], body.key))
-    else:
-        db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, ?, 1)",
-                (tg["id"], body.key))
-    gl.quest_progress(tg["id"], "buildings", 1)
+        gl.quest_progress(tg["id"], "buildings", 1)
     return await farm_state(tg)
 
 
@@ -117,8 +115,10 @@ async def buy_upgrade(body: KeyIn, tg: dict = Depends(tg_user)):
     # фарм-доход до апгрейда — по старой ставке
     gl.collect_farm(user)
     user = db.get_user(tg["id"])
-    db.update_user(tg["id"], cookies=user["cookies"] - u["cost"])
-    db.exec("INSERT INTO upgrades (user_id, upgrade_key) VALUES (?, ?)", (tg["id"], body.key))
+    with db.tx():  # списание и апгрейд — одним куском
+        db.update_user(tg["id"], cookies=user["cookies"] - u["cost"])
+        db.exec("INSERT OR IGNORE INTO upgrades (user_id, upgrade_key) VALUES (?, ?)",
+                (tg["id"], body.key))
     return await farm_state(tg)
 
 
@@ -136,8 +136,10 @@ async def buy_skin(body: KeyIn, tg: dict = Depends(tg_user)):
         raise HTTPException(400, "err_owned")
     if user["cookies"] < s["cost"]:
         raise HTTPException(400, "err_no_cookies")
-    db.update_user(tg["id"], cookies=user["cookies"] - s["cost"])
-    db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?)", (tg["id"], body.key))
+    with db.tx():  # списание и скин — одним куском
+        db.update_user(tg["id"], cookies=user["cookies"] - s["cost"])
+        db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
+                (tg["id"], body.key))
     return await farm_state(tg)
 
 

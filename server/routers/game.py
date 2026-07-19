@@ -78,60 +78,66 @@ async def quest_claim(body: ClaimQuest, tg: dict = Depends(tg_user)):
 # ---------- кликер ----------
 
 class ClickBatch(BaseModel):
-    clicks: int   # сколько кликов накопил клиент с прошлой отправки
-    seq: int = 0  # монотонный номер батча: повтор того же seq не начисляется
+    clicks: int         # сколько кликов накопил клиент с прошлой отправки
+    batch_id: str = ""  # уникальный id батча: повтор (ретрай) не начисляется дважды
 
 
 @router.post("/click")
 async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
-    user = gl.refresh_energy(_ensure_user(tg))
-
-    # дедупликация: клиент ретраит потерянный ответ тем же seq — если этот
-    # батч уже начислён, отдаём актуальное состояние без второго начисления
-    if batch.seq and batch.seq <= user["click_seq"]:
-        return {"accepted": 0, "earned": 0, "duplicate": True,
-                "combo": gl.current_combo(user),
-                "energy": user["energy"], "cookies": user["cookies"],
-                "xp": user["xp"], "golden": gl.golden_state(user)}
-
-    clicks = max(0, min(batch.clicks, 200))  # защита от мусора
-
-    # CPS-лимит: окно копит "допустимые" клики со скоростью MAX_CPS.
-    # Живёт в БД (не в памяти процесса) — переживает рестарт и несколько worker'ов
     now = time.time()
-    last_ts, allowance = user["cps_ts"], user["cps_allowance"]
-    if not last_ts:
-        allowance = float(cfg.MAX_CPS)
-    allowance = min(cfg.MAX_CPS * 3, allowance + (now - last_ts) * cfg.MAX_CPS)
-    clicks = int(min(clicks, allowance))
-
-    # энергия
-    clicks = int(min(clicks, user["energy"] // cfg.ENERGY_PER_CLICK))
-    if clicks <= 0:
-        db.update_user(tg["id"], click_seq=max(batch.seq, user["click_seq"]),
-                       cps_ts=now, cps_allowance=allowance)
-        return {"accepted": 0, "earned": 0, "combo": gl.current_combo(user),
-                "energy": user["energy"], "cookies": user["cookies"]}
-
-    combo = gl.update_combo(user, clicks, now)
-    earned = (clicks * cfg.click_power(user["click_level"])
-              * gl.click_multiplier(tg["id"]) * combo)
-
-    # дневной счётчик кликов: после мягкого капа XP за клик режется вчетверо
-    today = gl._utc_day(now)
-    day_count = user["clicks_day_count"] if user["clicks_day"] == today else 0
-    under_cap = max(0, min(clicks, cfg.CLICK_XP_SOFT_CAP - day_count))
-    xp = under_cap * cfg.CLICK_XP_RATE + (clicks - under_cap) * cfg.CLICK_XP_RATE_CAPPED
-
-    # начисление атомарно: seq фиксируется вместе с деньгами, поэтому
-    # упавший посередине батч либо начислён целиком, либо не начислён вовсе
+    # ВСЁ внутри одной транзакции (BEGIN IMMEDIATE = write-lock):
+    # параллельный worker дождётся и увидит уже обновлённое состояние,
+    # а упавший посередине батч откатится целиком вместе со своим batch_id
     with db.tx():
+        user = gl.refresh_energy(_ensure_user(tg))
+
+        # дедупликация по (user_id, batch_id): id уникален для каждого батча,
+        # поэтому честные батчи с другого устройства не отбрасываются
+        if batch.batch_id:
+            db.exec("INSERT OR IGNORE INTO click_batches (user_id, batch_id, "
+                    "created_at) VALUES (?, ?, ?)",
+                    (tg["id"], batch.batch_id[:64], now))
+            if db.cursor.rowcount == 0:  # уже обработан — ретрай потерянного ответа
+                return {"accepted": 0, "earned": 0, "duplicate": True,
+                        "combo": gl.current_combo(user),
+                        "energy": user["energy"], "cookies": user["cookies"],
+                        "xp": user["xp"], "golden": gl.golden_state(user)}
+            # TTL: чистим свои записи старше часа
+            db.exec("DELETE FROM click_batches WHERE user_id = ? AND created_at < ?",
+                    (tg["id"], now - 3600))
+
+        clicks = max(0, min(batch.clicks, 200))  # защита от мусора
+
+        # CPS-лимит: окно копит "допустимые" клики со скоростью MAX_CPS.
+        # Живёт в БД — переживает рестарт и несколько worker-процессов
+        last_ts, allowance = user["cps_ts"], user["cps_allowance"]
+        if not last_ts:
+            allowance = float(cfg.MAX_CPS)
+        allowance = min(cfg.MAX_CPS * 3, allowance + (now - last_ts) * cfg.MAX_CPS)
+        clicks = int(min(clicks, allowance))
+
+        # энергия
+        clicks = int(min(clicks, user["energy"] // cfg.ENERGY_PER_CLICK))
+        if clicks <= 0:
+            db.update_user(tg["id"], cps_ts=now, cps_allowance=allowance)
+            return {"accepted": 0, "earned": 0, "combo": gl.current_combo(user),
+                    "energy": user["energy"], "cookies": user["cookies"]}
+
+        combo = gl.update_combo(user, clicks, now)
+        earned = (clicks * cfg.click_power(user["click_level"])
+                  * gl.click_multiplier(tg["id"]) * combo)
+
+        # дневной счётчик кликов: после мягкого капа XP за клик режется вчетверо
+        today = gl._utc_day(now)
+        day_count = user["clicks_day_count"] if user["clicks_day"] == today else 0
+        under_cap = max(0, min(clicks, cfg.CLICK_XP_SOFT_CAP - day_count))
+        xp = under_cap * cfg.CLICK_XP_RATE + (clicks - under_cap) * cfg.CLICK_XP_RATE_CAPPED
+
         db.update_user(
             tg["id"],
             energy=user["energy"] - clicks * cfg.ENERGY_PER_CLICK,
             total_clicks=user["total_clicks"] + clicks,
             clicks_day=today, clicks_day_count=day_count + clicks,
-            click_seq=max(batch.seq, user["click_seq"]),
             cps_ts=now, cps_allowance=allowance - clicks,
         )
         gl.add_cookies(tg["id"], earned)
@@ -223,10 +229,11 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         raise HTTPException(400, "err_no_cookies")
     free_cells = [c for c in range(cfg.BOARD_SIZE) if c not in board]
     cell = free_cells[0]
-    db.update_user(tg["id"], cookies=user["cookies"] - cost)
-    db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
-            (tg["id"], cell, level))
-    gl.quest_progress(tg["id"], "spawns", 1)
+    with db.tx():  # списание и печенька на доске — одним куском
+        db.update_user(tg["id"], cookies=user["cookies"] - cost)
+        db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
+                (tg["id"], cell, level))
+        gl.quest_progress(tg["id"], "spawns", 1)
     return gl.full_state(tg["id"])
 
 
@@ -249,11 +256,12 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
 
     dst = board[mv.to_cell]
     if src != dst:
-        # свап
-        db.exec("UPDATE board SET cell = -1 WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
-        db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = ?",
-                (mv.from_cell, tg["id"], mv.to_cell))
-        db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = -1", (mv.to_cell, tg["id"]))
+        # свап — три шага через временную клетку, строго одной транзакцией
+        with db.tx():
+            db.exec("UPDATE board SET cell = -1 WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
+            db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = ?",
+                    (mv.from_cell, tg["id"], mv.to_cell))
+            db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = -1", (mv.to_cell, tg["id"]))
         return gl.full_state(tg["id"])
 
     # merge!
@@ -262,12 +270,13 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
         raise HTTPException(400, "err_max_item")
     if cfg.item_unlock_level(new_level) > user["level"]:
         raise HTTPException(400, f"err_item_locked|{cfg.item_unlock_level(new_level)}")
-    db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
-    db.exec("UPDATE board SET item_level = ? WHERE user_id = ? AND cell = ?",
-            (new_level, tg["id"], mv.to_cell))
-    db.update_user(tg["id"], total_merges=user["total_merges"] + 1)
-    gl.add_xp(db.get_user(tg["id"]), cfg.merge_reward_xp(new_level))
-    gl.quest_progress(tg["id"], "merges", 1)
+    with db.tx():  # удаление + апгрейд + счётчики — одним куском
+        db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
+        db.exec("UPDATE board SET item_level = ? WHERE user_id = ? AND cell = ?",
+                (new_level, tg["id"], mv.to_cell))
+        db.update_user(tg["id"], total_merges=user["total_merges"] + 1)
+        gl.add_xp(db.get_user(tg["id"]), cfg.merge_reward_xp(new_level))
+        gl.quest_progress(tg["id"], "merges", 1)
 
     state = gl.full_state(tg["id"])
     state["merged_level"] = new_level
@@ -300,12 +309,13 @@ async def claim_level(tg: dict = Depends(tg_user)):
     if not nxt:
         raise HTTPException(400, "err_no_xp")
     reward = cfg.level_reward(nxt)
-    db.update_user(tg["id"], level=nxt)
-    gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
-    if reward.get("full_refill"):
-        fresh = db.get_user(tg["id"])
-        db.update_user(tg["id"], energy=gl.energy_cap(fresh),
-                       energy_updated_at=time.time())
+    with db.tx():  # уровень + награда + refill — одним куском
+        db.update_user(tg["id"], level=nxt)
+        gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
+        if reward.get("full_refill"):
+            fresh = db.get_user(tg["id"])
+            db.update_user(tg["id"], energy=gl.energy_cap(fresh),
+                           energy_updated_at=time.time())
     state = gl.full_state(tg["id"])
     state["level_up"] = {"level": nxt, "reward": reward}
     return state

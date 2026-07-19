@@ -72,10 +72,15 @@ class DataBase:
                 # --- дневной кап XP за клики ---
                 'clicks_day': 'TEXT',                   # 'YYYY-MM-DD' (UTC)
                 'clicks_day_count': 'INTEGER DEFAULT 0',
-                # --- дедупликация клик-батчей + CPS-лимит (переживают рестарт) ---
-                'click_seq': 'INTEGER DEFAULT 0',       # последний обработанный batch seq
+                # --- CPS-лимит (переживает рестарт и мульти-worker) ---
                 'cps_ts': 'REAL DEFAULT 0',             # окно анти-чита: время
                 'cps_allowance': 'REAL DEFAULT 0',      # окно анти-чита: остаток кликов
+            },
+            'click_batches': {  # обработанные батчи кликов (дедуп ретраев, TTL ~1ч)
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER',
+                'batch_id': 'TEXT',
+                'created_at': 'REAL DEFAULT 0',
             },
             'farm': {  # здания автофарма: одна строка = тип здания у юзера
                 'id': 'INTEGER PRIMARY KEY',
@@ -185,7 +190,7 @@ class DataBase:
             "ON daily_quests(user_id, day, quest_key)")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_season_earned ON users(season_earned)")
-        self._dedupe_and_unique()
+        self._dedupe_and_unique(db_file)
         self.connection.commit()
 
     # пары колонок, которые обязаны быть уникальными; код и так это проверяет,
@@ -199,11 +204,60 @@ class DataBase:
         "promo_redemptions": ("user_id", "code"),
         "ref_claims": ("user_id", "milestone_key"),
         "season_results": ("season_id", "user_id"),
+        "click_batches": ("user_id", "batch_id"),
     }
 
-    def _dedupe_and_unique(self):
-        """Сначала убираем возможные дубли (оставляем строку с меньшим id),
-        затем вешаем UNIQUE-индексы, чтобы новые дубли были невозможны."""
+    def _has_duplicates(self) -> bool:
+        for table, cols in self.UNIQUES.items():
+            if self.q1(f"SELECT 1 AS x FROM {table} GROUP BY {', '.join(cols)} "
+                       f"HAVING COUNT(*) > 1 LIMIT 1"):
+                return True
+        return bool(self.q1(
+            "SELECT 1 AS x FROM purchases WHERE tg_payment_id IS NOT NULL "
+            "GROUP BY tg_payment_id HAVING COUNT(*) > 1 LIMIT 1"))
+
+    def _backup(self, db_file: str):
+        """Копия базы перед разрушительной миграцией (sqlite backup API)."""
+        path = f"{db_file}.pre-dedup-{int(time.time())}.bak"
+        dest = sqlite3.connect(path)
+        try:
+            self.connection.backup(dest)
+            print(f"[*] Миграция: найдены дубли, бэкап сохранён в {path}")
+        finally:
+            dest.close()
+
+    def _dedupe_and_unique(self, db_file: str):
+        """Схлопывает дубли С УЧЁТОМ ДАННЫХ (ферма — суммируем количество,
+        доска — оставляем лучшую печеньку, ачивки — сохраняем claimed,
+        платежи — сохраняем fulfilled), затем вешает UNIQUE-индексы."""
+        if self._has_duplicates() and db_file != ":memory:":
+            self._backup(db_file)
+
+        # ферма: у выжившей строки — суммарное количество зданий
+        self.cursor.execute(
+            "UPDATE farm SET count = (SELECT SUM(f2.count) FROM farm f2 "
+            " WHERE f2.user_id = farm.user_id AND f2.building_key = farm.building_key) "
+            "WHERE id IN (SELECT MIN(id) FROM farm GROUP BY user_id, building_key "
+            "             HAVING COUNT(*) > 1)")
+        # доска: в клетке выживает печенька максимального уровня
+        self.cursor.execute(
+            "DELETE FROM board WHERE EXISTS (SELECT 1 FROM board b2 "
+            " WHERE b2.user_id = board.user_id AND b2.cell = board.cell "
+            " AND (b2.item_level > board.item_level "
+            "      OR (b2.item_level = board.item_level AND b2.id < board.id)))")
+        # ачивки: если хоть один дубль заклеймлен — сохраняем claimed=1
+        self.cursor.execute(
+            "UPDATE achievements SET claimed = (SELECT MAX(a2.claimed) FROM achievements a2 "
+            " WHERE a2.user_id = achievements.user_id AND a2.key = achievements.key) "
+            "WHERE id IN (SELECT MIN(id) FROM achievements GROUP BY user_id, key "
+            "             HAVING COUNT(*) > 1)")
+        # платежи: fulfilled важнее paid — переносим статус на выжившую строку
+        self.cursor.execute(
+            "UPDATE purchases SET status = 'fulfilled' "
+            "WHERE tg_payment_id IS NOT NULL AND status != 'fulfilled' AND EXISTS "
+            "(SELECT 1 FROM purchases p2 WHERE p2.tg_payment_id = purchases.tg_payment_id "
+            " AND p2.status = 'fulfilled')")
+
         for table, cols in self.UNIQUES.items():
             col_list = ", ".join(cols)
             self.cursor.execute(

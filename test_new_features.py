@@ -78,6 +78,31 @@ r = c.post("/api/daily/claim", headers=H(UID))
 check("daily streak resets after miss", r.status_code == 200 and r.json()["streak"] == 1,
       r.text[:200])
 
+# --- атомарность: сбой внутри tx откатывает всё ---
+_before = db.get_user(UID)["cookies"]
+try:
+    with db.tx():
+        db.update_user(UID, cookies=_before + 12345)
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+check("tx rollback works", db.get_user(UID)["cookies"] == _before)
+
+# daily: если начисление награды упало, клейм не фиксируется (нет claimed без денег)
+db.update_user(UID, daily_claimed_at=0, daily_streak=0)
+_orig_add = gl.add_cookies
+gl.add_cookies = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fail"))
+try:
+    gl.claim_daily(db.get_user(UID))
+except RuntimeError:
+    pass
+gl.add_cookies = _orig_add
+check("daily atomic: no claim on failed reward",
+      db.get_user(UID)["daily_claimed_at"] == 0)
+r = c.post("/api/daily/claim", headers=H(UID))
+check("daily claim works after failed attempt", r.status_code == 200, r.text[:120])
+db.update_user(UID, daily_claimed_at=time.time())  # вернуть состояние для следующих тестов
+
 # --- quests ---
 r = c.get("/api/quests", headers=H(UID))
 qs = r.json()["quests"]
@@ -127,6 +152,14 @@ check("rollover reset", u["season_earned"] == 0 and u["bp_xp"] == 0
       and u["bp_premium"] == 0 and u["season_id"] == gl.current_season())
 res = gl.my_last_season_result(UID)
 check("season result saved", res is not None and res["rank"] >= 1, str(res))
+# идемпотентность ролловера: частичный снапшот прошлого сбоя не роняет повтор
+db.update_user(UID, season_id=gl.current_season() - 1, season_earned=777)
+db.exec("INSERT OR IGNORE INTO season_results (season_id, user_id, rank, earned, "
+        "reward_cookies, created_at) VALUES (?, ?, 1, 777, 0, ?)",
+        (gl.current_season() - 1, UID, time.time()))
+gl.finalize_seasons()  # не должен упасть на IntegrityError
+check("rollover survives partial snapshot",
+      db.get_user(UID)["season_id"] == gl.current_season())
 if res and res["rank"] <= 10:
     check("season reward paid", db.get_user(UID)["cookies"] > 0)
 
