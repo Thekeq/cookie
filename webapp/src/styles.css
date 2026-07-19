@@ -232,14 +232,15 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   filter: drop-shadow(0 6px 10px rgba(0, 0, 0, 0.45));
 }
 
-/* селектор уровня покупаемой печеньки */
+/* селектор уровня покупаемой печеньки: перенос рядами, без скролла —
+   горизонтальная лента не листалась на ПК (скрытый скроллбар) и спорила
+   со свайпами Telegram на телефоне */
 .spawn-levels {
-  display: flex; gap: 6px; overflow-x: auto; padding: 2px 0 8px;
-  scrollbar-width: none;
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 8px;
+  justify-content: center;
 }
-.spawn-levels::-webkit-scrollbar { display: none; }
 .spawn-lvl {
-  flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+  display: flex; flex-direction: column; align-items: center;
   background: var(--card); border: 2px solid var(--card-edge); border-radius: 12px;
   color: var(--text);
   padding: 5px 9px; font-size: 20px; cursor: pointer;
