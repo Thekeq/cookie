@@ -15,10 +15,17 @@ export default function Segments<T extends string>({
           key={it.key}
           className="btn secondary"
           style={{
-            padding: '9px 0',
+            padding: '9px 2px',
             fontSize: 13,
             position: 'relative',
             outline: value === it.key ? '2px solid var(--accent)' : 'none',
+            // строго равные доли: без minWidth flex не даёт кнопке ужаться
+            // меньше текста ("Завдання" распирала свой сегмент)
+            flex: '1 1 0',
+            minWidth: 0,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
           }}
           onClick={() => onChange(it.key)}
         >
