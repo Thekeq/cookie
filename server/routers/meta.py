@@ -54,8 +54,14 @@ async def auth(tg: dict = Depends(tg_user)):
     if user.get("lang") != tg["lang"]:
         db.update_user(tg["id"], lang=tg["lang"])
 
+    # оффлайн-доход начисляем сразу при входе, а не при первом /api/state —
+    # иначе шапка первые полминуты показывала «вчерашний» баланс
+    passive = gl.collect_passive(db.get_user(tg["id"]))
+    farm_income = gl.collect_farm(db.get_user(tg["id"]))
+
     state = gl.full_state(tg["id"])
     state["just_registered"] = just_registered
+    state["passive_collected"] = passive + farm_income
     return state
 
 
@@ -236,12 +242,14 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
 
 @router.get("/leaderboard")
 async def leaderboard(tg: dict = Depends(tg_user)):
-    """Сезонный топ по season_earned; сезон длится SEASON_LENGTH_DAYS, топ-10 получают награды."""
+    """Сезонный топ: по уровню, при равном уровне — по season_earned.
+    Сезон длится SEASON_LENGTH_DAYS, топ-10 получают награды."""
     gl.finalize_seasons()
     season = gl.current_season()
     top = db.q(
         "SELECT user_id, username, first_name, level, season_earned "
-        "FROM users WHERE season_id = ? ORDER BY season_earned DESC LIMIT 100", (season,))
+        "FROM users WHERE season_id = ? "
+        "ORDER BY level DESC, season_earned DESC LIMIT 100", (season,))
     for i, row in enumerate(top):
         row["rank"] = i + 1
         row["name"] = row.pop("first_name") or row.pop("username") or "Player"
@@ -253,8 +261,9 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     my_rank = None
     if me:
         my_rank = db.q1(
-            "SELECT COUNT(*) c FROM users WHERE season_id = ? AND season_earned > ?",
-            (season, me["season_earned"]))["c"] + 1
+            "SELECT COUNT(*) c FROM users WHERE season_id = ? AND "
+            "(level > ? OR (level = ? AND season_earned > ?))",
+            (season, me["level"], me["level"], me["season_earned"]))["c"] + 1
     return {
         "top": top,
         "me": {"rank": my_rank, "season_earned": me["season_earned"] if me else 0},

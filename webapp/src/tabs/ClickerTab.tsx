@@ -12,7 +12,7 @@ interface Float {
 }
 
 export default function ClickerTab() {
-  const { state, setState, toast, refresh } = useGame()
+  const { state, setState, toast, refresh, liveBalance, bumpBalance } = useGame()
   const t = useT()
   const te = useTErr()
   const [floats, setFloats] = useState<Float[]>([])
@@ -20,8 +20,8 @@ export default function ClickerTab() {
   const floatId = useRef(0)
   const wrapRef = useRef<HTMLDivElement>(null)
 
-  // локальный предикт: рисуем энергию/печеньки сразу, сервер подтверждает батчем
-  const [localCookies, setLocalCookies] = useState(state.user.cookies)
+  // локальный предикт энергии: рисуем сразу, сервер подтверждает батчем
+  // (баланс живёт в App — liveBalance, общий для шапки и этой вкладки)
   const [localEnergy, setLocalEnergy] = useState(state.user.energy)
   const [combo, setCombo] = useState(1)
   const lastTapAt = useRef(0) // для локального затухания комбо
@@ -30,7 +30,6 @@ export default function ClickerTab() {
   const [goldenPos] = useState(() => ({ left: 15 + Math.random() * 55, top: 18 + Math.random() * 40 }))
 
   useEffect(() => {
-    setLocalCookies(state.user.cookies)
     setLocalEnergy(state.user.energy)
   }, [state.user.cookies, state.user.energy])
 
@@ -95,7 +94,7 @@ export default function ClickerTab() {
     sfxClick()
     lastTapAt.current = Date.now()
     pending.current += 1
-    setLocalCookies((c) => c + state.user.click_power * combo)
+    bumpBalance(state.user.click_power * combo)
     setLocalEnergy((en) => en - 1)
 
     const rect = wrapRef.current!.getBoundingClientRect()
@@ -153,7 +152,7 @@ export default function ClickerTab() {
         </div>
       </div>
 
-      <div style={{ fontSize: 30, fontWeight: 800, marginBottom: 4 }}>🍪 {fmt(localCookies)}</div>
+      <div style={{ fontSize: 30, fontWeight: 800, marginBottom: 4 }}>🍪 {fmt(liveBalance)}</div>
       <div className="hint" style={{ marginBottom: 10 }}>
         +{fmt(state.user.click_power * combo)} {t('per_click')}
         {boost && <span style={{ color: 'var(--good)' }}> · {t('boost_active')}</span>}
@@ -194,7 +193,7 @@ export default function ClickerTab() {
             </div>
           </div>
         </div>
-        <button className="btn" disabled={localCookies < state.user.click_upgrade_cost} onClick={upgrade}>
+        <button className="btn" disabled={liveBalance < state.user.click_upgrade_cost} onClick={upgrade}>
           {t('upgrade_for')} 🍪 {fmt(state.user.click_upgrade_cost)}
         </button>
       </div>

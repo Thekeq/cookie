@@ -150,7 +150,7 @@ const dict = {
   // сезоны
   season_ends: { en: 'Season ends in {n}', uk: 'Сезон закінчиться через {n}', ru: 'Сезон закончится через {n}' },
   season_num: { en: 'Season {n}', uk: 'Сезон {n}', ru: 'Сезон {n}' },
-  lb_season_hint: { en: 'Top-10 get cookie prizes at season end. Progress resets each season!', uk: 'Топ-10 отримають призи наприкінці сезону. Прогрес скидається щосезону!', ru: 'Топ-10 получат призы в конце сезона. Прогресс сбрасывается каждый сезон!' },
+  lb_season_hint: { en: 'Ranked by level; ties by cookies earned. Top-10 get prizes at season end. Progress resets each season!', uk: 'Рейтинг за рівнем, за рівності — за печивками. Топ-10 отримають призи наприкінці сезону. Прогрес скидається щосезону!', ru: 'Рейтинг по уровню, при равенстве — по печенькам. Топ-10 получат призы в конце сезона. Прогресс сбрасывается каждый сезон!' },
   lb_last_season: { en: 'Last season: #{r} — +{n} 🍪', uk: 'Минулий сезон: #{r} — +{n} 🍪', ru: 'Прошлый сезон: #{r} — +{n} 🍪' },
   days_short: { en: '{n}d', uk: '{n}д', ru: '{n}д' },
   hours_short: { en: '{n}h', uk: '{n}год', ru: '{n}ч' },

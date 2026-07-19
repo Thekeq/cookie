@@ -31,7 +31,7 @@ def finalize_seasons():
         top = db.q(
             "SELECT user_id, season_earned FROM users "
             "WHERE season_id = ? AND season_earned > 0 "
-            "ORDER BY season_earned DESC LIMIT 10", (season,))
+            "ORDER BY level DESC, season_earned DESC LIMIT 10", (season,))
         now = time.time()
         for i, u in enumerate(top):
             reward = cfg.season_reward(i + 1, u["season_earned"])

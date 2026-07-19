@@ -109,6 +109,10 @@ lb = r.json()
 check("lb has season fields", "season_ends_at" in lb and "season" in lb)
 check("lb top has prizes", all("prize" in row for row in lb["top"]))
 check("lb top has me", any(row["is_me"] for row in lb["top"]))
+# сортировка: уровень главнее, при равном уровне — season_earned
+ranks = [(row["level"], row["season_earned"]) for row in lb["top"]]
+check("lb sorted by level then earned",
+      ranks == sorted(ranks, key=lambda x: (-x[0], -x[1])), str(ranks[:5]))
 
 # --- season rollover ---
 db.update_user(UID, season_id=gl.current_season() - 1, season_earned=55555,

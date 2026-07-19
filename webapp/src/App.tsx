@@ -17,6 +17,10 @@ interface Ctx {
   refresh: () => Promise<void>
   toast: (msg: string, isError?: boolean) => void
   isAdmin: boolean
+  /** единый живой баланс для всех вкладок: сервер + пассивный тик + предикт кликов */
+  liveBalance: number
+  /** предикт клика: мгновенно прибавляет к балансу, сервер подтвердит батчем */
+  bumpBalance: (n: number) => void
 }
 
 const GameCtx = createContext<Ctx>(null!)
@@ -55,6 +59,10 @@ function Game() {
   const [dailyShown, setDailyShown] = useState(false)
   // живой баланс: тикает каждую секунду со скоростью фермы + пассивки мерджа
   const [liveCookies, setLiveCookies] = useState(0)
+  // предикт кликов: тапы падают сюда мгновенно, сервер подтверждает батчем
+  const [clickDelta, setClickDelta] = useState(0)
+
+  const bumpBalance = useCallback((n: number) => setClickDelta((v) => v + n), [])
 
   const toast = useCallback((text: string, err = false) => {
     setToastMsg({ text, err })
@@ -83,9 +91,11 @@ function Game() {
     return () => clearInterval(timer)
   }, [state !== null, showOnboarding, refresh])
 
-  // при любом обновлении стейта с сервера локальная прибавка обнуляется
+  // при любом обновлении стейта с сервера локальная прибавка обнуляется:
+  // серверный баланс уже включает и пассивку, и подтверждённые клики
   useEffect(() => {
     setLiveCookies(0)
+    setClickDelta(0)
   }, [state?.user.cookies])
 
   useEffect(() => {
@@ -127,7 +137,7 @@ function Game() {
 
   if (showOnboarding)
     return (
-      <GameCtx.Provider value={{ state, setState, refresh, toast, isAdmin }}>
+      <GameCtx.Provider value={{ state, setState, refresh, toast, isAdmin, liveBalance: state.user.cookies, bumpBalance }}>
         <Onboarding onDone={() => setShowOnboarding(false)} />
       </GameCtx.Provider>
     )
@@ -141,11 +151,14 @@ function Game() {
     { key: 'profile', ico: '👤', label: t('tab_profile') },
   ]
 
+  // единая правда для всех вкладок: шапка и кликер показывают одно число
+  const liveBalance = state.user.cookies + liveCookies + clickDelta
+
   return (
-    <GameCtx.Provider value={{ state, setState, refresh, toast, isAdmin }}>
+    <GameCtx.Provider value={{ state, setState, refresh, toast, isAdmin, liveBalance, bumpBalance }}>
       <div className="app">
         <div className="header">
-          <div className="balance">🍪 {fmt(state.user.cookies + liveCookies)}</div>
+          <div className="balance">🍪 {fmt(liveBalance)}</div>
           <div className="lvl">
             ⚡ {Math.floor(state.user.energy)}/{state.user.max_energy} · {t('level')}{' '}
             {state.user.level}
