@@ -1,13 +1,15 @@
 """Общая игровая логика поверх БД. Сервер — единственный источник правды."""
 import datetime
 import json
+import os
 import random
 import time
 
 from db import DataBase
 from server import game_config as cfg
 
-db = DataBase("data.db")
+# DATABASE_PATH переопределяет путь (тесты подставляют временную БД)
+db = DataBase(os.environ.get("DATABASE_PATH", "data.db"))
 
 
 # ---------- сезоны ----------
@@ -553,6 +555,8 @@ def full_state(user_id: int) -> dict:
             "xp_next": cfg.xp_for_level(nxt) if nxt <= cfg.MAX_LEVEL else None,
             "energy": user["energy"],
             "max_energy": energy_cap(user, eff),
+            # фактическая скорость регена (с апгрейдами) — клиент рисует такой же тик
+            "energy_regen": cfg.ENERGY_REGEN_PER_SEC + eff["energy_regen"],
             "click_level": user["click_level"],
             "click_power": cfg.click_power(user["click_level"]) * click_multiplier(user_id),
             "click_upgrade_cost": cfg.click_upgrade_cost(user["click_level"]),

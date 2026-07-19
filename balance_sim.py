@@ -14,7 +14,7 @@ SIM_HOURS = 72
 
 state = {
     "cookies": 0.0, "earned": 0.0, "xp": 0.0, "level": 1, "click_level": 1,
-    "energy": 500.0, "buildings": {}, "board_items": 0, "board_max": 0,
+    "energy": float(cfg.max_energy(1)), "buildings": {}, "board_items": 0, "board_max": 0,
 }
 log_events = []
 
@@ -124,3 +124,10 @@ xp_per_day = state["xp"] / (SIM_HOURS / 24) + 750
 bp_days = bp_total / max(1, xp_per_day)
 print(f"\nБатл-пасс ({cfg.BP_MAX_LEVEL} ур., всего {bp_total:,.0f} XP): "
       f"~{bp_days:.1f} дней такого темпа (сезон {cfg.SEASON_LENGTH_DAYS} дн.)")
+
+# --- проверки здоровья баланса: упадут, если конфиг разъехался ---
+assert bp_days <= cfg.SEASON_LENGTH_DAYS + 1, (
+    f"батл-пасс не успевается за сезон: {bp_days:.1f}д > {cfg.SEASON_LENGTH_DAYS}д")
+assert state["level"] <= 12, f"прогрессия слишком быстрая: lvl {state['level']} за {SIM_HOURS}ч"
+assert state["earned"] < 2e9, f"гиперинфляция: {state['earned']:,.0f} за {SIM_HOURS}ч"
+print("assertions: OK")

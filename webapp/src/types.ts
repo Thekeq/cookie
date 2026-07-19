@@ -8,6 +8,7 @@ export interface UserState {
   xp_next: number | null
   energy: number
   max_energy: number
+  energy_regen?: number
   click_level: number
   click_power: number
   click_upgrade_cost: number

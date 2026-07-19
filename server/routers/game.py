@@ -11,9 +11,6 @@ from server.game_logic import db
 
 router = APIRouter(prefix="/api")
 
-# трек последнего батча кликов для CPS-лимита: user_id -> (ts, clicks_left_window)
-_click_windows: dict[int, tuple[float, float]] = {}
-
 
 def _ensure_user(tg: dict) -> dict:
     user = db.get_user(tg["id"])
@@ -81,25 +78,40 @@ async def quest_claim(body: ClaimQuest, tg: dict = Depends(tg_user)):
 # ---------- кликер ----------
 
 class ClickBatch(BaseModel):
-    clicks: int  # сколько кликов накопил клиент с прошлой отправки
+    clicks: int   # сколько кликов накопил клиент с прошлой отправки
+    seq: int = 0  # монотонный номер батча: повтор того же seq не начисляется
 
 
 @router.post("/click")
 async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
     user = gl.refresh_energy(_ensure_user(tg))
+
+    # дедупликация: клиент ретраит потерянный ответ тем же seq — если этот
+    # батч уже начислён, отдаём актуальное состояние без второго начисления
+    if batch.seq and batch.seq <= user["click_seq"]:
+        return {"accepted": 0, "earned": 0, "duplicate": True,
+                "combo": gl.current_combo(user),
+                "energy": user["energy"], "cookies": user["cookies"],
+                "xp": user["xp"], "golden": gl.golden_state(user)}
+
     clicks = max(0, min(batch.clicks, 200))  # защита от мусора
 
-    # CPS-лимит: окно копит "допустимые" клики со скоростью MAX_CPS
+    # CPS-лимит: окно копит "допустимые" клики со скоростью MAX_CPS.
+    # Живёт в БД (не в памяти процесса) — переживает рестарт и несколько worker'ов
     now = time.time()
-    last_ts, allowance = _click_windows.get(tg["id"], (now, float(cfg.MAX_CPS)))
+    last_ts, allowance = user["cps_ts"], user["cps_allowance"]
+    if not last_ts:
+        allowance = float(cfg.MAX_CPS)
     allowance = min(cfg.MAX_CPS * 3, allowance + (now - last_ts) * cfg.MAX_CPS)
     clicks = int(min(clicks, allowance))
-    _click_windows[tg["id"]] = (now, allowance - clicks)
 
     # энергия
     clicks = int(min(clicks, user["energy"] // cfg.ENERGY_PER_CLICK))
     if clicks <= 0:
-        return {"accepted": 0, "earned": 0, "energy": user["energy"], "cookies": user["cookies"]}
+        db.update_user(tg["id"], click_seq=max(batch.seq, user["click_seq"]),
+                       cps_ts=now, cps_allowance=allowance)
+        return {"accepted": 0, "earned": 0, "combo": gl.current_combo(user),
+                "energy": user["energy"], "cookies": user["cookies"]}
 
     combo = gl.update_combo(user, clicks, now)
     earned = (clicks * cfg.click_power(user["click_level"])
@@ -111,15 +123,20 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
     under_cap = max(0, min(clicks, cfg.CLICK_XP_SOFT_CAP - day_count))
     xp = under_cap * cfg.CLICK_XP_RATE + (clicks - under_cap) * cfg.CLICK_XP_RATE_CAPPED
 
-    db.update_user(
-        tg["id"],
-        energy=user["energy"] - clicks * cfg.ENERGY_PER_CLICK,
-        total_clicks=user["total_clicks"] + clicks,
-        clicks_day=today, clicks_day_count=day_count + clicks,
-    )
-    gl.add_cookies(tg["id"], earned)
-    gl.add_xp(db.get_user(tg["id"]), xp)
-    gl.quest_progress(tg["id"], "clicks", clicks)
+    # начисление атомарно: seq фиксируется вместе с деньгами, поэтому
+    # упавший посередине батч либо начислён целиком, либо не начислён вовсе
+    with db.tx():
+        db.update_user(
+            tg["id"],
+            energy=user["energy"] - clicks * cfg.ENERGY_PER_CLICK,
+            total_clicks=user["total_clicks"] + clicks,
+            clicks_day=today, clicks_day_count=day_count + clicks,
+            click_seq=max(batch.seq, user["click_seq"]),
+            cps_ts=now, cps_allowance=allowance - clicks,
+        )
+        gl.add_cookies(tg["id"], earned)
+        gl.add_xp(db.get_user(tg["id"]), xp)
+        gl.quest_progress(tg["id"], "clicks", clicks)
 
     fresh = db.get_user(tg["id"])
     return {"accepted": clicks, "earned": earned, "combo": combo,

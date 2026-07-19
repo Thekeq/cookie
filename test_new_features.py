@@ -8,6 +8,10 @@ import time
 from urllib.parse import urlencode
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
+# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается
+import tempfile
+os.environ["DATABASE_PATH"] = os.path.join(
+    tempfile.gettempdir(), f"cookie_test_{os.getpid()}.db")
 
 from fastapi.testclient import TestClient
 

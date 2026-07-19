@@ -8,6 +8,10 @@ import time
 from urllib.parse import urlencode
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
+# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается
+import tempfile
+os.environ["DATABASE_PATH"] = os.path.join(
+    tempfile.gettempdir(), f"cookie_test_{os.getpid()}.db")
 
 from fastapi.testclient import TestClient
 
@@ -83,6 +87,20 @@ db.update_user(UID, combo_last_at=time.time() - cfg.COMBO_WINDOW - 2)
 r = c.post("/api/click", json={"clicks": 10}, headers=H)
 check("combo resets after pause", r.json().get("combo") == 1.0, str(r.json().get("combo")))
 
+# --- дедупликация клик-батчей по seq ---
+db.update_user(UID, energy=2000)
+time.sleep(1.0)  # даём CPS-окну накопить allowance
+seq = int(time.time() * 1000)
+r = c.post("/api/click", json={"clicks": 5, "seq": seq}, headers=H)
+check("seq batch accepted", r.json()["accepted"] == 5, r.text[:120])
+cookies_after = db.get_user(UID)["cookies"]
+r = c.post("/api/click", json={"clicks": 5, "seq": seq}, headers=H)  # повтор (ретрай)
+check("duplicate seq not credited",
+      r.json().get("duplicate") is True and r.json()["accepted"] == 0, r.text[:120])
+check("cookies unchanged on dup", db.get_user(UID)["cookies"] == cookies_after)
+r = c.post("/api/click", json={"clicks": 5, "seq": seq - 100}, headers=H)  # устаревший
+check("stale seq not credited", r.json()["accepted"] == 0)
+
 # --- престиж ---
 r = c.get("/api/prestige", headers=H)
 check("prestige locked early", r.json()["can_prestige"] is False)
@@ -151,8 +169,7 @@ db.update_user(UID, energy=200000, clicks_day=gl._utc_day(time.time()),
                clicks_day_count=cfg.CLICK_XP_SOFT_CAP, combo_last_at=0)
 xp_before = db.get_user(UID)["xp"]
 db.exec("DELETE FROM daily_quests WHERE user_id = ?", (UID,))
-import server.routers.game as game_router
-game_router._click_windows.pop(UID, None)
+db.update_user(UID, cps_ts=0, cps_allowance=0)  # сброс CPS-окна (теперь в БД)
 r = c.post("/api/click", json={"clicks": 40}, headers=H)
 accepted = r.json()["accepted"]
 xp_gained = db.get_user(UID)["xp"] - xp_before

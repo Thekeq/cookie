@@ -27,6 +27,16 @@ app.include_router(game.router)
 app.include_router(admin.router)
 app.include_router(farm.router)
 
+
+@app.get("/healthz")
+async def healthz():
+    """Живость процесса + доступность БД (для мониторинга/оркестрации)."""
+    import time as _time
+    from server.game_logic import db
+    db.q1("SELECT 1 AS ok")
+    return {"ok": True, "ts": _time.time()}
+
+
 # собранный фронт (webapp/dist) раздаём как статику с корня
 DIST = os.path.join(os.path.dirname(__file__), "webapp", "dist")
 if os.path.isdir(DIST):

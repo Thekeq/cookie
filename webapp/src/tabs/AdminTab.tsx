@@ -90,11 +90,29 @@ export default function AdminTab() {
     setBcBusy(true)
     try {
       const r = await api.post('/api/admin/broadcast', { text: bcText, test })
-      toast(test ? 'Превью отправлено тебе 📨' : `Разослано: ${r.sent} ✅ (блок: ${r.blocked}, ошибки: ${r.failed})`)
-      if (!test) setBcText('')
+      if (test) {
+        toast('Превью отправлено тебе 📨')
+        setBcBusy(false)
+        return
+      }
+      // рассылка идёт фоном на сервере — опрашиваем прогресс
+      toast(`Рассылка запущена (${r.total} получателей)…`)
+      setBcText('')
+      const poll = setInterval(async () => {
+        try {
+          const s = await api.get('/api/admin/broadcast/status')
+          if (!s.running) {
+            clearInterval(poll)
+            setBcBusy(false)
+            toast(`Разослано: ${s.sent} ✅ (блок: ${s.blocked}, ошибки: ${s.failed})`)
+          }
+        } catch {
+          clearInterval(poll)
+          setBcBusy(false)
+        }
+      }, 2000)
     } catch (e: any) {
       toast(e.detail || 'Ошибка', true)
-    } finally {
       setBcBusy(false)
     }
   }

@@ -1,11 +1,17 @@
+import os
 import sqlite3
 import time
+from contextlib import contextmanager
 
 
 class DataBase:
-    def __init__(self, db_file):
+    def __init__(self, db_file=None):
+        # путь можно переопределить (тесты используют временную БД)
+        db_file = db_file or os.environ.get("DATABASE_PATH", "data.db")
         # timeout=10 говорит базе: если занято, подожди 10 сек, а не падай сразу
         self.connection = sqlite3.connect(db_file, check_same_thread=False, timeout=10)
+        # автокоммит на каждый statement; многошаговые операции — явно через tx()
+        self.connection.isolation_level = None
 
         # Включаем WAL-режим (МЕГА-ВАЖНО для онлайна и скорости)
         self.connection.execute('PRAGMA journal_mode=WAL;')
@@ -13,6 +19,7 @@ class DataBase:
         # Чтобы получать результаты как словари, а не кортежи (удобнее читать)
         self.connection.row_factory = sqlite3.Row
         self.cursor = self.connection.cursor()
+        self._tx_depth = 0
 
         self.tables_schema = {
             'users': {
@@ -65,6 +72,10 @@ class DataBase:
                 # --- дневной кап XP за клики ---
                 'clicks_day': 'TEXT',                   # 'YYYY-MM-DD' (UTC)
                 'clicks_day_count': 'INTEGER DEFAULT 0',
+                # --- дедупликация клик-батчей + CPS-лимит (переживают рестарт) ---
+                'click_seq': 'INTEGER DEFAULT 0',       # последний обработанный batch seq
+                'cps_ts': 'REAL DEFAULT 0',             # окно анти-чита: время
+                'cps_allowance': 'REAL DEFAULT 0',      # окно анти-чита: остаток кликов
             },
             'farm': {  # здания автофарма: одна строка = тип здания у юзера
                 'id': 'INTEGER PRIMARY KEY',
@@ -174,7 +185,41 @@ class DataBase:
             "ON daily_quests(user_id, day, quest_key)")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_season_earned ON users(season_earned)")
+        self._dedupe_and_unique()
         self.connection.commit()
+
+    # пары колонок, которые обязаны быть уникальными; код и так это проверяет,
+    # но параллельные запросы могли бы создать дубли — БД теперь не даст
+    UNIQUES = {
+        "board": ("user_id", "cell"),
+        "farm": ("user_id", "building_key"),
+        "upgrades": ("user_id", "upgrade_key"),
+        "skins": ("user_id", "skin_key"),
+        "achievements": ("user_id", "key"),
+        "promo_redemptions": ("user_id", "code"),
+        "ref_claims": ("user_id", "milestone_key"),
+        "season_results": ("season_id", "user_id"),
+    }
+
+    def _dedupe_and_unique(self):
+        """Сначала убираем возможные дубли (оставляем строку с меньшим id),
+        затем вешаем UNIQUE-индексы, чтобы новые дубли были невозможны."""
+        for table, cols in self.UNIQUES.items():
+            col_list = ", ".join(cols)
+            self.cursor.execute(
+                f"DELETE FROM {table} WHERE id NOT IN "
+                f"(SELECT MIN(id) FROM {table} GROUP BY {col_list})")
+            self.cursor.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{table}_{'_'.join(cols)} "
+                f"ON {table}({col_list})")
+        # один Stars-платёж — одна запись (charge_id уникален, NULL допустим)
+        self.cursor.execute(
+            "DELETE FROM purchases WHERE tg_payment_id IS NOT NULL AND id NOT IN "
+            "(SELECT MIN(id) FROM purchases WHERE tg_payment_id IS NOT NULL "
+            " GROUP BY tg_payment_id)")
+        self.cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_charge "
+            "ON purchases(tg_payment_id) WHERE tg_payment_id IS NOT NULL")
 
     def _auto_migrate(self):
         """ Умная система: создает таблицы или добавляет новые столбцы на лету """
@@ -194,6 +239,28 @@ class DataBase:
 
     # ---------- универсальные хелперы ----------
 
+    @contextmanager
+    def tx(self):
+        """Атомарный блок: все exec() внутри коммитятся одним куском или
+        откатываются целиком. Вложенные tx() присоединяются к внешнему."""
+        if self._tx_depth:
+            self._tx_depth += 1
+            try:
+                yield
+            finally:
+                self._tx_depth -= 1
+            return
+        self._tx_depth = 1
+        self.cursor.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        finally:
+            self._tx_depth = 0
+
     def q(self, sql, params=()):
         """SELECT: список dict"""
         self.cursor.execute(sql, params)
@@ -206,9 +273,11 @@ class DataBase:
         return dict(row) if row else None
 
     def exec(self, sql, params=()):
-        """INSERT/UPDATE/DELETE с коммитом, возвращает lastrowid"""
+        """INSERT/UPDATE/DELETE, возвращает lastrowid.
+        Вне tx() — автокоммит; внутри tx() коммитит внешний блок."""
         self.cursor.execute(sql, params)
-        self.connection.commit()
+        if not self._tx_depth:
+            self.connection.commit()
         return self.cursor.lastrowid
 
     # ---------- юзеры ----------

@@ -37,13 +37,15 @@ export default function ClickerTab() {
     setGolden(state.golden)
   }, [state.golden?.active, state.golden?.expires_at])
 
-  // регенерация энергии на клиенте (визуально, синхронно с сервером: 0.45/с)
+  // регенерация энергии на клиенте — визуально, той же скоростью, что сервер
+  // (сервер шлёт фактический реген с учётом апгрейдов)
   useEffect(() => {
+    const regen = state.user.energy_regen ?? 0.45
     const timer = setInterval(() => {
-      setLocalEnergy((e) => Math.min(state.user.max_energy, e + 0.45))
+      setLocalEnergy((e) => Math.min(state.user.max_energy, e + regen))
     }, 1000)
     return () => clearInterval(timer)
-  }, [state.user.max_energy])
+  }, [state.user.max_energy, state.user.energy_regen])
 
   // локальное затухание комбо: пауза в тапах > 4с — комбо гаснет сразу на клиенте,
   // не дожидаясь ответа сервера (сервер придёт к тому же выводу по своему окну)
@@ -54,22 +56,34 @@ export default function ClickerTab() {
     return () => clearInterval(timer)
   }, [combo])
 
-  // батч-отправка кликов раз в 1.5 сек
+  // батч-отправка кликов раз в 1.5 сек; seq = метка времени батча:
+  // потерянный ответ ретраится тем же seq, сервер не начислит дважды
+  const retryBatch = useRef<{ seq: number; n: number } | null>(null)
+  const inflight = useRef(false)
   useEffect(() => {
     const timer = setInterval(async () => {
-      const n = pending.current
-      if (!n) return
-      pending.current = 0
+      if (inflight.current) return // запросы не пересекаются — ответы по порядку
+      let batch = retryBatch.current
+      if (!batch) {
+        const n = pending.current
+        if (!n) return
+        pending.current = 0
+        batch = { seq: Date.now(), n }
+      }
+      inflight.current = true
       try {
-        const r = await api.post('/api/click', { clicks: n })
+        const r = await api.post('/api/click', { clicks: batch.n, seq: batch.seq })
+        retryBatch.current = null
         // серверное комбо принимаем, только если игрок ещё тапает —
         // иначе устаревший ответ «воскресит» уже погасшее комбо
         if (Date.now() - lastTapAt.current < 4000) setCombo(r.combo || 1)
         if (r.golden) setGolden(r.golden)
         setState({ ...state, user: { ...state.user, cookies: r.cookies, energy: r.energy, xp: r.xp ?? state.user.xp } })
       } catch {
-        /* сеть моргнула — клики вернём в очередь */
-        pending.current += n
+        /* сеть моргнула — повторим тот же батч, дедуп на сервере */
+        retryBatch.current = batch
+      } finally {
+        inflight.current = false
       }
     }, 1500)
     return () => clearInterval(timer)
@@ -164,7 +178,11 @@ export default function ClickerTab() {
         🔥 {t('combo')} x{combo.toFixed(1)}
       </div>
 
-      <button className={'big-cookie' + (frenzy ? ' frenzy' : '')} onPointerDown={onClick}>
+      <button
+        className={'big-cookie' + (frenzy ? ' frenzy' : '')}
+        onPointerDown={onClick}
+        aria-label={t('tab_clicker')}
+      >
         {state.user.skin_emoji || '🍪'}
       </button>
 

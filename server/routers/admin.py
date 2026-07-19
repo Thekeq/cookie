@@ -79,18 +79,54 @@ async def create_source(body: SourceCreate):
     return {"ok": True, "link": f"https://t.me/{BOT_USERNAME}?startapp=src_{code}"}
 
 
-# ---------- рассылка ----------
+# ---------- рассылка (фоном, чтобы не держать HTTP-запрос) ----------
 
 class BroadcastIn(BaseModel):
     text: str
     test: bool = False  # true = отправить только себе (превью)
 
 
-@router.post("/broadcast")
-async def broadcast(body: BroadcastIn, tg: dict = Depends(tg_admin)):
-    """Шлёт сообщение всем юзерам через бота. ~25 сообщений/сек (лимит Telegram)."""
+# прогресс текущей рассылки; одна за раз
+_bc = {"running": False, "sent": 0, "blocked": 0, "failed": 0, "total": 0,
+       "started_at": 0.0, "finished_at": 0.0}
+
+
+async def _run_broadcast(text: str):
     import asyncio
     from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+    from bot.loader import bot
+
+    user_ids = [r["user_id"] for r in
+                db.q("SELECT user_id FROM users WHERE notify_blocked = 0")]
+    _bc.update(running=True, sent=0, blocked=0, failed=0, total=len(user_ids),
+               started_at=time.time(), finished_at=0.0)
+    try:
+        for uid in user_ids:
+            try:
+                await bot.send_message(uid, text)
+                _bc["sent"] += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await bot.send_message(uid, text)
+                    _bc["sent"] += 1
+                except Exception:
+                    _bc["failed"] += 1
+            except TelegramForbiddenError:
+                db.exec("UPDATE users SET notify_blocked = 1 WHERE user_id = ?", (uid,))
+                _bc["blocked"] += 1
+            except Exception:
+                _bc["failed"] += 1
+            await asyncio.sleep(0.04)  # ≈25/сек, безопасно для лимитов Telegram
+    finally:
+        _bc.update(running=False, finished_at=time.time())
+
+
+@router.post("/broadcast")
+async def broadcast(body: BroadcastIn, tg: dict = Depends(tg_admin)):
+    """Превью шлём сразу; полную рассылку запускаем фоновой задачей и
+    отдаём прогресс через /broadcast/status."""
+    import asyncio
     from bot.loader import bot
 
     text = body.text.strip()
@@ -101,27 +137,16 @@ async def broadcast(body: BroadcastIn, tg: dict = Depends(tg_admin)):
         await bot.send_message(tg["id"], text)
         return {"sent": 1, "blocked": 0, "failed": 0, "test": True}
 
-    user_ids = [r["user_id"] for r in
-                db.q("SELECT user_id FROM users WHERE notify_blocked = 0")]
-    sent = blocked = failed = 0
-    for uid in user_ids:
-        try:
-            await bot.send_message(uid, text)
-            sent += 1
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            try:
-                await bot.send_message(uid, text)
-                sent += 1
-            except Exception:
-                failed += 1
-        except TelegramForbiddenError:
-            db.exec("UPDATE users SET notify_blocked = 1 WHERE user_id = ?", (uid,))
-            blocked += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.04)  # ≈25/сек, безопасно для лимитов Telegram
-    return {"sent": sent, "blocked": blocked, "failed": failed, "test": False}
+    if _bc["running"]:
+        raise HTTPException(400, "Рассылка уже идёт")
+    asyncio.create_task(_run_broadcast(text))
+    total = db.q1("SELECT COUNT(*) c FROM users WHERE notify_blocked = 0")["c"]
+    return {"started": True, "total": total}
+
+
+@router.get("/broadcast/status")
+async def broadcast_status():
+    return dict(_bc)
 
 
 # ---------- статистика ----------
@@ -137,7 +162,7 @@ async def stats():
     active_day = db.q1("SELECT COUNT(*) c FROM users WHERE energy_updated_at > ?", (day_ago,))["c"]
     refs = db.q1("SELECT COUNT(*) c FROM referrals")["c"]
     paid = db.q1("SELECT COUNT(*) c, COALESCE(SUM(stars_amount),0) s FROM purchases "
-                 "WHERE status = 'paid'")
+                 "WHERE status IN ('paid', 'fulfilled')")
     by_source = db.q(
         "SELECT COALESCE(source_code, 'organic') src, COUNT(*) c FROM users "
         "GROUP BY source_code ORDER BY c DESC")
