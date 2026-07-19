@@ -38,10 +38,10 @@ export default function ClickerTab() {
     setGolden(state.golden)
   }, [state.golden?.active, state.golden?.expires_at])
 
-  // регенерация энергии на клиенте (визуально, синхронно с сервером: 0.7/с)
+  // регенерация энергии на клиенте (визуально, синхронно с сервером: 0.45/с)
   useEffect(() => {
     const timer = setInterval(() => {
-      setLocalEnergy((e) => Math.min(state.user.max_energy, e + 0.7))
+      setLocalEnergy((e) => Math.min(state.user.max_energy, e + 0.45))
     }, 1000)
     return () => clearInterval(timer)
   }, [state.user.max_energy])

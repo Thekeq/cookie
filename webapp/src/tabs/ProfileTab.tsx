@@ -31,9 +31,10 @@ export default function ProfileTab() {
     api.get('/api/referrals').then(setRefs)
     api.get('/api/channel').then(setChannel).catch(() => {})
   }
+  // перезагружаем при смене языка: ачивки приходят с сервера уже переведёнными
   useEffect(() => {
     load()
-  }, [])
+  }, [lang])
 
   const claimAch = async (key: string) => {
     try {

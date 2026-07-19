@@ -3,12 +3,14 @@
 # ---------- Кликер ----------
 MAX_CPS = 15                    # серверный потолок кликов/сек (анти-чит)
 ENERGY_PER_CLICK = 1
-# 0.7/сек: полный бак (1000) восстанавливается за ~25 мин — пауза ощущается,
-# но не отваживает; сессии тапа всё ещё живут минуты
-ENERGY_REGEN_PER_SEC = 0.7
+# 0.45/сек: полный бак (400) за ~15 мин. Энергия должна КОНЧАТЬСЯ в сессии
+# тапа (80 сек при 5 cps) — иначе апгрейды энергии бессмысленны (фидбек игроков)
+ENERGY_REGEN_PER_SEC = 0.45
 
 def max_energy(user_level: int) -> int:
-    return 1000 + (user_level - 1) * 100
+    """Тесный бак: на 1 lvl хватает на ~80 сек тапа, качается уровнями и
+    апгрейдами energy_cap — теперь их есть смысл покупать."""
+    return 400 + (user_level - 1) * 50
 
 def click_power(click_level: int) -> float:
     """Сколько cookies даёт один клик"""
@@ -65,10 +67,12 @@ def item_unlock_level(item_level: int) -> int:
 MAX_LEVEL = 30
 
 def xp_for_level(level: int) -> float:
-    """Сколько всего XP нужно, чтобы достичь уровня level"""
+    """Сколько всего XP нужно, чтобы достичь уровня level.
+    250*(n-1)^2.1: круче прежних 200^1.9 — фидбек «изи дошёл до 16 за день»;
+    теперь активный игрок берёт ~8 lvl за 3 дня, дальше каждый уровень — событие."""
     if level <= 1:
         return 0
-    return 200 * (level - 1) ** 1.9
+    return 250 * (level - 1) ** 2.1
 
 def level_reward(level: int) -> dict:
     """Награда за достижение уровня. Растёт быстрее линейного, чтобы поздние
@@ -103,13 +107,13 @@ BP_PREMIUM_STARS = 100          # цена premium-пасса в Stars
 
 def bp_xp_for_level(level: int) -> float:
     """Сколько XP стоит взять уровень level (не кумулятивно).
-    Прогрессия level*400: ранние уровни щёлкаются за сессию, полный пасс
-    (186k суммарно) — ~13 дней активной игры (~14k XP/день) из 14 дней сезона."""
-    return level * 400
+    level*160: после энерго-нерфа кликовый XP просел вдвое; полный пасс
+    (74.4k суммарно) — ~12.5 дней активной игры из 14 дней сезона."""
+    return level * 160
 
 def bp_total_xp(level: int) -> float:
     """Кумулятивный XP до уровня level включительно."""
-    return 200 * level * (level + 1)  # сумма арифм. прогрессии x400
+    return 80 * level * (level + 1)  # сумма арифм. прогрессии x160
 
 def bp_level_for_xp(xp: float) -> int:
     lvl = 0
@@ -253,15 +257,15 @@ FARM_BUILDINGS = {
     "granny":   {"base_cost": 1_000,    "cps": 4,     "req_level": 2},
     "bakery":   {"base_cost": 8_000,    "cps": 20,    "req_level": 4},
     "factory":  {"base_cost": 50_000,   "cps": 90,    "req_level": 7},
-    "mine":     {"base_cost": 250_000,  "cps": 350,   "req_level": 10},
-    "portal":   {"base_cost": 1_500_000,"cps": 1500,  "req_level": 15},
-    "timelab":  {"base_cost": 9_000_000,"cps": 7000,  "req_level": 20},
-    "moonbase": {"base_cost": 60_000_000,  "cps": 35000,  "req_level": 24},
-    "singularity": {"base_cost": 400_000_000, "cps": 180000, "req_level": 28},
+    "mine":     {"base_cost": 250_000,  "cps": 250,   "req_level": 10},
+    "portal":   {"base_cost": 1_500_000,"cps": 900,   "req_level": 15},
+    "timelab":  {"base_cost": 9_000_000,"cps": 3800,  "req_level": 20},
+    "moonbase": {"base_cost": 60_000_000,  "cps": 16000,  "req_level": 24},
+    "singularity": {"base_cost": 400_000_000, "cps": 75000, "req_level": 28},
 }
-# 1.18: при 1.15 симуляция показала 90+ курсоров у топов и гиперинфляцию
-# (8.2B за 72ч); 1.18 режет late-game доход в ~2.5 раза, ранний темп не трогает
-FARM_COST_GROWTH = 1.18          # цена растёт за каждое купленное здание
+# 1.22 + пониженный cps топ-зданий: фидбек «залутал за часик и миллиарды»;
+# симуляция 72ч: earned 5.5B -> ~0.4B, фарм 70k -> 4k cps, ранний темп не тронут
+FARM_COST_GROWTH = 1.22          # цена растёт за каждое купленное здание
 FARM_OFFLINE_CAP_HOURS = 3       # оффлайн-фарм копится максимум 3 часа
 
 def building_cost(key: str, owned: int) -> float:

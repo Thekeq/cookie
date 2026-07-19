@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useContext, useEffect, useState } from 'react'
 import { api, openInvoice } from '../api'
 import { fmt, useGame } from '../App'
-import { useT, useTErr } from '../i18n'
+import { LangCtx, useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { ShopItem } from '../types'
 
@@ -18,11 +18,13 @@ export default function ShopTab() {
   const { refresh, toast } = useGame()
   const t = useT()
   const te = useTErr()
+  const { lang } = useContext(LangCtx)
   const [items, setItems] = useState<ShopItem[]>([])
 
+  // товары локализует сервер — при смене языка перезапрашиваем
   useEffect(() => {
     api.get('/api/shop').then((r) => setItems(r.items))
-  }, [])
+  }, [lang])
 
   const buy = async (item: ShopItem) => {
     try {

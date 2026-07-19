@@ -50,7 +50,7 @@ check("auth", r.status_code == 200, r.text[:200])
 s = r.json()
 check("state has golden/combo/prestige",
       "golden" in s and "combo" in s and "prestige" in s)
-check("energy base 1000", s["user"]["max_energy"] >= 1000, str(s["user"]["max_energy"]))
+check("energy base 400", s["user"]["max_energy"] >= 400, str(s["user"]["max_energy"]))
 check("golden scheduled not active", s["golden"]["active"] is False)
 
 # --- золотая печенька: форсим появление ---
@@ -139,8 +139,8 @@ check("merge to lvl13 works", r.status_code == 200
 
 # --- перебаланс: прогрессивный БП, кап XP, динамический магазин, престиж-порог ---
 # прогрессивная цена уровня БП
-check("bp lvl1 costs 400", cfg.bp_xp_for_level(1) == 400)
-check("bp lvl30 costs 12000", cfg.bp_xp_for_level(30) == 12000)
+check("bp lvl1 costs 160", cfg.bp_xp_for_level(1) == 160)
+check("bp lvl30 costs 4800", cfg.bp_xp_for_level(30) == 4800)
 check("bp cumulative consistent",
       cfg.bp_total_xp(30) == sum(cfg.bp_xp_for_level(l) for l in range(1, 31)))
 check("bp_level_for_xp", cfg.bp_level_for_xp(cfg.bp_total_xp(5)) == 5
