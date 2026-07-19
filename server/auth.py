@@ -45,10 +45,12 @@ def validate_init_data(init_data: str) -> dict:
     return parsed
 
 
-async def tg_user(authorization: str = Header(default="")) -> dict:
+async def tg_user(authorization: str = Header(default=""),
+                  x_lang: str = Header(default="en", alias="X-Lang")) -> dict:
     """FastAPI dependency: заголовок Authorization: tma <initData>.
 
-    Возвращает {"id": ..., "username": ..., "first_name": ..., "start_param": ...}
+    Возвращает {"id", "username", "first_name", "start_param", "lang"};
+    lang приходит из Mini App заголовком X-Lang (en/uk/ru).
     """
     if not authorization.startswith("tma "):
         raise HTTPException(401, "Use 'Authorization: tma <initData>'")
@@ -56,17 +58,20 @@ async def tg_user(authorization: str = Header(default="")) -> dict:
     user = data.get("user")
     if not user or "id" not in user:
         raise HTTPException(401, "No user in initData")
+    lang = x_lang if x_lang in ("en", "uk", "ru") else "en"
     return {
         "id": user["id"],
         "username": user.get("username", ""),
         "first_name": user.get("first_name", ""),
         "start_param": data.get("start_param", ""),
+        "lang": lang,
     }
 
 
-async def tg_admin(authorization: str = Header(default="")) -> dict:
+async def tg_admin(authorization: str = Header(default=""),
+                   x_lang: str = Header(default="en", alias="X-Lang")) -> dict:
     """Dependency для админ-роутов: тот же tma-заголовок + проверка ADMIN_ID."""
-    user = await tg_user(authorization)
+    user = await tg_user(authorization, x_lang)
     if user["id"] != ADMIN_ID:
         raise HTTPException(403, "Admins only")
     return user

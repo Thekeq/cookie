@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxMerge } from '../sound'
 import { COOKIE_SKINS } from '../cookieSkins'
 
@@ -17,6 +17,7 @@ interface Drag {
 export default function MergeTab() {
   const { state, setState, toast } = useGame()
   const t = useT()
+  const te = useTErr()
   const [drag, setDrag] = useState<Drag | null>(null)
   const [popCell, setPopCell] = useState<number | null>(null)
   const [buyLevel, setBuyLevel] = useState(1) // уровень покупаемой печеньки
@@ -43,7 +44,7 @@ export default function MergeTab() {
       }
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     } finally {
       busy.current = false
     }
@@ -106,7 +107,7 @@ export default function MergeTab() {
       sfxBuy()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -146,6 +147,7 @@ export default function MergeTab() {
               key={i}
               className={
                 'cell' +
+                (lvl ? ' has-item' : '') +
                 (isSource ? ' drag-source' : '') +
                 (isOver ? (mergeOk ? ' drop-ok' : ' drop-over') : '') +
                 (popCell === i ? ' merge-pop' : '')

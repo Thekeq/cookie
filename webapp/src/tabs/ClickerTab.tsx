@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxClick, sfxError, sfxFanfare } from '../sound'
 
 interface Float {
@@ -14,6 +14,7 @@ interface Float {
 export default function ClickerTab() {
   const { state, setState, toast, refresh } = useGame()
   const t = useT()
+  const te = useTErr()
   const [floats, setFloats] = useState<Float[]>([])
   const pending = useRef(0) // клики, ещё не отправленные на сервер
   const floatId = useRef(0)
@@ -22,7 +23,8 @@ export default function ClickerTab() {
   // локальный предикт: рисуем энергию/печеньки сразу, сервер подтверждает батчем
   const [localCookies, setLocalCookies] = useState(state.user.cookies)
   const [localEnergy, setLocalEnergy] = useState(state.user.energy)
-  const [combo, setCombo] = useState(state.combo?.mult || 1)
+  const [combo, setCombo] = useState(1)
+  const lastTapAt = useRef(0) // для локального затухания комбо
   // золотая печенька: сервер решает когда, клиент рисует и ловит тап
   const [golden, setGolden] = useState(state.golden)
   const [goldenPos] = useState(() => ({ left: 15 + Math.random() * 55, top: 18 + Math.random() * 40 }))
@@ -36,13 +38,22 @@ export default function ClickerTab() {
     setGolden(state.golden)
   }, [state.golden?.active, state.golden?.expires_at])
 
-  // регенерация энергии на клиенте (визуально, синхронно с сервером: 1.2/с)
+  // регенерация энергии на клиенте (визуально, синхронно с сервером: 0.7/с)
   useEffect(() => {
     const timer = setInterval(() => {
-      setLocalEnergy((e) => Math.min(state.user.max_energy, e + 1.2))
+      setLocalEnergy((e) => Math.min(state.user.max_energy, e + 0.7))
     }, 1000)
     return () => clearInterval(timer)
   }, [state.user.max_energy])
+
+  // локальное затухание комбо: пауза в тапах > 4с — комбо гаснет сразу на клиенте,
+  // не дожидаясь ответа сервера (сервер придёт к тому же выводу по своему окну)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (combo > 1 && Date.now() - lastTapAt.current > 4000) setCombo(1)
+    }, 400)
+    return () => clearInterval(timer)
+  }, [combo])
 
   // батч-отправка кликов раз в 1.5 сек
   useEffect(() => {
@@ -52,7 +63,9 @@ export default function ClickerTab() {
       pending.current = 0
       try {
         const r = await api.post('/api/click', { clicks: n })
-        setCombo(r.combo || 1)
+        // серверное комбо принимаем, только если игрок ещё тапает —
+        // иначе устаревший ответ «воскресит» уже погасшее комбо
+        if (Date.now() - lastTapAt.current < 4000) setCombo(r.combo || 1)
         if (r.golden) setGolden(r.golden)
         setState({ ...state, user: { ...state.user, cookies: r.cookies, energy: r.energy, xp: r.xp ?? state.user.xp } })
       } catch {
@@ -80,6 +93,7 @@ export default function ClickerTab() {
     }
     haptic('light')
     sfxClick()
+    lastTapAt.current = Date.now()
     pending.current += 1
     setLocalCookies((c) => c + state.user.click_power * combo)
     setLocalEnergy((en) => en - 1)
@@ -118,7 +132,7 @@ export default function ClickerTab() {
       toast(t('click_upgraded'))
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -146,11 +160,10 @@ export default function ClickerTab() {
         {frenzy && <span style={{ color: 'var(--accent)' }}> · 🔥x7</span>}
       </div>
 
-      {combo > 1.05 && (
-        <div className="combo-badge">
-          🔥 {t('combo')} x{combo.toFixed(1)}
-        </div>
-      )}
+      {/* бейдж комбо всегда в DOM — появление/уход анимируются классом */}
+      <div className={'combo-badge' + (combo > 1.05 ? ' show' : '')}>
+        🔥 {t('combo')} x{combo.toFixed(1)}
+      </div>
 
       <button className={'big-cookie' + (frenzy ? ' frenzy' : '')} onPointerDown={onClick}>
         {state.user.skin_emoji || '🍪'}

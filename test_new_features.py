@@ -175,6 +175,34 @@ u2 = dict(u)
 u2.update(energy=999999, energy_updated_at=now)
 check("push on full energy", _pick_notification(u2, now) is not None)
 
+# --- локализация сервера ---
+from server.i18n import T as SRV_T, tr
+
+missing = [k for k, v in SRV_T.items() if set(v) != {"en", "uk", "ru"}]
+check("server i18n: all keys have en/uk/ru", not missing, str(missing[:5]))
+for key in cfg.SHOP_ITEMS:
+    check(f"shop {key} localized",
+          tr("uk", f"shop_{key}_t") != f"shop_{key}_t")
+for key in cfg.ACHIEVEMENTS:
+    check(f"ach {key} localized",
+          tr("uk", f"ach_{key}_t") != f"ach_{key}_t"
+          and tr("uk", f"ach_{key}_d") != f"ach_{key}_d")
+# ачивки в API переводятся по X-Lang
+r = c.get("/api/achievements", headers={**H(UID), "X-Lang": "uk"})
+first = r.json()["achievements"][0]
+check("achievements API uk", first["title"] == tr("uk", f"ach_{first['key']}_t"),
+      first["title"])
+# магазин переводится
+r = c.get("/api/shop", headers={**H(UID), "X-Lang": "uk"})
+item = r.json()["items"][0]
+check("shop API uk", item["title"] == tr("uk", f"shop_{item['key']}_t"), item["title"])
+# язык синкается в профиль на /auth
+c.post("/api/auth", headers={**H(UID), "X-Lang": "uk"})
+check("lang synced to profile", db.get_user(UID)["lang"] == "uk")
+# ошибки приходят кодами err_*
+r = c.post("/api/promo/redeem", json={"code": "NOPE123"}, headers=H(UID))
+check("errors are err_ codes", r.json()["detail"].startswith("err_"), r.text[:100])
+
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
           "ref_claims", "achievements", "boosts", "purchases"):

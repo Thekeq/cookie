@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, shareRefLink } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 
 const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
 
@@ -28,11 +28,12 @@ const MEDALS = ['🥇', '🥈', '🥉']
 
 export default function LeaderboardTab() {
   const t = useT()
+  const te = useTErr()
   const { state, toast } = useGame()
   const [data, setData] = useState<LBData | null>(null)
 
   useEffect(() => {
-    api.get('/api/leaderboard').then(setData).catch((e) => toast(e.detail || t('error'), true))
+    api.get('/api/leaderboard').then(setData).catch((e) => toast(te(e.detail), true))
   }, [])
 
   if (!data)

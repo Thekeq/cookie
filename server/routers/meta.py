@@ -50,6 +50,10 @@ async def auth(tg: dict = Depends(tg_user)):
             gl.add_cookies(referrer_id, cfg.REF_REWARD_REFERRER, count_earned=False)
             gl.add_cookies(tg["id"], cfg.REF_REWARD_REFERRED, count_earned=False)
 
+    # синкаем язык Mini App в профиль — бот использует его для /start и пушей
+    if user.get("lang") != tg["lang"]:
+        db.update_user(tg["id"], lang=tg["lang"])
+
     state = gl.full_state(tg["id"])
     state["just_registered"] = just_registered
     return state
@@ -80,7 +84,7 @@ class MilestoneIn(BaseModel):
 async def claim_milestone(body: MilestoneIn, tg: dict = Depends(tg_user)):
     user = db.get_user(tg["id"])
     if not user:
-        raise HTTPException(404, "No user")
+        raise HTTPException(404, "err_no_user")
     try:
         r = gl.claim_ref_milestone(user, body.key)
     except ValueError as e:
@@ -100,11 +104,11 @@ async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
     code = body.code.strip().upper()
     promo = db.q1("SELECT * FROM promo_codes WHERE code = ? AND active = 1", (code,))
     if not promo:
-        raise HTTPException(400, "Промокод не найден")
+        raise HTTPException(400, "err_promo_not_found")
     if promo["max_uses"] and promo["uses"] >= promo["max_uses"]:
-        raise HTTPException(400, "Промокод исчерпан")
+        raise HTTPException(400, "err_promo_used_up")
     if db.q1("SELECT id FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, tg["id"])):
-        raise HTTPException(400, "Ты уже активировал этот промокод")
+        raise HTTPException(400, "err_promo_already")
 
     db.exec("INSERT INTO promo_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
             (code, tg["id"], time.time()))
@@ -125,7 +129,7 @@ async def battlepass(tg: dict = Depends(tg_user)):
     gl.finalize_seasons()
     user = db.get_user(tg["id"])
     if not user:
-        raise HTTPException(404, "No user")
+        raise HTTPException(404, "err_no_user")
     bp_level = cfg.bp_level_for_xp(user["bp_xp"])
     claimed_free = json.loads(user["bp_claimed_free"] or "[]")
     claimed_prem = json.loads(user["bp_claimed_premium"] or "[]")
@@ -164,13 +168,13 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
     user = db.get_user(tg["id"])
     bp_level = cfg.bp_level_for_xp(user["bp_xp"])
     if body.level < 1 or body.level > bp_level:
-        raise HTTPException(400, "Уровень ещё не достигнут")
+        raise HTTPException(400, "err_bp_locked")
     if body.track == "premium" and not user["bp_premium"]:
-        raise HTTPException(400, "Нужен Premium Пасс")
+        raise HTTPException(400, "err_need_premium")
     col = "bp_claimed_free" if body.track == "free" else "bp_claimed_premium"
     claimed = json.loads(user[col] or "[]")
     if body.level in claimed:
-        raise HTTPException(400, "Уже получено")
+        raise HTTPException(400, "err_claimed")
     claimed.append(body.level)
     db.update_user(tg["id"], **{col: json.dumps(claimed)})
 
@@ -187,12 +191,14 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
 
 @router.get("/shop")
 async def shop(tg: dict = Depends(tg_user)):
-    """Для пачек с income_hours считаем персональную сумму — покупатель видит,
-    сколько конкретно печенек получит именно он."""
+    """Тексты локализуются по X-Lang; для пачек с income_hours считаем
+    персональную сумму — покупатель видит, сколько получит именно он."""
+    from server.i18n import tr
     income = gl.hourly_income(tg["id"])
     items = []
-    for k, (title, d, s, effect) in cfg.SHOP_ITEMS.items():
-        item = {"key": k, "title": title, "desc": d, "stars": s}
+    for k, (_t, _d, s, effect) in cfg.SHOP_ITEMS.items():
+        item = {"key": k, "title": tr(tg["lang"], f"shop_{k}_t"),
+                "desc": tr(tg["lang"], f"shop_{k}_d"), "stars": s}
         if effect.get("type") == "cookies" and "income_hours" in effect:
             item["amount"] = max(effect["min_amount"],
                                  income * effect["income_hours"])
@@ -208,8 +214,11 @@ class BuyIn(BaseModel):
 async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
     """Создаёт invoice-ссылку на оплату Stars через бота."""
     if body.item_key not in cfg.SHOP_ITEMS:
-        raise HTTPException(400, "Нет такого товара")
-    title, desc, stars, _effect = cfg.SHOP_ITEMS[body.item_key]
+        raise HTTPException(400, "err_no_item")
+    from server.i18n import tr
+    _t, _d, stars, _effect = cfg.SHOP_ITEMS[body.item_key]
+    title = tr(tg["lang"], f"shop_{body.item_key}_t")
+    desc = tr(tg["lang"], f"shop_{body.item_key}_d")
 
     from bot.loader import bot  # локальный импорт: бот и сервер живут в одном процессе
     from aiogram.types import LabeledPrice
@@ -275,20 +284,20 @@ async def channel(tg: dict = Depends(tg_user)):
 @router.post("/channel/claim")
 async def channel_claim(tg: dict = Depends(tg_user)):
     if not CHANNEL_USERNAME:
-        raise HTTPException(400, "Канал не настроен")
+        raise HTTPException(400, "err_no_channel")
     user = db.get_user(tg["id"])
     if not user:
-        raise HTTPException(404, "No user")
+        raise HTTPException(404, "err_no_user")
     if user["channel_claimed"]:
-        raise HTTPException(400, "Уже получено")
+        raise HTTPException(400, "err_claimed")
 
     from bot.loader import bot
     try:
         member = await bot.get_chat_member(f"@{CHANNEL_USERNAME}", tg["id"])
     except Exception:
-        raise HTTPException(400, "Не удалось проверить подписку")
+        raise HTTPException(400, "err_check_failed")
     if member.status in ("left", "kicked"):
-        raise HTTPException(400, "Сначала подпишись на канал")
+        raise HTTPException(400, "err_not_subscribed")
 
     db.update_user(tg["id"], channel_claimed=1)
     gl.add_cookies(tg["id"], cfg.CHANNEL_REWARD, count_earned=False)

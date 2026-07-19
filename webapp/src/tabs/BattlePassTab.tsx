@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, hapticSuccess, openInvoice } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { BPLevel } from '../types'
 
@@ -20,6 +20,7 @@ interface BPData {
 export default function BattlePassTab() {
   const { refresh, toast } = useGame()
   const t = useT()
+  const te = useTErr()
   const [bp, setBp] = useState<BPData | null>(null)
 
   const load = () => api.get('/api/battlepass').then(setBp)
@@ -37,7 +38,7 @@ export default function BattlePassTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -53,7 +54,7 @@ export default function BattlePassTab() {
       })
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 

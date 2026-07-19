@@ -274,10 +274,12 @@ input.field:focus { border-color: var(--accent); }
 }
 .combo-badge {
   font-weight: 800; color: var(--accent);
-  animation: comboPop 0.3s ease;
   margin-bottom: 6px;
+  opacity: 0; transform: scale(0.6) translateY(6px);
+  transition: opacity 0.35s ease, transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+  pointer-events: none;
 }
-@keyframes comboPop { from { transform: scale(1.6); } }
+.combo-badge.show { opacity: 1; transform: scale(1) translateY(0); }
 .big-cookie.frenzy {
   animation: frenzyShake 0.25s linear infinite;
   filter: drop-shadow(0 0 18px rgba(255, 120, 0, 0.8));
@@ -289,7 +291,9 @@ input.field:focus { border-color: var(--accent); }
 }
 
 /* ---------- drag-n-drop на merge-доске ---------- */
-.board { touch-action: none; position: relative; user-select: none; }
+.board { position: relative; user-select: none; }
+/* драг только с занятых клеток; пустые и сама доска скроллятся как обычно */
+.cell.has-item { touch-action: none; }
 .cell.drag-source { border-color: var(--accent); }
 .cell.drop-over { border-color: rgba(255,255,255,0.35); transform: scale(1.05); }
 .drag-ghost {

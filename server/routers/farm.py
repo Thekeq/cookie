@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/farm")
 def _user(tg: dict) -> dict:
     user = db.get_user(tg["id"])
     if not user:
-        raise HTTPException(404, "No user")
+        raise HTTPException(404, "err_no_user")
     return user
 
 
@@ -81,16 +81,16 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
     user = _user(tg)
     b = cfg.FARM_BUILDINGS.get(body.key)
     if not b:
-        raise HTTPException(400, "Нет такого здания")
+        raise HTTPException(400, "err_no_item")
     if user["level"] < b["req_level"]:
-        raise HTTPException(400, f"Нужен {b['req_level']} уровень")
+        raise HTTPException(400, f"err_req_level|{b['req_level']}")
     # доход до покупки забираем по старой ставке, чтобы новая не задним числом
     gl.collect_farm(user)
     user = db.get_user(tg["id"])
     owned = gl.farm_counts(tg["id"]).get(body.key, 0)
     cost = cfg.building_cost(body.key, owned)
     if user["cookies"] < cost:
-        raise HTTPException(400, "Не хватает печенек")
+        raise HTTPException(400, "err_no_cookies")
     db.update_user(tg["id"], cookies=user["cookies"] - cost)
     if owned:
         db.exec("UPDATE farm SET count = count + 1 WHERE user_id = ? AND building_key = ?",
@@ -107,13 +107,13 @@ async def buy_upgrade(body: KeyIn, tg: dict = Depends(tg_user)):
     user = _user(tg)
     u = cfg.COOKIE_UPGRADES.get(body.key)
     if not u:
-        raise HTTPException(400, "Нет такого апгрейда")
+        raise HTTPException(400, "err_no_item")
     if user["level"] < u["req_level"]:
-        raise HTTPException(400, f"Нужен {u['req_level']} уровень")
+        raise HTTPException(400, f"err_req_level|{u['req_level']}")
     if body.key in gl.user_upgrades(tg["id"]):
-        raise HTTPException(400, "Уже куплено")
+        raise HTTPException(400, "err_owned")
     if user["cookies"] < u["cost"]:
-        raise HTTPException(400, "Не хватает печенек")
+        raise HTTPException(400, "err_no_cookies")
     # фарм-доход до апгрейда — по старой ставке
     gl.collect_farm(user)
     user = db.get_user(tg["id"])
@@ -127,15 +127,15 @@ async def buy_skin(body: KeyIn, tg: dict = Depends(tg_user)):
     user = _user(tg)
     s = cfg.COOKIE_SKINS_SHOP.get(body.key)
     if not s:
-        raise HTTPException(400, "Нет такого скина")
+        raise HTTPException(400, "err_no_item")
     if user["level"] < s["req_level"]:
-        raise HTTPException(400, f"Нужен {s['req_level']} уровень")
+        raise HTTPException(400, f"err_req_level|{s['req_level']}")
     owned = {r["skin_key"] for r in
              db.q("SELECT skin_key FROM skins WHERE user_id = ?", (tg["id"],))} | {"classic"}
     if body.key in owned:
-        raise HTTPException(400, "Уже куплено")
+        raise HTTPException(400, "err_owned")
     if user["cookies"] < s["cost"]:
-        raise HTTPException(400, "Не хватает печенек")
+        raise HTTPException(400, "err_no_cookies")
     db.update_user(tg["id"], cookies=user["cookies"] - s["cost"])
     db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?)", (tg["id"], body.key))
     return await farm_state(tg)
@@ -147,6 +147,6 @@ async def set_skin(body: KeyIn, tg: dict = Depends(tg_user)):
     owned = {r["skin_key"] for r in
              db.q("SELECT skin_key FROM skins WHERE user_id = ?", (tg["id"],))} | {"classic"}
     if body.key not in owned:
-        raise HTTPException(400, "Скин не куплен")
+        raise HTTPException(400, "err_not_owned")
     db.update_user(tg["id"], active_skin=body.key)
     return await farm_state(tg)

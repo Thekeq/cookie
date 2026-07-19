@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 import { sfxError, sfxFanfare } from '../sound'
 import type { LevelNode } from '../types'
 import { COOKIE_SKINS } from '../cookieSkins'
@@ -9,6 +9,7 @@ import { COOKIE_SKINS } from '../cookieSkins'
 export default function LevelsTab() {
   const { state, setState, toast } = useGame()
   const t = useT()
+  const te = useTErr()
   const [path, setPath] = useState<LevelNode[] | null>(null)
   const [claimable, setClaimable] = useState<number | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -42,7 +43,7 @@ export default function LevelsTab() {
       load()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 

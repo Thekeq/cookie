@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import type { GameState } from './types'
-import { Lang, LangCtx, loadLang, saveLang, useT } from './i18n'
+import { Lang, LangCtx, loadLang, saveLang, useT, useTErr } from './i18n'
 import { unlockAudio } from './sound'
 import Onboarding from './Onboarding'
 import DailyModal from './DailyModal'
@@ -44,6 +44,7 @@ export default function App() {
 
 function Game() {
   const t = useT()
+  const te = useTErr()
   const [state, setState] = useState<GameState | null>(null)
   const [error, setError] = useState('')
   const [tab, setTab] = useState('clicker')
@@ -97,7 +98,7 @@ function Game() {
           toast(`${t('offline_income')}: +${fmt(s.passive_collected)} 🍪`)
         api.get('/api/admin/stats').then(() => setIsAdmin(true)).catch(() => {})
       })
-      .catch((e) => setError(e instanceof ApiError ? e.detail : t('open_in_tg')))
+      .catch((e) => setError(e instanceof ApiError ? te(e.detail) : t('open_in_tg')))
   }, [])
 
   // браузер разрешает звук только после первого жеста — ловим его один раз

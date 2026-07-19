@@ -16,6 +16,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from server import game_config as cfg
 from server import game_logic as gl
 from server.game_logic import db
+from server.i18n import tr
 
 CHECK_INTERVAL = 15 * 60  # проверяем всех раз в 15 минут
 
@@ -24,6 +25,7 @@ log = logging.getLogger(__name__)
 
 def _pick_notification(user: dict, now: float) -> str | None:
     """Возвращает текст пуша или None. Приоритет: стрик > ферма > энергия."""
+    lang = user.get("lang") or "en"
     # 1) стрик сгорает: забирал вчера, сегодня ещё нет, до полуночи UTC < 4 часов
     if user["daily_streak"] >= 2 and user["daily_claimed_at"]:
         dt = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
@@ -32,15 +34,13 @@ def _pick_notification(user: dict, now: float) -> str | None:
             user["daily_claimed_at"], datetime.timezone.utc).strftime("%Y-%m-%d")
         yesterday = (dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         if last_day == yesterday and seconds_left < 4 * 3600:
-            return (f"🔥 Твой стрик {user['daily_streak']} дн. сгорит через пару часов!\n"
-                    f"Зайди и забери ежедневную награду 🍪")
+            return tr(lang, "notif_streak", days=user["daily_streak"])
 
     # 2) ферма упёрлась в оффлайн-кап — доход простаивает
     if user["farm_collected_at"]:
         idle_h = (now - user["farm_collected_at"]) / 3600
         if idle_h >= cfg.FARM_OFFLINE_CAP_HOURS and gl.farm_cps(user["user_id"]) > 0:
-            return ("🏭 Ферма забита! Печеньки больше не копятся.\n"
-                    "Забери доход и запусти производство снова 🍪")
+            return tr(lang, "notif_farm")
 
     # 3) энергия полная
     eff = gl.upgrade_effects(user["user_id"])
@@ -48,7 +48,7 @@ def _pick_notification(user: dict, now: float) -> str | None:
     regen = cfg.ENERGY_REGEN_PER_SEC + eff["energy_regen"]
     energy_now = min(cap, user["energy"] + (now - (user["energy_updated_at"] or now)) * regen)
     if energy_now >= cap:
-        return "⚡ Энергия полностью восстановлена — время накликать печенек! 🍪"
+        return tr(lang, "notif_energy")
 
     return None
 

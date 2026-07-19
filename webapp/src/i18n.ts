@@ -4,9 +4,9 @@ import { createContext, useContext } from 'react'
 export type Lang = 'en' | 'uk' | 'ru'
 
 export const LANGS: { code: Lang; label: string; flag: string }[] = [
-  { code: 'en', label: 'English', flag: '🇬🇧' },
-  { code: 'uk', label: 'Українська', flag: '🇺🇦' },
-  { code: 'ru', label: 'Русский', flag: '🇷🇺' },
+  { code: 'en', label: 'English', flag: 'EN' },
+  { code: 'uk', label: 'Українська', flag: 'UA' },
+  { code: 'ru', label: 'Русский', flag: 'RU' },
 ]
 
 const dict = {
@@ -72,6 +72,8 @@ const dict = {
   b_mine: { en: 'Cookie Mine', uk: 'Шахта печива', ru: 'Печенечная шахта' },
   b_portal: { en: 'Portal', uk: 'Портал', ru: 'Портал' },
   b_timelab: { en: 'Time Lab', uk: 'Лабораторія часу', ru: 'Лаборатория времени' },
+  b_moonbase: { en: 'Moon Base', uk: 'Місячна база', ru: 'Лунная база' },
+  b_singularity: { en: 'Singularity', uk: 'Сингулярність', ru: 'Сингулярность' },
   u_click_mult: { en: 'Click x{n}', uk: 'Клік x{n}', ru: 'Клик x{n}' },
   u_farm_mult: { en: 'Farm x{n}', uk: 'Ферма x{n}', ru: 'Ферма x{n}' },
   u_energy_cap: { en: '+{n} max energy', uk: '+{n} макс. енергії', ru: '+{n} макс. энергии' },
@@ -188,6 +190,35 @@ const dict = {
   share_rank_text: { en: "I'm #{n} in Cookie Merge this season! Join and beat me 🍪", uk: 'Я #{n} у Cookie Merge цього сезону! Заходь і обійди мене 🍪', ru: 'Я #{n} в Cookie Merge в этом сезоне! Заходи и обгони меня 🍪' },
   share_prestige_text: { en: 'I just prestiged in Cookie Merge — x{m} income now! 🍪✨', uk: 'Я щойно зробив престиж у Cookie Merge — тепер x{m} доходу! 🍪✨', ru: 'Я сделал престиж в Cookie Merge — теперь x{m} дохода! 🍪✨' },
 
+  // серверные ошибки (коды err_* из API, параметр после |)
+  err_no_user: { en: 'Open the app via the bot (/start)', uk: 'Відкрий застосунок через бота (/start)', ru: 'Открой приложение через бота (/start)' },
+  err_board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },
+  err_no_cookies: { en: 'Not enough cookies', uk: 'Не вистачає печива', ru: 'Не хватает печенек' },
+  err_bad_move: { en: 'Invalid move', uk: 'Некоректний хід', ru: 'Некорректный ход' },
+  err_empty_cell: { en: 'Empty cell', uk: 'Порожня клітинка', ru: 'Пустая клетка' },
+  err_max_item: { en: 'Max cookie level reached', uk: 'Максимальний рівень печива', ru: 'Максимальный уровень печеньки' },
+  err_item_locked: { en: 'Unlocks at player level {n}', uk: 'Відкриється на {n} рівні гравця', ru: 'Откроется на {n} уровне игрока' },
+  err_direct_cap: { en: 'Buy up to lvl {n} directly — higher only by merging', uk: 'Напряму можна до {n} рівня — вище лише злиттям', ru: 'Напрямую можно до {n} lvl — выше только слиянием' },
+  err_no_xp: { en: 'Not enough XP', uk: 'Недостатньо XP', ru: 'Недостаточно XP' },
+  err_already_today: { en: 'Already claimed today', uk: 'Вже забрано сьогодні', ru: 'Уже забрано сегодня' },
+  err_no_quest: { en: 'No such quest today', uk: 'Немає такого завдання сьогодні', ru: 'Нет такого задания сегодня' },
+  err_not_done: { en: 'Not completed yet', uk: 'Ще не виконано', ru: 'Ещё не выполнено' },
+  err_claimed: { en: 'Already claimed', uk: 'Вже отримано', ru: 'Уже получено' },
+  err_no_item: { en: 'Not found', uk: 'Не знайдено', ru: 'Не найдено' },
+  err_golden_gone: { en: 'The golden cookie is gone', uk: 'Золоте печиво вже зникло', ru: 'Золотая печенька уже исчезла' },
+  err_prestige_early: { en: 'Too early: earn more cookies first', uk: 'Зарано: спершу зароби більше печива', ru: 'Ещё рано: нужно больше заработанных печенек' },
+  err_promo_not_found: { en: 'Promo code not found', uk: 'Промокод не знайдено', ru: 'Промокод не найден' },
+  err_promo_used_up: { en: 'Promo code is used up', uk: 'Промокод вичерпано', ru: 'Промокод исчерпан' },
+  err_promo_already: { en: 'You already used this code', uk: 'Ти вже активував цей промокод', ru: 'Ты уже активировал этот промокод' },
+  err_bp_locked: { en: 'Level not reached yet', uk: 'Рівень ще не досягнуто', ru: 'Уровень ещё не достигнут' },
+  err_need_premium: { en: 'Premium Pass required', uk: 'Потрібен Premium Пас', ru: 'Нужен Premium Пасс' },
+  err_no_channel: { en: 'Channel is not set up', uk: 'Канал не налаштовано', ru: 'Канал не настроен' },
+  err_check_failed: { en: 'Could not verify subscription', uk: 'Не вдалося перевірити підписку', ru: 'Не удалось проверить подписку' },
+  err_not_subscribed: { en: 'Subscribe to the channel first', uk: 'Спочатку підпишись на канал', ru: 'Сначала подпишись на канал' },
+  err_req_level: { en: 'Level {n} required', uk: 'Потрібен {n} рівень', ru: 'Нужен {n} уровень' },
+  err_owned: { en: 'Already owned', uk: 'Вже придбано', ru: 'Уже куплено' },
+  err_not_owned: { en: 'Not purchased', uk: 'Не придбано', ru: 'Не куплено' },
+
   // туториал
   tut_lang_title: { en: 'Choose your language', uk: 'Обери мову', ru: 'Выбери язык' },
   tut_skip: { en: 'Skip', uk: 'Пропустити', ru: 'Пропустить' },
@@ -211,6 +242,16 @@ export function translate(lang: Lang, key: TKey, vars?: Record<string, string | 
   return s
 }
 
+// Серверные ошибки приходят кодами "err_xxx" или "err_xxx|параметр" —
+// переводим по словарю; неизвестный текст показываем как есть
+export function translateError(lang: Lang, detail: string | undefined): string {
+  if (!detail) return translate(lang, 'error')
+  const [code, param] = detail.split('|')
+  if (code.startsWith('err_') && code in dict)
+    return translate(lang, code as TKey, param !== undefined ? { n: param } : undefined)
+  return detail
+}
+
 export function loadLang(): Lang {
   const saved = localStorage.getItem('lang')
   if (saved === 'en' || saved === 'uk' || saved === 'ru') return saved
@@ -229,4 +270,10 @@ export const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>
 export function useT() {
   const { lang } = useContext(LangCtx)
   return (key: TKey, vars?: Record<string, string | number>) => translate(lang, key, vars)
+}
+
+// Хук перевода серверных ошибок: const te = useTErr(); toast(te(e.detail))
+export function useTErr() {
+  const { lang } = useContext(LangCtx)
+  return (detail: string | undefined) => translateError(lang, detail)
 }

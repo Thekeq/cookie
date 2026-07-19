@@ -1,7 +1,7 @@
 import { useContext, useEffect, useState } from 'react'
 import { api, hapticSuccess, shareRefLink } from '../api'
 import { fmt, useGame } from '../App'
-import { LANGS, LangCtx, useT } from '../i18n'
+import { LANGS, LangCtx, useT, useTErr } from '../i18n'
 import {
   isMusicOn, isSfxOn, sfxBuy, sfxError, sfxFanfare, toggleMusic, toggleSfx,
 } from '../sound'
@@ -15,6 +15,7 @@ const tgApp = (window as any).Telegram?.WebApp
 export default function ProfileTab() {
   const { state, refresh, toast } = useGame()
   const t = useT()
+  const te = useTErr()
   const { lang, setLang } = useContext(LangCtx)
   const [achs, setAchs] = useState<Achievement[]>([])
   const [refs, setRefs] = useState<{
@@ -44,7 +45,7 @@ export default function ProfileTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -58,7 +59,7 @@ export default function ProfileTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -72,7 +73,7 @@ export default function ProfileTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -91,7 +92,7 @@ export default function ProfileTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 
@@ -117,7 +118,7 @@ export default function ProfileTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 

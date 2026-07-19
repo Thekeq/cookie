@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, openInvoice } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { ShopItem } from '../types'
 
@@ -17,6 +17,7 @@ const ICONS: Record<string, string> = {
 export default function ShopTab() {
   const { refresh, toast } = useGame()
   const t = useT()
+  const te = useTErr()
   const [items, setItems] = useState<ShopItem[]>([])
 
   useEffect(() => {
@@ -33,7 +34,7 @@ export default function ShopTab() {
       })
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 

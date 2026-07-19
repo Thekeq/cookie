@@ -20,6 +20,7 @@ class DataBase:
                 'user_id': 'INTEGER UNIQUE',
                 'username': 'TEXT',
                 'first_name': 'TEXT',
+                'lang': 'TEXT DEFAULT "en"',          # язык Mini App (en/uk/ru) для бота/пушей
                 'cookies': 'REAL DEFAULT 0',          # основная валюта
                 'total_earned': 'REAL DEFAULT 0',     # всего заработано (для ачивок/уровней)
                 'total_clicks': 'INTEGER DEFAULT 0',

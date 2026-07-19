@@ -18,7 +18,7 @@ _click_windows: dict[int, tuple[float, float]] = {}
 def _ensure_user(tg: dict) -> dict:
     user = db.get_user(tg["id"])
     if not user:
-        raise HTTPException(404, "Открой приложение через бота (/start)")
+        raise HTTPException(404, "err_no_user")
     return user
 
 
@@ -132,7 +132,7 @@ async def upgrade_click(tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
     cost = cfg.click_upgrade_cost(user["click_level"])
     if user["cookies"] < cost:
-        raise HTTPException(400, "Не хватает печенек")
+        raise HTTPException(400, "err_no_cookies")
     db.update_user(tg["id"], cookies=user["cookies"] - cost,
                    click_level=user["click_level"] + 1)
     return gl.full_state(tg["id"])
@@ -191,7 +191,7 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
     board = _board_map(tg["id"])
     if len(board) >= cfg.BOARD_SIZE:
-        raise HTTPException(400, "Доска заполнена")
+        raise HTTPException(400, "err_board_full")
 
     level = max(1, body.level)
     # прямой спавн ограничен: топ-тиры только слиянием
@@ -199,12 +199,11 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
                         if cfg.item_unlock_level(l) <= user["level"]), default=1)
     max_direct = max(1, max_unlocked - cfg.SPAWN_DIRECT_GAP)
     if level > max_direct:
-        raise HTTPException(400, f"Напрямую можно купить максимум {max_direct} lvl — "
-                                 f"выше только слиянием")
+        raise HTTPException(400, f"err_direct_cap|{max_direct}")
 
     cost = cfg.direct_spawn_cost(level, len(board))
     if user["cookies"] < cost:
-        raise HTTPException(400, "Не хватает печенек")
+        raise HTTPException(400, "err_no_cookies")
     free_cells = [c for c in range(cfg.BOARD_SIZE) if c not in board]
     cell = free_cells[0]
     db.update_user(tg["id"], cookies=user["cookies"] - cost)
@@ -219,10 +218,10 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
     if not (0 <= mv.from_cell < cfg.BOARD_SIZE and 0 <= mv.to_cell < cfg.BOARD_SIZE) \
             or mv.from_cell == mv.to_cell:
-        raise HTTPException(400, "Некорректный ход")
+        raise HTTPException(400, "err_bad_move")
     board = _board_map(tg["id"])
     if mv.from_cell not in board:
-        raise HTTPException(400, "Пустая клетка")
+        raise HTTPException(400, "err_empty_cell")
 
     src = board[mv.from_cell]
     if mv.to_cell not in board:
@@ -243,10 +242,9 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
     # merge!
     new_level = src + 1
     if new_level > cfg.MAX_ITEM_LEVEL:
-        raise HTTPException(400, "Максимальный уровень печеньки")
+        raise HTTPException(400, "err_max_item")
     if cfg.item_unlock_level(new_level) > user["level"]:
-        raise HTTPException(400, f"Печенька {new_level} lvl откроется на "
-                                 f"{cfg.item_unlock_level(new_level)} уровне игрока")
+        raise HTTPException(400, f"err_item_locked|{cfg.item_unlock_level(new_level)}")
     db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
     db.exec("UPDATE board SET item_level = ? WHERE user_id = ? AND cell = ?",
             (new_level, tg["id"], mv.to_cell))
@@ -283,7 +281,7 @@ async def claim_level(tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
     nxt = gl.claimable_level(user)
     if not nxt:
-        raise HTTPException(400, "Недостаточно XP")
+        raise HTTPException(400, "err_no_xp")
     reward = cfg.level_reward(nxt)
     db.update_user(tg["id"], level=nxt)
     gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
@@ -300,7 +298,7 @@ async def claim_level(tg: dict = Depends(tg_user)):
 
 @router.get("/achievements")
 async def achievements(tg: dict = Depends(tg_user)):
-    return {"achievements": gl.achievements_state(_ensure_user(tg))}
+    return {"achievements": gl.achievements_state(_ensure_user(tg), tg["lang"])}
 
 
 class ClaimAch(BaseModel):

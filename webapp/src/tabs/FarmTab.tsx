@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { fmt, useGame } from '../App'
-import { useT } from '../i18n'
+import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { FarmState } from '../types'
 
 const B_ICONS: Record<string, string> = {
   cursor: '👆', granny: '👵', bakery: '🏠', factory: '🏭',
-  mine: '⛏️', portal: '🌀', timelab: '⏳',
+  mine: '⛏️', portal: '🌀', timelab: '⏳', moonbase: '🌙', singularity: '🕳️',
 }
 const U_ICONS: Record<string, string> = {
   click_mult: '💪', farm_mult: '🏭', energy_cap: '🔋', energy_regen: '⚡', passive_mult: '🧩',
@@ -16,6 +16,7 @@ const U_ICONS: Record<string, string> = {
 export default function FarmTab() {
   const { refresh, toast } = useGame()
   const t = useT()
+  const te = useTErr()
   const [farm, setFarm] = useState<FarmState | null>(null)
   const [section, setSection] = useState<'buildings' | 'upgrades' | 'skins'>('buildings')
 
@@ -34,7 +35,7 @@ export default function FarmTab() {
       refresh()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
     }
   }
 

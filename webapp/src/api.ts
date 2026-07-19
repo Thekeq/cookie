@@ -57,11 +57,13 @@ async function request(method: string, path: string, body?: unknown) {
     headers: {
       'Content-Type': 'application/json',
       Authorization: 'tma ' + initData,
+      // язык интерфейса — сервер локализует тексты (магазин, ачивки) и пуши
+      'X-Lang': localStorage.getItem('lang') || 'en',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new ApiError(data.detail || `Ошибка ${res.status}`)
+  if (!res.ok) throw new ApiError(data.detail || `HTTP ${res.status}`)
   return data
 }
 

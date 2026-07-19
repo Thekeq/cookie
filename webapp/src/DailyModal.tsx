@@ -2,12 +2,13 @@
 import { useState } from 'react'
 import { api, hapticSuccess } from './api'
 import { fmt, useGame } from './App'
-import { useT } from './i18n'
+import { useT, useTErr } from './i18n'
 import { sfxError, sfxFanfare } from './sound'
 import type { DailyState } from './types'
 
 export default function DailyModal({ daily, onClose }: { daily: DailyState; onClose: () => void }) {
   const t = useT()
+  const te = useTErr()
   const { refresh, toast } = useGame()
   const [busy, setBusy] = useState(false)
 
@@ -23,7 +24,7 @@ export default function DailyModal({ daily, onClose }: { daily: DailyState; onCl
       onClose()
     } catch (e: any) {
       sfxError()
-      toast(e.detail || t('error'), true)
+      toast(te(e.detail), true)
       onClose()
     }
   }

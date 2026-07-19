@@ -90,7 +90,7 @@ def claim_daily(user: dict) -> dict:
     today = _utc_day(now)
     last_day = _utc_day(user["daily_claimed_at"]) if user["daily_claimed_at"] else ""
     if last_day == today:
-        raise ValueError("Уже забрано сегодня")
+        raise ValueError("err_already_today")
     yesterday = _utc_day(now - 86400)
     streak = user["daily_streak"] + 1 if last_day == yesterday else 1
     reward = cfg.daily_reward(streak)
@@ -161,14 +161,14 @@ def claim_quest(user: dict, key: str) -> dict:
     """Возвращает награду задания или кидает ValueError."""
     day = _utc_day(time.time())
     if key not in todays_quest_keys(day):
-        raise ValueError("Нет такого задания сегодня")
+        raise ValueError("err_no_quest")
     q = cfg.DAILY_QUEST_POOL[key]
     row = db.q1("SELECT * FROM daily_quests WHERE user_id = ? AND day = ? AND quest_key = ?",
                 (user["user_id"], day, key))
     if not row or row["progress"] < q["goal"]:
-        raise ValueError("Ещё не выполнено")
+        raise ValueError("err_not_done")
     if row["claimed"]:
-        raise ValueError("Уже получено")
+        raise ValueError("err_claimed")
     db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ?", (row["id"],))
     reward = quest_reward_cookies(user["user_id"], q["reward_cookies"])
     add_cookies(user["user_id"], reward, count_earned=False)
@@ -199,12 +199,12 @@ def ref_milestones_state(user_id: int) -> list[dict]:
 def claim_ref_milestone(user: dict, key: str) -> dict:
     ms = cfg.REF_MILESTONES.get(key)
     if not ms:
-        raise ValueError("Нет такой награды")
+        raise ValueError("err_no_item")
     state = {m["key"]: m for m in ref_milestones_state(user["user_id"])}[key]
     if not state["done"]:
-        raise ValueError("Ещё не выполнено")
+        raise ValueError("err_not_done")
     if state["claimed"]:
-        raise ValueError("Уже получено")
+        raise ValueError("err_claimed")
     db.exec("INSERT INTO ref_claims (user_id, milestone_key, claimed_at) VALUES (?, ?, ?)",
             (user["user_id"], key, time.time()))
     if ms["type"] == "boost":
@@ -323,7 +323,7 @@ def claim_golden(user: dict) -> dict:
     """Тап по золотой печеньке. Возвращает применённый эффект или ValueError."""
     now = time.time()
     if now >= user["golden_expires_at"]:
-        raise ValueError("Золотая печенька уже исчезла")
+        raise ValueError("err_golden_gone")
     effect = user["golden_effect"] or "chain"
     db.update_user(user["user_id"], golden_expires_at=0)
     if effect == "frenzy":
@@ -340,11 +340,19 @@ def claim_golden(user: dict) -> dict:
 
 # ---------- комбо ----------
 
+def current_combo(user: dict, now: float | None = None) -> float:
+    """Актуальный множитель комбо: если окно истекло — уже 1 (даже до записи)."""
+    now = now or time.time()
+    if now - (user["combo_last_at"] or 0) > cfg.COMBO_WINDOW:
+        return 1.0
+    return user["combo_mult"] or 1.0
+
+
 def update_combo(user: dict, clicks: int, now: float) -> float:
     """Комбо растёт, пока батчи кликов идут без пауз в хорошем темпе."""
     elapsed = now - (user["combo_last_at"] or 0)
     if elapsed <= cfg.COMBO_WINDOW and clicks / max(elapsed, 0.5) >= cfg.COMBO_MIN_CPS:
-        mult = min(cfg.COMBO_MAX_MULT, (user["combo_mult"] or 1) + cfg.COMBO_STEP)
+        mult = min(cfg.COMBO_MAX_MULT, current_combo(user, now) + cfg.COMBO_STEP)
     else:
         mult = 1.0
     db.update_user(user["user_id"], combo_mult=mult, combo_last_at=now)
@@ -372,7 +380,7 @@ def do_prestige(user: dict) -> dict:
     """Сбрасывает прогресс за постоянный множитель. Возвращает {gained, points, multiplier}."""
     st = prestige_state(user)
     if not st["can_prestige"]:
-        raise ValueError("Ещё рано: нужно больше заработанных печенек")
+        raise ValueError("err_prestige_early")
     new_points = user["prestige_points"] + st["gain_available"]
     uid = user["user_id"]
     # сохраняем: скины, ачивки, рефералов, стрик, БП сезона, покупки Stars, бусты
@@ -487,16 +495,19 @@ def passive_per_hour(user_id: int) -> float:
 
 # ---------- достижения ----------
 
-def achievements_state(user: dict) -> list[dict]:
+def achievements_state(user: dict, lang: str = "en") -> list[dict]:
+    from server.i18n import tr
     user_id = user["user_id"]
     refs = db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
     claimed = {r["key"] for r in db.q(
         "SELECT key FROM achievements WHERE user_id = ? AND claimed = 1", (user_id,))}
     out = []
-    for key, (title, desc, field, goal, reward) in cfg.ACHIEVEMENTS.items():
+    for key, (_title, _desc, field, goal, reward) in cfg.ACHIEVEMENTS.items():
         progress = refs if field == "_refs" else user.get(field, 0)
         out.append({
-            "key": key, "title": title, "desc": desc,
+            "key": key,
+            "title": tr(lang, f"ach_{key}_t"),
+            "desc": tr(lang, f"ach_{key}_d"),
             "progress": min(progress, goal), "goal": goal, "reward": reward,
             "done": progress >= goal, "claimed": key in claimed,
         })
@@ -508,14 +519,14 @@ def claim_achievement(user: dict, key: str) -> float:
     for a in achievements_state(user):
         if a["key"] == key:
             if not a["done"]:
-                raise ValueError("Ещё не выполнено")
+                raise ValueError("err_not_done")
             if a["claimed"]:
-                raise ValueError("Уже получено")
+                raise ValueError("err_claimed")
             db.exec("INSERT INTO achievements (user_id, key, claimed) VALUES (?, ?, 1)",
                     (user["user_id"], key))
             add_cookies(user["user_id"], a["reward"], count_earned=False)
             return a["reward"]
-    raise ValueError("Нет такого достижения")
+    raise ValueError("err_no_item")
 
 
 # ---------- профиль целиком (для фронта) ----------
@@ -559,7 +570,7 @@ def full_state(user_id: int) -> dict:
         "daily": daily_state(user),
         "quests_claimable": claimable_quests_count(user_id),
         "golden": golden_state(user),
-        "combo": {"mult": user["combo_mult"] or 1,
+        "combo": {"mult": current_combo(user),
                   "max_mult": cfg.COMBO_MAX_MULT},
         "prestige": prestige_state(user),
         "farm": {

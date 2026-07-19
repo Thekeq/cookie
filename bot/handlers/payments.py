@@ -38,6 +38,9 @@ async def on_paid(message: Message):
             (user_id, item_key, sp.total_amount, sp.telegram_payment_charge_id, time.time()))
 
     title, _desc, _stars, effect = cfg.SHOP_ITEMS[item_key]
+    from server.i18n import tr
+    lang = (db.get_user(user_id) or {}).get("lang") or "en"
+    title = tr(lang, f"shop_{item_key}_t")
     if effect["type"] == "cookies":
         # пачка масштабируется под доход покупателя (часы дохода, с минимумом)
         if "income_hours" in effect:
@@ -56,4 +59,4 @@ async def on_paid(message: Message):
     elif effect["type"] == "bp_premium":
         db.update_user(user_id, bp_premium=1)
 
-    await message.answer(f"✅ Покупка <b>{title}</b> активирована! Спасибо 🍪")
+    await message.answer(tr(lang, "pay_ok", title=title))
