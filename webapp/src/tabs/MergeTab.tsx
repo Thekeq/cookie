@@ -15,7 +15,7 @@ interface Drag {
 }
 
 export default function MergeTab() {
-  const { state, setState, toast } = useGame()
+  const { state, setState, toast, liveBalance } = useGame()
   const t = useT()
   const te = useTErr()
   const [drag, setDrag] = useState<Drag | null>(null)
@@ -193,7 +193,7 @@ export default function MergeTab() {
       <button
         className="btn"
         onClick={spawn}
-        disabled={state.board.length >= 25 || state.user.cookies < buyCost}
+        disabled={state.board.length >= 25 || liveBalance < buyCost}
       >
         {state.board.length >= 25
           ? t('board_full')

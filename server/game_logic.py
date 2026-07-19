@@ -433,6 +433,17 @@ def farm_cps(user_id: int, eff: dict | None = None) -> float:
     return base * eff["farm_mult"] * prestige
 
 
+def collect_all(user_id: int) -> dict:
+    """Собирает ферму + пассивку доски и возвращает СВЕЖЕГО юзера.
+    Обязателен перед любой проверкой «хватает ли печенек»: иначе сервер
+    сравнивает цену со вчерашним балансом, а игрок видит уже натикавший —
+    «деньги есть, а купить не даёт»."""
+    u = db.get_user(user_id)
+    collect_passive(u)
+    collect_farm(db.get_user(user_id))
+    return db.get_user(user_id)
+
+
 def collect_farm(user: dict) -> float:
     """Начисляет накопленный доход фермы, возвращает сколько упало."""
     now = time.time()

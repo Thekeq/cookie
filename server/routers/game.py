@@ -89,7 +89,12 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
     # параллельный worker дождётся и увидит уже обновлённое состояние,
     # а упавший посередине батч откатится целиком вместе со своим batch_id
     with db.tx():
-        user = gl.refresh_energy(_ensure_user(tg))
+        gl.refresh_energy(_ensure_user(tg))
+        # доход фермы/доски капает и во время тапа: собираем каждый батч,
+        # чтобы cookies в ответе не «откатывали» баланс у богатых игроков
+        gl.collect_passive(db.get_user(tg["id"]))
+        gl.collect_farm(db.get_user(tg["id"]))
+        user = db.get_user(tg["id"])
 
         # дедупликация по (user_id, batch_id): id уникален для каждого батча,
         # поэтому честные батчи с другого устройства не отбрасываются
@@ -152,7 +157,8 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
 
 @router.post("/click/upgrade")
 async def upgrade_click(tg: dict = Depends(tg_user)):
-    user = _ensure_user(tg)
+    _ensure_user(tg)
+    user = gl.collect_all(tg["id"])  # свежий баланс: с натикавшим доходом
     cost = cfg.click_upgrade_cost(user["click_level"])
     if user["cookies"] < cost:
         raise HTTPException(400, "err_no_cookies")
@@ -211,7 +217,8 @@ class SpawnIn(BaseModel):
 
 @router.post("/merge/spawn")
 async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
-    user = _ensure_user(tg)
+    _ensure_user(tg)
+    user = gl.collect_all(tg["id"])  # свежий баланс: с натикавшим доходом
     board = _board_map(tg["id"])
     if len(board) >= cfg.BOARD_SIZE:
         raise HTTPException(400, "err_board_full")

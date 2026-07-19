@@ -244,6 +244,16 @@ check("lang synced to profile", db.get_user(UID)["lang"] == "uk")
 r = c.post("/api/promo/redeem", json={"code": "NOPE123"}, headers=H(UID))
 check("errors are err_ codes", r.json()["detail"].startswith("err_"), r.text[:100])
 
+# --- покупка при «натикавшем» доходе фермы (баг «деньги есть, купить не даёт») ---
+db.update_user(UID, cookies=50, click_level=1,
+               farm_collected_at=time.time() - 60, passive_collected_at=time.time())
+db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'cursor', 10) "
+        "ON CONFLICT(user_id, building_key) DO UPDATE SET count = 10", (UID,))
+# на счету 50, апгрейд стоит 100, но за 60с ферма натикала 10*0.5*60 = 300
+r = c.post("/api/click/upgrade", headers=H(UID))
+check("buy with pending farm income", r.status_code == 200, r.text[:150])
+check("balance collected before charge", db.get_user(UID)["cookies"] > 0)
+
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
           "ref_claims", "achievements", "boosts", "purchases"):

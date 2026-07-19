@@ -84,9 +84,9 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
         raise HTTPException(400, "err_no_item")
     if user["level"] < b["req_level"]:
         raise HTTPException(400, f"err_req_level|{b['req_level']}")
-    # доход до покупки забираем по старой ставке, чтобы новая не задним числом
-    gl.collect_farm(user)
-    user = db.get_user(tg["id"])
+    # доход до покупки забираем по старой ставке (и ферму, и пассивку доски) —
+    # проверка цены идёт по свежему балансу, который видит игрок
+    user = gl.collect_all(tg["id"])
     owned = gl.farm_counts(tg["id"]).get(body.key, 0)
     cost = cfg.building_cost(body.key, owned)
     if user["cookies"] < cost:
@@ -110,11 +110,11 @@ async def buy_upgrade(body: KeyIn, tg: dict = Depends(tg_user)):
         raise HTTPException(400, f"err_req_level|{u['req_level']}")
     if body.key in gl.user_upgrades(tg["id"]):
         raise HTTPException(400, "err_owned")
+    # сначала собираем натикавший доход, потом проверяем цену —
+    # иначе «деньги есть, а купить не даёт» у игроков с большим доходом
+    user = gl.collect_all(tg["id"])
     if user["cookies"] < u["cost"]:
         raise HTTPException(400, "err_no_cookies")
-    # фарм-доход до апгрейда — по старой ставке
-    gl.collect_farm(user)
-    user = db.get_user(tg["id"])
     with db.tx():  # списание и апгрейд — одним куском
         db.update_user(tg["id"], cookies=user["cookies"] - u["cost"])
         db.exec("INSERT OR IGNORE INTO upgrades (user_id, upgrade_key) VALUES (?, ?)",
@@ -134,6 +134,7 @@ async def buy_skin(body: KeyIn, tg: dict = Depends(tg_user)):
              db.q("SELECT skin_key FROM skins WHERE user_id = ?", (tg["id"],))} | {"classic"}
     if body.key in owned:
         raise HTTPException(400, "err_owned")
+    user = gl.collect_all(tg["id"])  # свежий баланс перед проверкой цены
     if user["cookies"] < s["cost"]:
         raise HTTPException(400, "err_no_cookies")
     with db.tx():  # списание и скин — одним куском

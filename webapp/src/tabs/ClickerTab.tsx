@@ -90,6 +90,23 @@ export default function ClickerTab() {
     return () => clearInterval(timer)
   }, [state, setState])
 
+  // не теряем тапы при уходе со вкладки: остаток батча улетает при размонтировании
+  // (иначе их предикт висел бы в балансе «фантомом», которого нет на сервере)
+  useEffect(() => {
+    return () => {
+      const n = pending.current
+      if (!n) return
+      pending.current = 0
+      api
+        .post('/api/click', {
+          clicks: n,
+          batch_id: `${Date.now().toString(36)}-flush-${Math.random().toString(36).slice(2, 8)}`,
+        })
+        .then(() => refresh())
+        .catch(() => {})
+    }
+  }, [])
+
   // тик времени жизни золотой печеньки
   useEffect(() => {
     if (!golden?.active) return

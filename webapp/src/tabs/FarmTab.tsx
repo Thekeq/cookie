@@ -14,7 +14,7 @@ const U_ICONS: Record<string, string> = {
 }
 
 export default function FarmTab() {
-  const { refresh, toast } = useGame()
+  const { refresh, toast, liveBalance } = useGame()
   const t = useT()
   const te = useTErr()
   const [farm, setFarm] = useState<FarmState | null>(null)
@@ -100,7 +100,8 @@ export default function FarmTab() {
               </div>
             </div>
             {b.unlocked ? (
-              <button className="claim-chip" onClick={() => post('/api/farm/buy_building', b.key)}>
+              <button className="claim-chip" disabled={liveBalance < b.cost}
+                      onClick={() => post('/api/farm/buy_building', b.key)}>
                 🍪 {fmt(b.cost)}
               </button>
             ) : (
@@ -122,7 +123,7 @@ export default function FarmTab() {
             ) : (
               <button
                 className="claim-chip"
-                disabled={!u.unlocked}
+                disabled={!u.unlocked || liveBalance < u.cost}
                 onClick={() => post('/api/farm/buy_upgrade', u.key)}
               >
                 🍪 {fmt(u.cost)}
@@ -145,6 +146,7 @@ export default function FarmTab() {
                 </button>
               ) : s.unlocked ? (
                 <button className="claim-chip" style={{ marginTop: 4 }}
+                        disabled={liveBalance < s.cost}
                         onClick={() => post('/api/farm/buy_skin', s.key)}>
                   🍪 {fmt(s.cost)}
                 </button>
