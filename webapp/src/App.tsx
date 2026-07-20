@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
-import { api, ApiError } from './api'
+import { api, ApiError, startParam } from './api'
 import type { GameState } from './types'
 import { Lang, LangCtx, loadLang, saveLang, useT, useTErr } from './i18n'
 import { unlockAudio } from './sound'
@@ -57,7 +57,8 @@ function Game() {
   const te = useTErr()
   const [state, setState] = useState<GameState | null>(null)
   const [error, setError] = useState('')
-  const [tab, setTab] = useState('clicker')
+  // диплинк /admin из бота открывает приложение сразу на админ-панели
+  const [tab, setTab] = useState(startParam() === 'admin' ? 'profile' : 'clicker')
   const [toastMsg, setToastMsg] = useState<{ text: string; err: boolean } | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
   const [showOnboarding, setShowOnboarding] = useState(!localStorage.getItem('onboarded'))

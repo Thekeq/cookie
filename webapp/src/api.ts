@@ -19,6 +19,15 @@ function getInitData(): string {
   return tg?.initData || devInitData()
 }
 
+/** startParam диплинка: t.me/bot?startapp=X или ?tgWebAppStartParam=X (dev) */
+export function startParam(): string {
+  return (
+    tg?.initDataUnsafe?.start_param ||
+    new URLSearchParams(window.location.search).get('tgWebAppStartParam') ||
+    ''
+  )
+}
+
 export function haptic(style: 'light' | 'medium' | 'heavy' = 'light') {
   tg?.HapticFeedback?.impactOccurred?.(style)
 }

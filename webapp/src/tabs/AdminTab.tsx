@@ -18,6 +18,11 @@ interface Source {
   link: string
 }
 
+interface Retention {
+  cohort: number
+  returned: number
+}
+
 interface Stats {
   users_total: number
   users_new_24h: number
@@ -27,7 +32,23 @@ interface Stats {
   purchases_count: number
   stars_earned: number
   by_source: { src: string; c: number }[]
+  retention: { d1: Retention; d3: Retention; d7: Retention }
+  funnel: Record<string, number>
+  bp_completed: number
+  events_7d: { event: string; c: number }[]
 }
+
+const FUNNEL_LABELS: Record<string, string> = {
+  registered: 'Зарегистрировались',
+  clicked_10: 'Сделали 10 кликов',
+  merged_1: 'Первое слияние',
+  built_1: 'Первое здание',
+  order_1: 'Первый заказ',
+  tutorial_complete: 'Прошли туториал',
+}
+
+const retStr = (r: Retention) =>
+  r.cohort ? `${Math.round((r.returned / r.cohort) * 100)}% (${r.returned}/${r.cohort})` : '—'
 
 export default function AdminTab() {
   const { toast } = useGame()
@@ -159,6 +180,68 @@ export default function AdminTab() {
               <div className="row" key={s.src} style={{ fontSize: 13, padding: '2px 0' }}>
                 <span>{s.src}</span>
                 <b>{s.c}</b>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {stats?.retention && (
+        <div className="card">
+          <b>📈 Ретеншен (по когортам регистрации)</b>
+          <div className="stat-grid" style={{ marginTop: 10 }}>
+            <div className="stat-box">
+              <div className="v">{retStr(stats.retention.d1)}</div>
+              <div className="k">D1</div>
+            </div>
+            <div className="stat-box">
+              <div className="v">{retStr(stats.retention.d3)}</div>
+              <div className="k">D3</div>
+            </div>
+            <div className="stat-box">
+              <div className="v">{retStr(stats.retention.d7)}</div>
+              <div className="k">D7</div>
+            </div>
+            <div className="stat-box">
+              <div className="v">{stats.bp_completed}</div>
+              <div className="k">закрыли батл-пасс</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {stats?.funnel && (
+        <div className="card">
+          <b>🧭 Воронка активации</b>
+          <div style={{ marginTop: 8 }}>
+            {Object.entries(stats.funnel).map(([k, v]) => {
+              const pct = stats.funnel.registered
+                ? Math.round((v / stats.funnel.registered) * 100)
+                : 0
+              return (
+                <div key={k} style={{ padding: '3px 0', fontSize: 13 }}>
+                  <div className="row">
+                    <span>{FUNNEL_LABELS[k] || k}</span>
+                    <b>{v} · {pct}%</b>
+                  </div>
+                  <div className="progress-bar" style={{ height: 5, marginTop: 2 }}>
+                    <div style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {stats?.events_7d && stats.events_7d.length > 0 && (
+        <div className="card">
+          <b>🗒️ События за 7 дней</b>
+          <div style={{ marginTop: 8 }}>
+            {stats.events_7d.map((e) => (
+              <div className="row" key={e.event} style={{ fontSize: 13, padding: '2px 0' }}>
+                <span>{e.event}</span>
+                <b>{fmt(e.c)}</b>
               </div>
             ))}
           </div>

@@ -1,5 +1,6 @@
 // Объединённая вкладка «Профиль»: профиль / магазин Stars / (админка)
 import { useState } from 'react'
+import { startParam } from '../api'
 import { useGame } from '../App'
 import { useT } from '../i18n'
 import Segments from '../Segments'
@@ -10,7 +11,9 @@ import AdminTab from './AdminTab'
 export default function ProfileHubTab() {
   const t = useT()
   const { isAdmin } = useGame()
-  const [seg, setSeg] = useState<'profile' | 'shop' | 'admin'>('profile')
+  // диплинк /admin из бота открывает сразу сегмент админки
+  const [seg, setSeg] = useState<'profile' | 'shop' | 'admin'>(
+    startParam() === 'admin' ? 'admin' : 'profile')
 
   const items: { key: 'profile' | 'shop' | 'admin'; label: string }[] = [
     { key: 'profile', label: t('seg_profile') },
@@ -24,6 +27,7 @@ export default function ProfileHubTab() {
       {seg === 'profile' && <ProfileTab />}
       {seg === 'shop' && <ShopTab />}
       {seg === 'admin' && isAdmin && <AdminTab />}
+      {seg === 'admin' && !isAdmin && <ProfileTab />}
     </div>
   )
 }
