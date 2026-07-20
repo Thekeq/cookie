@@ -104,8 +104,22 @@ export default function ClickerTab() {
     }
   }
 
+  const claimTutorial = async () => {
+    try {
+      const r = await api.post('/api/tutorial/claim')
+      hapticSuccess()
+      sfxFanfare()
+      toast(`+${fmt(r.reward)} 🍪`)
+      refresh()
+    } catch (e: any) {
+      sfxError()
+      toast(te(e.detail), true)
+    }
+  }
+
   const boost = state.boosts.find((b) => b.key === 'click_x2')
   const frenzy = state.boosts.find((b) => b.key === 'golden_frenzy')
+  const tut = state.tutorial
 
   return (
     <div className="clicker" ref={wrapRef} style={{ position: 'relative' }}>
@@ -156,6 +170,25 @@ export default function ClickerTab() {
           {f.text}
         </span>
       ))}
+
+      {/* стартовый чеклист: ведёт новичка руками через все режимы */}
+      {tut && !tut.claimed && (
+        <div className="card" style={{ width: '100%', marginTop: 18 }}>
+          <b>{t('tut_title')}</b>
+          <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {tut.steps.map((s) => (
+              <div key={s.key} style={{ fontSize: 14, opacity: s.done ? 0.55 : 1 }}>
+                {s.done ? '✅' : '⬜'} {t(`step_${s.key}` as any)}
+              </div>
+            ))}
+          </div>
+          {tut.all_done && (
+            <button className="btn" style={{ marginTop: 10 }} onClick={claimTutorial}>
+              {t('tut_claim', { n: fmt(tut.reward) })}
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="card" style={{ width: '100%', marginTop: 18 }}>
         <div className="row" style={{ marginBottom: 8 }}>

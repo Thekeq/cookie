@@ -292,9 +292,101 @@ db.exec("UPDATE users SET channel_claimed = 1 WHERE user_id = ? AND channel_clai
 second = db.cursor.rowcount
 check("channel conditional claim once", first == 1 and second == 0, f"{first},{second}")
 
+# ================= фичи залипательности =================
+
+# --- заказы пекарни ---
+r = c.get("/api/orders", headers=H(UID))
+o = r.json()
+check("orders: 3 offers", o["active"] is None and len(o["offers"]) == 3, str(o)[:120])
+r = c.post("/api/orders/take", json={"slot": 1}, headers=H(UID))
+check("order taken", r.status_code == 200, r.text[:150])
+r = c.post("/api/orders/take", json={"slot": 2}, headers=H(UID))
+check("second take blocked", r.status_code == 400)
+db.exec("UPDATE orders SET progress = goal WHERE user_id = ? AND status = 'active'", (UID,))
+bp_before = db.get_user(UID)["bp_xp"]
+r = c.post("/api/orders/claim", headers=H(UID))
+check("order claimed", r.status_code == 200, r.text[:150])
+check("order gave bp xp", db.get_user(UID)["bp_xp"] > bp_before)
+check("orders_completed=1", db.get_user(UID)["orders_completed"] == 1)
+r = c.get("/api/orders", headers=H(UID))
+check("new offers after claim", len(r.json()["offers"]) == 3)
+
+# --- реролл квеста (1/день) ---
+r = c.get("/api/quests", headers=H(UID))
+check("reroll available", r.json()["reroll_available"] is True)
+qkey = next(q["key"] for q in r.json()["quests"] if not q["claimed"])
+r = c.post("/api/quests/reroll", json={"key": qkey}, headers=H(UID))
+check("reroll works", r.status_code == 200 and r.json()["new_key"] != qkey, r.text[:150])
+r = c.post("/api/quests/reroll", json={"key": r.json()["new_key"]}, headers=H(UID))
+check("second reroll blocked", r.status_code == 400)
+
+# --- заморозка стрика: пропуск одного дня раз в неделю прощается ---
+db.update_user(UID, daily_streak=5, daily_claimed_at=time.time() - 2 * 86400,
+               streak_freeze_week=None)
+r = c.post("/api/daily/claim", headers=H(UID))
+check("freeze saves streak", r.status_code == 200 and r.json()["streak"] == 6
+      and r.json()["freeze_used"] is True, r.text[:150])
+db.update_user(UID, daily_claimed_at=time.time() - 2 * 86400)
+r = c.post("/api/daily/claim", headers=H(UID))
+check("no second freeze same week", r.status_code == 200 and r.json()["streak"] == 1,
+      r.text[:150])
+
+# --- catch-up BP: отстающий получает x2 XP квестов ---
+u = db.get_user(UID)
+near_end = gl.season_end_ts(gl.current_season()) - 3600
+check("catchup x2 when behind",
+      gl.bp_catchup_mult(dict(u, bp_xp=0), near_end) == cfg.BP_CATCHUP_MULT)
+season_start = gl.season_end_ts(gl.current_season()) - cfg.SEASON_LENGTH_DAYS * 86400
+check("no catchup at season start",
+      gl.bp_catchup_mult(dict(u, bp_xp=0), season_start + 60) == 1.0)
+
+# --- стартовый чеклист ---
+db.update_user(UID, tutorial_done=0, total_clicks=50, total_merges=3)
+r = c.get("/api/state", headers=H(UID))
+tut = r.json()["tutorial"]
+check("tutorial present with 4 steps", tut is not None and len(tut["steps"]) == 4)
+check("tutorial all done", tut["all_done"] is True, str(tut))
+cook_before = db.get_user(UID)["cookies"]
+r = c.post("/api/tutorial/claim", headers=H(UID))
+check("tutorial claim", r.status_code == 200, r.text[:150])
+check("tutorial reward paid", db.get_user(UID)["cookies"] > cook_before)
+r = c.post("/api/tutorial/claim", headers=H(UID))
+check("tutorial double-claim blocked", r.status_code == 400)
+
+# --- коллекция блестяшек ---
+db.exec("DELETE FROM collection WHERE user_id = ?", (UID,))
+for lvl in range(1, 7):
+    db.exec("INSERT OR IGNORE INTO collection (user_id, item_level, obtained_at) "
+            "VALUES (?, ?, ?)", (UID, lvl, time.time()))
+r = c.get("/api/collection", headers=H(UID))
+col = r.json()
+check("collection set 1 done", col["sets"][0]["done"] is True, str(col["sets"][0]))
+check("collection multiplier +3%", abs(col["multiplier"] - 1.03) < 1e-9,
+      str(col["multiplier"]))
+db.update_user(UID, shiny_pity=cfg.SHINY_PITY)
+check("pity guarantees shiny", gl.roll_shiny(db.get_user(UID), 7) is True)
+check("pity reset after drop", db.get_user(UID)["shiny_pity"] == 0)
+
+# --- лиги ---
+db.update_user(UID, level=3)
+r = c.get("/api/leaderboard", headers=H(UID))
+lb = r.json()
+check("bronze league at lvl 3", lb["league"]["key"] == "bronze", str(lb.get("league")))
+check("league rows within bounds", all(row["level"] <= 5 for row in lb["top"]))
+db.update_user(UID, level=14)
+r = c.get("/api/leaderboard", headers=H(UID))
+check("gold league at lvl 14", r.json()["league"]["key"] == "gold")
+
+# --- аналитика: события пишутся ---
+check("events tracked",
+      db.q1("SELECT COUNT(*) c FROM events WHERE user_id = ?", (UID,))["c"] > 0)
+evs = {r["event"] for r in db.q("SELECT DISTINCT event FROM events WHERE user_id = ?", (UID,))}
+check("key events present", {"session", "first_order", "tutorial_complete"} <= evs, str(evs))
+
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
-          "ref_claims", "achievements", "boosts", "purchases"):
+          "ref_claims", "achievements", "boosts", "purchases", "orders",
+          "collection", "events", "click_batches"):
     db.exec(f"DELETE FROM {t} WHERE user_id IN (?, ?)", (UID, UID2))
 db.exec("DELETE FROM referrals WHERE referrer_id = ? OR referred_id IN (?, ?)",
         (UID, UID, UID2))

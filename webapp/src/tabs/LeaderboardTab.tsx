@@ -19,6 +19,7 @@ interface LBData {
   top: LBRow[]
   me: { rank: number | null; season_earned: number }
   players_total: number
+  league?: { key: string; min_level: number; max_level: number | null; all: string[] }
   season: number
   season_ends_at: number
   last_result: { season_id: number; rank: number; reward_cookies: number } | null
@@ -57,6 +58,17 @@ export default function LeaderboardTab() {
           <b>{t('lb_title')}</b>
           <span className="hint">{t('season_num', { n: data.season })}</span>
         </div>
+        {data.league && (
+          <div style={{ marginTop: 6, fontWeight: 800, fontSize: 16 }}>
+            {t(`league_${data.league.key}` as any)}
+            <div className="hint" style={{ fontWeight: 400 }}>
+              {t('league_hint', {
+                a: data.league.min_level,
+                b: data.league.max_level ? `–${data.league.max_level}` : '+',
+              })}
+            </div>
+          </div>
+        )}
         <div style={{ marginTop: 4, fontWeight: 700, color: 'var(--accent)' }}>
           ⏳ {t('season_ends', { n: leftStr })}
         </div>

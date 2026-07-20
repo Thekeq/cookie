@@ -232,6 +232,48 @@ const dict = {
   tut_3_text: { en: 'Buy buildings that bake cookies automatically — even while you are offline. Upgrades and skins are there too!', uk: 'Купуй будівлі, що печуть печиво автоматично — навіть коли ти офлайн. Там же покращення та скіни!', ru: 'Покупай здания, которые пекут печеньки автоматически — даже когда ты оффлайн. Там же улучшения и скины!' },
   tut_4_title: { en: 'Level up & earn', uk: 'Прокачуйся та заробляй', ru: 'Прокачивайся и зарабатывай' },
   tut_4_text: { en: 'Gain XP, walk the level path, claim achievements and battle pass rewards. Invite friends — you both get bonuses!', uk: 'Отримуй XP, крокуй шляхом рівнів, забирай досягнення та нагороди батл-пасу. Клич друзів — бонуси обом!', ru: 'Получай XP, иди по тропинке уровней, забирай достижения и награды батл-пасса. Зови друзей — бонусы обоим!' },
+  // --- заказы пекарни ---
+  orders_title: { en: '🧾 Bakery orders', uk: '🧾 Замовлення пекарні', ru: '🧾 Заказы пекарни' },
+  orders_hint: { en: 'Pick one order, complete it and open the chest. {n} left today.', uk: 'Обери одне замовлення, виконай і відкрий скриню. Сьогодні лишилось: {n}.', ru: 'Выбери один заказ, выполни и открой сундук. Сегодня осталось: {n}.' },
+  order_take: { en: 'Take', uk: 'Взяти', ru: 'Взять' },
+  order_claim: { en: 'Deliver order', uk: 'Здати замовлення', ru: 'Сдать заказ' },
+  order_done_toast: { en: 'Order delivered! +{n} 🍪 and +{m} BP XP', uk: 'Замовлення здано! +{n} 🍪 та +{m} BP XP', ru: 'Заказ сдан! +{n} 🍪 и +{m} BP XP' },
+  orders_limit: { en: 'New orders tomorrow', uk: 'Нові замовлення завтра', ru: 'Новые заказы завтра' },
+  order_warmup: { en: 'Warm up the oven: {n} taps', uk: 'Розігрій піч: {n} тапів', ru: 'Разогрей печь: {n} тапов' },
+  order_delivery: { en: 'Buy {n} cookies for the board', uk: 'Купи {n} печива на дошку', ru: 'Купи {n} печенек на доску' },
+  order_batch: { en: 'Bake a batch: {n} merges', uk: 'Партія випічки: {n} злиттів', ru: 'Партия выпечки: {n} слияний' },
+  order_shopping: { en: 'Expand the bakery: {n} buildings', uk: 'Розшир пекарню: {n} будівлі', ru: 'Расширь пекарню: {n} здания' },
+  order_profit: { en: 'Earn {n} cookies', uk: 'Зароби {n} печива', ru: 'Заработай {n} печенек' },
+  order_special: { en: 'Create a level {n} cookie', uk: 'Створи печиво {n} рівня', ru: 'Создай печенье {n} уровня' },
+  order_marathon: { en: 'Tap marathon: {n} taps', uk: 'Тап-марафон: {n} тапів', ru: 'Тап-марафон: {n} тапов' },
+  // --- реролл и заморозка ---
+  quest_reroll: { en: 'Swap quest (1/day)', uk: 'Замінити завдання (1/день)', ru: 'Заменить задание (1/день)' },
+  streak_frozen: { en: '❄️ Streak saved by weekly freeze!', uk: '❄️ Стрік врятовано щотижневою заморозкою!', ru: '❄️ Стрик спасён недельной заморозкой!' },
+  // --- стартовый чеклист ---
+  tut_title: { en: '🚀 First steps', uk: '🚀 Перші кроки', ru: '🚀 Первые шаги' },
+  step_clicks10: { en: 'Make 10 taps', uk: 'Зроби 10 тапів', ru: 'Сделай 10 тапов' },
+  step_merge1: { en: 'Merge two cookies', uk: 'Обʼєднай два печива', ru: 'Соедини две печеньки' },
+  step_building1: { en: 'Build your first building', uk: 'Побудуй першу будівлю', ru: 'Построй первое здание' },
+  step_order1: { en: 'Deliver a bakery order', uk: 'Здай замовлення пекарні', ru: 'Сдай заказ пекарни' },
+  tut_claim: { en: 'Claim {n} 🍪', uk: 'Забрати {n} 🍪', ru: 'Забрать {n} 🍪' },
+  // --- коллекция ---
+  album: { en: '✨ Album', uk: '✨ Альбом', ru: '✨ Альбом' },
+  album_title: { en: '✨ Shiny cookie album', uk: '✨ Альбом блискучого печива', ru: '✨ Альбом блестящих печенек' },
+  album_hint: { en: 'Merges sometimes drop a shiny cookie. Complete sets for a permanent +{n}% income each!', uk: 'Злиття інколи дає блискуче печиво. Збери набори — кожен дає постійні +{n}% доходу!', ru: 'Слияния иногда дают блестящую печеньку. Собери наборы — каждый даёт постоянные +{n}% дохода!' },
+  album_pity: { en: 'Guaranteed shiny in {n} merges', uk: 'Гарантована блискітка через {n} злиттів', ru: 'Гарантированная блестяшка через {n} слияний' },
+  album_bonus_now: { en: 'Current bonus: +{n}%', uk: 'Поточний бонус: +{n}%', ru: 'Текущий бонус: +{n}%' },
+  shiny_drop: { en: '✨ Shiny cookie for the album!', uk: '✨ Блискуче печиво в альбом!', ru: '✨ Блестящая печенька в альбом!' },
+  set_label: { en: 'Set {a}–{b}', uk: 'Набір {a}–{b}', ru: 'Набор {a}–{b}' },
+  // --- лиги ---
+  league_bronze: { en: '🥉 Bronze league', uk: '🥉 Бронзова ліга', ru: '🥉 Бронзовая лига' },
+  league_silver: { en: '🥈 Silver league', uk: '🥈 Срібна ліга', ru: '🥈 Серебряная лига' },
+  league_gold: { en: '🥇 Gold league', uk: '🥇 Золота ліга', ru: '🥇 Золотая лига' },
+  league_diamond: { en: '💎 Diamond league', uk: '💎 Діамантова ліга', ru: '💎 Алмазная лига' },
+  league_hint: { en: 'You compete inside your league (levels {a}{b}). Level up to advance!', uk: 'Ти змагаєшся у своїй лізі (рівні {a}{b}). Підвищуй рівень, щоб піднятись!', ru: 'Ты соревнуешься внутри своей лиги (уровни {a}{b}). Качай уровень, чтобы подняться!' },
+  // --- ошибки новых фич ---
+  err_order_active: { en: 'Finish the current order first', uk: 'Спочатку заверши поточне замовлення', ru: 'Сначала заверши текущий заказ' },
+  err_orders_limit: { en: 'Order limit for today, come back tomorrow', uk: 'Ліміт замовлень на сьогодні, повертайся завтра', ru: 'Лимит заказов на сегодня, возвращайся завтра' },
+  err_no_reroll: { en: 'Swap already used today', uk: 'Заміну сьогодні вже використано', ru: 'Замена сегодня уже использована' },
 } satisfies Record<string, Record<Lang, string>>
 
 export type TKey = keyof typeof dict

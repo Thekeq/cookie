@@ -19,7 +19,7 @@ export default function DailyModal({ daily, onClose }: { daily: DailyState; onCl
       const r = await api.post('/api/daily/claim')
       hapticSuccess()
       sfxFanfare()
-      toast(t('daily_got', { d: r.streak, n: fmt(r.reward) }))
+      toast(r.freeze_used ? t('streak_frozen') : t('daily_got', { d: r.streak, n: fmt(r.reward) }))
       refresh()
       onClose()
     } catch (e: any) {

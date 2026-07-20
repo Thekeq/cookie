@@ -1,9 +1,69 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxMerge } from '../sound'
 import { COOKIE_SKINS } from '../cookieSkins'
+
+// Альбом блестящих печенек: 24 слота, наборы дают постоянный бонус к доходу
+function AlbumModal({ onClose }: { onClose: () => void }) {
+  const t = useT()
+  const [data, setData] = useState<any>(null)
+
+  useEffect(() => {
+    api.get('/api/collection').then(setData).catch(() => {})
+  }, [])
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <b style={{ fontSize: 17 }}>{t('album_title')}</b>
+        {data && (
+          <>
+            <div className="hint" style={{ marginTop: 6 }}>
+              {t('album_hint', { n: Math.round(data.set_bonus * 100) })}
+            </div>
+            <div style={{ marginTop: 4, fontWeight: 700, color: 'var(--good)' }}>
+              {t('album_bonus_now', { n: Math.round((data.multiplier - 1) * 100) })}
+            </div>
+            {data.sets.map((s: any) => (
+              <div key={s.from} style={{ marginTop: 10 }}>
+                <div className="row">
+                  <span className="hint">
+                    {t('set_label', { a: s.from, b: s.to })} · {s.have}/{s.need}
+                    {s.done && ' ✅'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                  {Array.from({ length: s.to - s.from + 1 }, (_, i) => s.from + i).map((lvl: number) => {
+                    const owned = data.owned.includes(lvl)
+                    return (
+                      <span
+                        key={lvl}
+                        style={{
+                          fontSize: 24, width: 34, height: 34, borderRadius: 8,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          background: owned ? 'rgba(240,166,59,0.18)' : 'var(--card)',
+                          filter: owned ? 'none' : 'grayscale(1) opacity(0.35)',
+                          outline: owned ? '1px solid var(--accent)' : 'none',
+                        }}
+                      >
+                        {COOKIE_SKINS[lvl]}
+                      </span>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+            <div className="hint" style={{ marginTop: 10 }}>
+              {t('album_pity', { n: Math.max(1, data.pity_at - data.pity) })}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
 
 interface Drag {
   from: number
@@ -21,6 +81,7 @@ export default function MergeTab() {
   const [drag, setDrag] = useState<Drag | null>(null)
   const [popCell, setPopCell] = useState<number | null>(null)
   const [buyLevel, setBuyLevel] = useState(1) // уровень покупаемой печеньки
+  const [showAlbum, setShowAlbum] = useState(false)
   const busy = useRef(false)
   const boardRef = useRef<HTMLDivElement>(null)
 
@@ -37,7 +98,8 @@ export default function MergeTab() {
         sfxMerge(s.merged_level)
         setPopCell(to)
         setTimeout(() => setPopCell(null), 350)
-        if (s.merged_level >= 5)
+        if (s.shiny) toast(t('shiny_drop'))
+        else if (s.merged_level >= 5)
           toast(`${t('merged_lvl', { n: s.merged_level })} ${COOKIE_SKINS[s.merged_level]}`)
       } else {
         haptic('light')
@@ -124,11 +186,22 @@ export default function MergeTab() {
             <b>{t('passive_income')}</b>
             <div className="hint">{t('passive_hint')}</div>
           </div>
-          <div style={{ fontWeight: 800, color: 'var(--good)' }}>
-            +{fmt(state.passive_per_hour)}/ч
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontWeight: 800, color: 'var(--good)' }}>
+              +{fmt(state.passive_per_hour)}/ч
+            </div>
+            <button
+              className="claim-chip"
+              style={{ marginTop: 4, padding: '5px 10px' }}
+              onClick={() => setShowAlbum(true)}
+            >
+              {t('album')}
+            </button>
           </div>
         </div>
       </div>
+
+      {showAlbum && <AlbumModal onClose={() => setShowAlbum(false)} />}
 
       <div
         className="board"

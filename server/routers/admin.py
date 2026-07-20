@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from server.auth import tg_admin
+from server import game_config as cfg
+from server import game_logic as gl
 from server.game_logic import db
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(tg_admin)])
@@ -166,6 +168,33 @@ async def stats():
     by_source = db.q(
         "SELECT COALESCE(source_code, 'organic') src, COUNT(*) c FROM users "
         "GROUP BY source_code ORDER BY c DESC")
+
+    # ретеншен DN: когорта = регистрации N+1..N дней назад; вернулся, если
+    # был онлайн спустя >= N дней после регистрации
+    def retention(n: int) -> dict:
+        cohort = db.q(
+            "SELECT created_at, last_seen_at FROM users "
+            "WHERE created_at BETWEEN ? AND ?",
+            (now - (n + 1) * 86400, now - n * 86400))
+        came_back = sum(1 for u in cohort
+                        if (u["last_seen_at"] or 0) >= u["created_at"] + n * 86400)
+        return {"cohort": len(cohort), "returned": came_back}
+
+    # воронка активации: где теряем игроков в первом сеансе
+    funnel = {
+        "registered": total,
+        "clicked_10": db.q1("SELECT COUNT(*) c FROM users WHERE total_clicks >= 10")["c"],
+        "merged_1": db.q1("SELECT COUNT(*) c FROM users WHERE total_merges >= 1")["c"],
+        "built_1": db.q1("SELECT COUNT(*) c FROM users WHERE EXISTS "
+                         "(SELECT 1 FROM farm WHERE farm.user_id = users.user_id)")["c"],
+        "order_1": db.q1("SELECT COUNT(*) c FROM users WHERE orders_completed >= 1")["c"],
+        "tutorial_complete": db.q1("SELECT COUNT(*) c FROM users WHERE tutorial_done = 1")["c"],
+    }
+    bp_done = db.q1("SELECT COUNT(*) c FROM users WHERE bp_xp >= ?",
+                    (cfg.bp_total_xp(cfg.BP_MAX_LEVEL),))["c"]
+    events_7d = db.q(
+        "SELECT event, COUNT(*) c FROM events WHERE created_at > ? "
+        "GROUP BY event ORDER BY c DESC LIMIT 20", (week_ago,))
     return {
         "users_total": total,
         "users_new_24h": new_day,
@@ -175,4 +204,8 @@ async def stats():
         "purchases_count": paid["c"],
         "stars_earned": paid["s"],
         "by_source": by_source,
+        "retention": {"d1": retention(1), "d3": retention(3), "d7": retention(7)},
+        "funnel": funnel,
+        "bp_completed": bp_done,
+        "events_7d": events_7d,
     }

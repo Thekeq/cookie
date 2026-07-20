@@ -12,6 +12,17 @@ from server import game_config as cfg
 db = DataBase(os.environ.get("DATABASE_PATH", "data.db"))
 
 
+# ---------- аналитика ----------
+
+def track(user_id: int, event: str, value: float = 0):
+    """Пишет событие аналитики. Одна вставка, никогда не роняет игровой код."""
+    try:
+        db.exec("INSERT INTO events (user_id, event, value, created_at) "
+                "VALUES (?, ?, ?, ?)", (user_id, event, value, time.time()))
+    except Exception:
+        pass
+
+
 # ---------- сезоны ----------
 
 def current_season(now: float | None = None) -> int:
@@ -21,6 +32,15 @@ def current_season(now: float | None = None) -> int:
 
 def season_end_ts(season: int) -> float:
     return cfg.SEASON_EPOCH + (season + 1) * cfg.SEASON_LENGTH_DAYS * 86400
+
+
+def league_brackets() -> list[tuple[str, int, int | None]]:
+    """[(ключ, мин. уровень, макс. уровень или None)] по конфигу LEAGUES."""
+    out = []
+    for i, (key, lo) in enumerate(cfg.LEAGUES):
+        hi = cfg.LEAGUES[i + 1][1] - 1 if i + 1 < len(cfg.LEAGUES) else None
+        out.append((key, lo, hi))
+    return out
 
 
 def finalize_seasons():
@@ -34,27 +54,34 @@ def finalize_seasons():
         # либо происходят целиком, либо откатываются и повторятся при
         # следующем запросе. OR IGNORE добивает частичные снапшоты прошлых сбоев.
         with db.tx():
-            top = db.q(
-                "SELECT user_id, season_earned FROM users "
-                "WHERE season_id = ? AND season_earned > 0 "
-                "ORDER BY level DESC, season_earned DESC LIMIT 10", (season,))
+            # топ-10 в КАЖДОЙ лиге: новички соревнуются с новичками
+            winners = []  # (user_id, rank, earned)
+            for key, lo, hi in league_brackets():
+                cond = "level >= ?" + (" AND level <= ?" if hi is not None else "")
+                params = [season, lo] + ([hi] if hi is not None else [])
+                top = db.q(
+                    f"SELECT user_id, season_earned FROM users "
+                    f"WHERE season_id = ? AND season_earned > 0 AND {cond} "
+                    f"ORDER BY level DESC, season_earned DESC LIMIT 10", params)
+                winners += [(u["user_id"], i + 1, u["season_earned"])
+                            for i, u in enumerate(top)]
             now = time.time()
-            for i, u in enumerate(top):
-                reward = cfg.season_reward(i + 1, u["season_earned"])
+            for uid, rank, earned in winners:
+                reward = cfg.season_reward(rank, earned)
                 db.exec(
                     "INSERT OR IGNORE INTO season_results (season_id, user_id, rank, "
                     "earned, reward_cookies, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (season, u["user_id"], i + 1, u["season_earned"], reward, now))
+                    (season, uid, rank, earned, reward, now))
             # сброс сезонного прогресса всем игрокам этого сезона
             db.exec(
                 "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
                 "bp_premium = 0, bp_claimed_free = '[]', bp_claimed_premium = '[]' "
                 "WHERE season_id = ?", (cur, season))
             # награды топам — уже после сброса, чтобы не попали в новый сезон
-            for i, u in enumerate(top):
-                reward = cfg.season_reward(i + 1, u["season_earned"])
+            for uid, rank, earned in winners:
+                reward = cfg.season_reward(rank, earned)
                 if reward:
-                    add_cookies(u["user_id"], reward, count_earned=False)
+                    add_cookies(uid, reward, count_earned=False)
 
 
 def my_last_season_result(user_id: int) -> dict | None:
@@ -69,16 +96,30 @@ def _utc_day(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
+def _iso_week(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%G-W%V")
+
+
+def _freeze_available(user: dict, now: float) -> bool:
+    """Заморозка стрика: раз в неделю пропуск ровно одного дня не сжигает стрик."""
+    return user["daily_streak"] > 0 and user.get("streak_freeze_week") != _iso_week(now)
+
+
 def daily_state(user: dict) -> dict:
     now = time.time()
     today = _utc_day(now)
     last_day = _utc_day(user["daily_claimed_at"]) if user["daily_claimed_at"] else ""
     yesterday = _utc_day(now - 86400)
+    day_before = _utc_day(now - 2 * 86400)
     can_claim = last_day != today
     # если пропустил день — стрик сгорел и следующий клейм начнёт с 1;
+    # НО раз в неделю пропуск ровно одного дня прощается (заморозка);
     # если уже забрал сегодня — «следующий» это завтрашний (стрик+1)
     if can_claim:
-        next_streak = user["daily_streak"] + 1 if last_day == yesterday else 1
+        if last_day == yesterday or (last_day == day_before and _freeze_available(user, now)):
+            next_streak = user["daily_streak"] + 1
+        else:
+            next_streak = 1
     else:
         next_streak = user["daily_streak"] + 1
     return {
@@ -98,12 +139,22 @@ def claim_daily(user: dict) -> dict:
     if last_day == today:
         raise ValueError("err_already_today")
     yesterday = _utc_day(now - 86400)
-    streak = user["daily_streak"] + 1 if last_day == yesterday else 1
+    day_before = _utc_day(now - 2 * 86400)
+    freeze_used = False
+    if last_day == yesterday:
+        streak = user["daily_streak"] + 1
+    elif last_day == day_before and _freeze_available(user, now):
+        # заморозка: пропущен ровно один день — стрик выживает (раз в неделю)
+        streak = user["daily_streak"] + 1
+        freeze_used = True
+    else:
+        streak = 1
     reward = cfg.daily_reward(streak)
+    extra = {"streak_freeze_week": _iso_week(now)} if freeze_used else {}
     with db.tx():  # отметка о получении и деньги — одним куском
-        db.update_user(user["user_id"], daily_streak=streak, daily_claimed_at=now)
+        db.update_user(user["user_id"], daily_streak=streak, daily_claimed_at=now, **extra)
         add_cookies(user["user_id"], reward, count_earned=False)
-    return {"streak": streak, "reward": reward}
+    return {"streak": streak, "reward": reward, "freeze_used": freeze_used}
 
 
 # ---------- ежедневные задания ----------
@@ -127,19 +178,22 @@ def quest_reward_cookies(user_id: int, base: float) -> float:
     return max(base, hourly_income(user_id) * 0.5)
 
 
+def _user_quest_rows(user_id: int, day: str) -> list[dict]:
+    """Строки заданий юзера за день (после реролла могут отличаться от глобальных)."""
+    _ensure_quest_rows(user_id, day, todays_quest_keys(day))
+    return db.q("SELECT id, quest_key, progress, claimed FROM daily_quests "
+                "WHERE user_id = ? AND day = ? ORDER BY id", (user_id, day))
+
+
 def quests_state(user_id: int) -> list[dict]:
     day = _utc_day(time.time())
-    keys = todays_quest_keys(day)
-    _ensure_quest_rows(user_id, day, keys)
-    rows = {r["quest_key"]: r for r in db.q(
-        "SELECT quest_key, progress, claimed FROM daily_quests "
-        "WHERE user_id = ? AND day = ?", (user_id, day))}
     out = []
-    for key in keys:
-        q = cfg.DAILY_QUEST_POOL[key]
-        r = rows.get(key, {"progress": 0, "claimed": 0})
+    for r in _user_quest_rows(user_id, day):
+        q = cfg.DAILY_QUEST_POOL.get(r["quest_key"])
+        if not q:
+            continue
         out.append({
-            "key": key, "metric": q["metric"], "goal": q["goal"],
+            "key": r["quest_key"], "metric": q["metric"], "goal": q["goal"],
             "reward_cookies": quest_reward_cookies(user_id, q["reward_cookies"]),
             "reward_bp_xp": q["reward_bp_xp"],
             "progress": min(r["progress"], q["goal"]),
@@ -153,23 +207,58 @@ def quest_progress(user_id: int, metric: str, amount: float):
     if amount <= 0:
         return
     day = _utc_day(time.time())
-    keys = [k for k in todays_quest_keys(day)
-            if cfg.DAILY_QUEST_POOL[k]["metric"] == metric]
-    if not keys:
-        return
-    _ensure_quest_rows(user_id, day, keys)
-    for key in keys:
-        db.exec("UPDATE daily_quests SET progress = progress + ? "
-                "WHERE user_id = ? AND day = ? AND quest_key = ? AND claimed = 0",
-                (amount, user_id, day, key))
+    for r in _user_quest_rows(user_id, day):
+        q = cfg.DAILY_QUEST_POOL.get(r["quest_key"])
+        if q and q["metric"] == metric and not r["claimed"]:
+            db.exec("UPDATE daily_quests SET progress = progress + ? WHERE id = ?",
+                    (amount, r["id"]))
+
+
+def reroll_quest(user: dict, key: str) -> str:
+    """Бесплатный реролл одного (не выполненного) задания раз в день.
+    Возвращает ключ нового задания."""
+    now = time.time()
+    day = _utc_day(now)
+    if user["quest_reroll_day"] == day:
+        raise ValueError("err_no_reroll")
+    rows = _user_quest_rows(user["user_id"], day)
+    row = next((r for r in rows if r["quest_key"] == key), None)
+    if not row:
+        raise ValueError("err_no_quest")
+    if row["claimed"]:
+        raise ValueError("err_claimed")
+    current = {r["quest_key"] for r in rows}
+    candidates = sorted(k for k in cfg.DAILY_QUEST_POOL if k not in current)
+    if not candidates:
+        raise ValueError("err_no_reroll")
+    new_key = random.choice(candidates)
+    with db.tx():
+        db.exec("DELETE FROM daily_quests WHERE id = ?", (row["id"],))
+        db.exec("INSERT OR IGNORE INTO daily_quests (user_id, day, quest_key) "
+                "VALUES (?, ?, ?)", (user["user_id"], day, new_key))
+        db.update_user(user["user_id"], quest_reroll_day=day)
+    track(user["user_id"], "quest_reroll")
+    return new_key
+
+
+def bp_catchup_mult(user: dict, now: float | None = None) -> float:
+    """x2 BP XP, если игрок отстаёт от темпа сезона: обычный игрок должен
+    успевать закрыть пасс, иначе он перестаёт пытаться."""
+    now = now or time.time()
+    total = cfg.SEASON_LENGTH_DAYS * 86400
+    elapsed = 1 - max(0.0, (season_end_ts(current_season()) - now)) / total
+    expected = cfg.BP_MAX_LEVEL * elapsed
+    if cfg.bp_level_for_xp(user["bp_xp"]) < expected - cfg.BP_CATCHUP_LAG:
+        return cfg.BP_CATCHUP_MULT
+    return 1.0
 
 
 def claim_quest(user: dict, key: str) -> dict:
     """Возвращает награду задания или кидает ValueError."""
     day = _utc_day(time.time())
-    if key not in todays_quest_keys(day):
+    q = cfg.DAILY_QUEST_POOL.get(key)
+    if not q:
         raise ValueError("err_no_quest")
-    q = cfg.DAILY_QUEST_POOL[key]
     row = db.q1("SELECT * FROM daily_quests WHERE user_id = ? AND day = ? AND quest_key = ?",
                 (user["user_id"], day, key))
     if not row or row["progress"] < q["goal"]:
@@ -177,12 +266,13 @@ def claim_quest(user: dict, key: str) -> dict:
     if row["claimed"]:
         raise ValueError("err_claimed")
     reward = quest_reward_cookies(user["user_id"], q["reward_cookies"])
+    bp_xp = int(q["reward_bp_xp"] * bp_catchup_mult(user))
     with db.tx():  # отметка + печеньки + BP XP — одним куском
         db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ?", (row["id"],))
         add_cookies(user["user_id"], reward, count_earned=False)
         db.update_user(user["user_id"],
-                       bp_xp=db.get_user(user["user_id"])["bp_xp"] + q["reward_bp_xp"])
-    return {"reward_cookies": reward, "reward_bp_xp": q["reward_bp_xp"]}
+                       bp_xp=db.get_user(user["user_id"])["bp_xp"] + bp_xp)
+    return {"reward_cookies": reward, "reward_bp_xp": bp_xp}
 
 
 def claimable_quests_count(user_id: int) -> int:
@@ -296,7 +386,8 @@ def click_multiplier(user_id: int) -> float:
     if "golden_frenzy" in boosts:
         mult *= cfg.GOLDEN_EFFECTS["frenzy"]["mult"]
     user = db.get_user(user_id)
-    return mult * cfg.prestige_multiplier(user["prestige_points"] if user else 0)
+    return (mult * cfg.prestige_multiplier(user["prestige_points"] if user else 0)
+            * collection_multiplier(user_id))
 
 
 # ---------- золотая печенька ----------
@@ -430,7 +521,7 @@ def farm_cps(user_id: int, eff: dict | None = None) -> float:
                if k in cfg.FARM_BUILDINGS)
     user = db.get_user(user_id)
     prestige = cfg.prestige_multiplier(user["prestige_points"] if user else 0)
-    return base * eff["farm_mult"] * prestige
+    return base * eff["farm_mult"] * prestige * collection_multiplier(user_id)
 
 
 def collect_all(user_id: int) -> dict:
@@ -486,8 +577,9 @@ def add_cookies(user_id: int, amount: float, count_earned: bool = True):
     if count_earned and amount > 0:
         fields["total_earned"] = user["total_earned"] + amount
         fields["season_earned"] = user["season_earned"] + amount
-        # честный заработок кормит и дневное задание "заработай N"
+        # честный заработок кормит дневное задание "заработай N" и заказ пекарни
         quest_progress(user_id, "earned", amount)
+        order_progress(user_id, "earned", amount)
     db.update_user(user_id, **fields)
 
 
@@ -522,7 +614,8 @@ def passive_per_hour(user_id: int) -> float:
     base = sum(cfg.passive_income_per_hour(r["item_level"]) for r in rows)
     user = db.get_user(user_id)
     prestige = cfg.prestige_multiplier(user["prestige_points"] if user else 0)
-    return base * upgrade_effects(user_id)["passive_mult"] * prestige
+    return (base * upgrade_effects(user_id)["passive_mult"] * prestige
+            * collection_multiplier(user_id))
 
 
 # ---------- достижения ----------
@@ -561,6 +654,207 @@ def claim_achievement(user: dict, key: str) -> float:
                 add_cookies(user["user_id"], a["reward"], count_earned=False)
             return a["reward"]
     raise ValueError("err_no_item")
+
+
+# ---------- заказы пекарни ----------
+# Клей между режимами: ферма/клики/мердж дают прогресс одному активному заказу,
+# награда-сундук масштабируется от дохода. offer(3) -> active(1) -> done.
+
+def _order_params(user: dict, template_key: str) -> dict:
+    t = cfg.ORDER_TEMPLATES[template_key]
+    diff = t["difficulty"]
+    income = hourly_income(user["user_id"])
+    goal = t["goal"]
+    if t["metric"] == "earned":
+        goal = max(2000, round(income))          # ~час дохода
+    elif t["metric"] == "make_item":
+        # печенье на уровень ниже максимально открытого — достижимо слиянием
+        max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
+                            if cfg.item_unlock_level(l) <= user["level"]), default=1)
+        goal = max(3, max_unlocked - 1)
+    reward = max(cfg.ORDER_REWARD_MIN[diff], income * cfg.ORDER_REWARD_HOURS[diff])
+    return {"metric": t["metric"], "goal": goal, "reward_cookies": reward,
+            "reward_bp_xp": cfg.ORDER_BP_XP[diff]}
+
+
+def _gen_order_offers(user: dict):
+    """3 оффера: по одному каждой сложности, шаблон случайный."""
+    uid = user["user_id"]
+    rnd = random.Random(f"{uid}:{int(time.time())}")
+    now = time.time()
+    with db.tx():
+        db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer'", (uid,))
+        for slot, diff in enumerate((1, 2, 3), start=1):
+            keys = sorted(k for k, t in cfg.ORDER_TEMPLATES.items()
+                          if t["difficulty"] == diff)
+            key = rnd.choice(keys)
+            p = _order_params(user, key)
+            db.exec(
+                "INSERT INTO orders (user_id, slot, template, metric, goal, progress, "
+                "reward_cookies, reward_bp_xp, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'offer', ?)",
+                (uid, slot, key, p["metric"], p["goal"],
+                 p["reward_cookies"], p["reward_bp_xp"], now))
+
+
+def _pack_order(o: dict) -> dict:
+    return {"slot": o["slot"], "template": o["template"], "metric": o["metric"],
+            "goal": o["goal"], "progress": min(o["progress"], o["goal"]),
+            "done": o["progress"] >= o["goal"],
+            "reward_cookies": o["reward_cookies"], "reward_bp_xp": o["reward_bp_xp"],
+            "difficulty": cfg.ORDER_TEMPLATES.get(o["template"], {}).get("difficulty", 1)}
+
+
+def orders_state(user: dict) -> dict:
+    uid = user["user_id"]
+    day = _utc_day(time.time())
+    used = user["orders_day_count"] if user["orders_day"] == day else 0
+    left = max(0, cfg.ORDERS_PER_DAY - used)
+    active = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
+    offers = []
+    if not active and left > 0:
+        offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
+                      "ORDER BY slot", (uid,))
+        if len(offers) != 3:
+            _gen_order_offers(user)
+            offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
+                          "ORDER BY slot", (uid,))
+    return {"active": _pack_order(active) if active else None,
+            "offers": [_pack_order(o) for o in offers],
+            "left_today": left, "per_day": cfg.ORDERS_PER_DAY}
+
+
+def take_order(user: dict, slot: int) -> dict:
+    uid = user["user_id"]
+    if db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'active'", (uid,)):
+        raise ValueError("err_order_active")
+    day = _utc_day(time.time())
+    used = user["orders_day_count"] if user["orders_day"] == day else 0
+    if used >= cfg.ORDERS_PER_DAY:
+        raise ValueError("err_orders_limit")
+    row = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' AND slot = ?",
+                (uid, slot))
+    if not row:
+        raise ValueError("err_no_item")
+    with db.tx():
+        db.exec("UPDATE orders SET status = 'active' WHERE id = ?", (row["id"],))
+        db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer'", (uid,))
+    track(uid, "order_take")
+    return _pack_order(dict(row, status="active"))
+
+
+def order_progress(user_id: int, metric: str, amount: float):
+    """Прогресс активного заказа. make_item — «лучший достигнутый уровень»."""
+    if amount <= 0:
+        return
+    if metric == "make_item":
+        db.exec("UPDATE orders SET progress = MAX(progress, ?) "
+                "WHERE user_id = ? AND status = 'active' AND metric = 'make_item'",
+                (amount, user_id))
+    else:
+        db.exec("UPDATE orders SET progress = progress + ? "
+                "WHERE user_id = ? AND status = 'active' AND metric = ?",
+                (amount, user_id, metric))
+
+
+def claim_order(user: dict) -> dict:
+    uid = user["user_id"]
+    row = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
+    if not row:
+        raise ValueError("err_no_item")
+    if row["progress"] < row["goal"]:
+        raise ValueError("err_not_done")
+    day = _utc_day(time.time())
+    used = user["orders_day_count"] if user["orders_day"] == day else 0
+    first = user["orders_completed"] == 0
+    with db.tx():
+        db.exec("UPDATE orders SET status = 'done' WHERE id = ?", (row["id"],))
+        add_cookies(uid, row["reward_cookies"], count_earned=False)
+        db.update_user(uid,
+                       bp_xp=db.get_user(uid)["bp_xp"] + row["reward_bp_xp"],
+                       orders_completed=user["orders_completed"] + 1,
+                       orders_day=day, orders_day_count=used + 1)
+    track(uid, "order_done")
+    if first:
+        track(uid, "first_order")
+    return {"reward_cookies": row["reward_cookies"], "reward_bp_xp": row["reward_bp_xp"]}
+
+
+# ---------- коллекция блестящих печенек ----------
+
+def roll_shiny(user: dict, item_level: int) -> bool:
+    """Бросок на блестяшку при мердже; pity гарантирует дроп раз в SHINY_PITY."""
+    pity = user["shiny_pity"] + 1
+    if pity < cfg.SHINY_PITY and random.random() >= cfg.SHINY_CHANCE:
+        db.update_user(user["user_id"], shiny_pity=pity)
+        return False
+    with db.tx():
+        db.update_user(user["user_id"], shiny_pity=0)
+        db.exec("INSERT OR IGNORE INTO collection (user_id, item_level, obtained_at) "
+                "VALUES (?, ?, ?)", (user["user_id"], item_level, time.time()))
+    track(user["user_id"], "shiny_drop", item_level)
+    return True
+
+
+def collection_sets_done(user_id: int) -> int:
+    owned = {r["item_level"] for r in
+             db.q("SELECT item_level FROM collection WHERE user_id = ?", (user_id,))}
+    return sum(1 for lo, hi in cfg.COLLECTION_SETS
+               if all(l in owned for l in range(lo, hi + 1)))
+
+
+def collection_multiplier(user_id: int) -> float:
+    """Постоянный бонус за собранные наборы — применяется ко ВСЕМУ доходу."""
+    return 1.0 + collection_sets_done(user_id) * cfg.COLLECTION_SET_BONUS
+
+
+def collection_state(user: dict) -> dict:
+    uid = user["user_id"]
+    owned = {r["item_level"]: r["obtained_at"] for r in
+             db.q("SELECT item_level, obtained_at FROM collection WHERE user_id = ?", (uid,))}
+    sets = []
+    for lo, hi in cfg.COLLECTION_SETS:
+        have = sum(1 for l in range(lo, hi + 1) if l in owned)
+        sets.append({"from": lo, "to": hi, "have": have, "need": hi - lo + 1,
+                     "done": have == hi - lo + 1})
+    return {"owned": sorted(owned), "sets": sets,
+            "set_bonus": cfg.COLLECTION_SET_BONUS,
+            "multiplier": collection_multiplier(uid),
+            "pity": user["shiny_pity"], "pity_at": cfg.SHINY_PITY,
+            "max_level": cfg.MAX_ITEM_LEVEL}
+
+
+# ---------- стартовый чеклист ----------
+
+def tutorial_state(user: dict) -> dict:
+    buildings = db.q1("SELECT COALESCE(SUM(count), 0) c FROM farm WHERE user_id = ?",
+                      (user["user_id"],))["c"]
+    done = {
+        "clicks10": user["total_clicks"] >= 10,
+        "merge1": user["total_merges"] >= 1,
+        "building1": buildings >= 1,
+        "order1": user["orders_completed"] >= 1,
+    }
+    return {"steps": [{"key": k, "done": done[k]} for k in cfg.TUTORIAL_STEPS],
+            "all_done": all(done.values()),
+            "claimed": bool(user["tutorial_done"]),
+            "reward": cfg.TUTORIAL_REWARD}
+
+
+def claim_tutorial(user: dict) -> dict:
+    st = tutorial_state(user)
+    if st["claimed"]:
+        raise ValueError("err_claimed")
+    if not st["all_done"]:
+        raise ValueError("err_not_done")
+    with db.tx():
+        db.exec("UPDATE users SET tutorial_done = 1 "
+                "WHERE user_id = ? AND tutorial_done = 0", (user["user_id"],))
+        if db.cursor.rowcount == 0:
+            raise ValueError("err_claimed")
+        add_cookies(user["user_id"], cfg.TUTORIAL_REWARD, count_earned=False)
+    track(user["user_id"], "tutorial_complete")
+    return {"reward": cfg.TUTORIAL_REWARD}
 
 
 # ---------- выдача Stars-покупок ----------
@@ -652,6 +946,8 @@ def full_state(user_id: int) -> dict:
         },
         "daily": daily_state(user),
         "quests_claimable": claimable_quests_count(user_id),
+        # стартовый чеклист: показывается, пока награда не забрана
+        "tutorial": tutorial_state(user) if not user["tutorial_done"] else None,
         "golden": golden_state(user),
         "combo": {"mult": current_combo(user),
                   "max_mult": cfg.COMBO_MAX_MULT},

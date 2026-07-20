@@ -55,8 +55,24 @@ async def daily_claim(tg: dict = Depends(tg_user)):
 
 @router.get("/quests")
 async def quests(tg: dict = Depends(tg_user)):
-    _ensure_user(tg)
-    return {"quests": gl.quests_state(tg["id"])}
+    user = _ensure_user(tg)
+    return {"quests": gl.quests_state(tg["id"]),
+            "reroll_available": user["quest_reroll_day"] != gl._utc_day(time.time())}
+
+
+class RerollQuest(BaseModel):
+    key: str
+
+
+@router.post("/quests/reroll")
+async def quest_reroll(body: RerollQuest, tg: dict = Depends(tg_user)):
+    user = _ensure_user(tg)
+    try:
+        new_key = gl.reroll_quest(user, body.key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"new_key": new_key, "quests": gl.quests_state(tg["id"]),
+            "reroll_available": False}
 
 
 class ClaimQuest(BaseModel):
@@ -148,6 +164,7 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
         gl.add_cookies(tg["id"], earned)
         gl.add_xp(db.get_user(tg["id"]), xp)
         gl.quest_progress(tg["id"], "clicks", clicks)
+        gl.order_progress(tg["id"], "clicks", clicks)
 
     fresh = db.get_user(tg["id"])
     return {"accepted": clicks, "earned": earned, "combo": combo,
@@ -245,6 +262,7 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
                 (tg["id"], cell, level))
         gl.quest_progress(tg["id"], "spawns", 1)
+        gl.order_progress(tg["id"], "spawns", 1)
     return gl.full_state(tg["id"])
 
 
@@ -288,9 +306,15 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
         db.update_user(tg["id"], total_merges=user["total_merges"] + 1)
         gl.add_xp(db.get_user(tg["id"]), cfg.merge_reward_xp(new_level))
         gl.quest_progress(tg["id"], "merges", 1)
+        gl.order_progress(tg["id"], "merges", 1)
+        gl.order_progress(tg["id"], "make_item", new_level)
+        shiny = gl.roll_shiny(db.get_user(tg["id"]), new_level)
+    if user["total_merges"] == 0:
+        gl.track(tg["id"], "first_merge")
 
     state = gl.full_state(tg["id"])
     state["merged_level"] = new_level
+    state["shiny"] = shiny
     return state
 
 
@@ -351,3 +375,56 @@ async def claim_ach(body: ClaimAch, tg: dict = Depends(tg_user)):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}
+
+
+# ---------- заказы пекарни ----------
+
+@router.get("/orders")
+async def orders(tg: dict = Depends(tg_user)):
+    return gl.orders_state(_ensure_user(tg))
+
+
+class TakeOrder(BaseModel):
+    slot: int
+
+
+@router.post("/orders/take")
+async def order_take(body: TakeOrder, tg: dict = Depends(tg_user)):
+    user = _ensure_user(tg)
+    try:
+        active = gl.take_order(user, body.slot)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"active": active}
+
+
+@router.post("/orders/claim")
+async def order_claim(tg: dict = Depends(tg_user)):
+    user = _ensure_user(tg)
+    try:
+        r = gl.claim_order(user)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    r["cookies"] = db.get_user(tg["id"])["cookies"]
+    r["orders"] = gl.orders_state(db.get_user(tg["id"]))
+    return r
+
+
+# ---------- стартовый чеклист ----------
+
+@router.post("/tutorial/claim")
+async def tutorial_claim(tg: dict = Depends(tg_user)):
+    user = _ensure_user(tg)
+    try:
+        r = gl.claim_tutorial(user)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    r["cookies"] = db.get_user(tg["id"])["cookies"]
+    return r
+
+
+# ---------- коллекция блестящих печенек ----------
+
+@router.get("/collection")
+async def collection(tg: dict = Depends(tg_user)):
+    return gl.collection_state(_ensure_user(tg))

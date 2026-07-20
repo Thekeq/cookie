@@ -111,6 +111,14 @@ export interface GameState {
   quests_claimable: number
   golden: { active: boolean; effect: string | null; expires_at: number }
   combo: { mult: number; max_mult: number }
+  tutorial?: {
+    steps: { key: string; done: boolean }[]
+    all_done: boolean
+    claimed: boolean
+    reward: number
+  } | null
+  merged_level?: number
+  shiny?: boolean
   prestige: {
     points: number
     count: number

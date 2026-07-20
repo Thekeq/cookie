@@ -212,6 +212,56 @@ def prestige_points(total_earned: float) -> int:
 def prestige_multiplier(points: float) -> float:
     return 1.0 + points * PRESTIGE_MULT_PER_POINT
 
+# ---------- Заказы пекарни ----------
+# Игроку предлагаются 3 заказа разной сложности, он берёт один. Награда-сундук
+# масштабируется от дохода (часы дохода с минимумом) — не обесценивается.
+ORDER_TEMPLATES = {
+    "warmup":    {"metric": "clicks",    "goal": 80,  "difficulty": 1},   # разогрей печь
+    "delivery":  {"metric": "spawns",    "goal": 6,   "difficulty": 1},   # закупи тесто
+    "batch":     {"metric": "merges",    "goal": 8,   "difficulty": 2},   # партия выпечки
+    "shopping":  {"metric": "buildings", "goal": 2,   "difficulty": 2},   # расширь цех
+    "profit":    {"metric": "earned",    "goal": 0,   "difficulty": 2},   # выручка (goal = час дохода)
+    "special":   {"metric": "make_item", "goal": 0,   "difficulty": 3},   # печенье уровня N
+    "marathon":  {"metric": "clicks",    "goal": 250, "difficulty": 3},   # клик-марафон
+}
+ORDER_REWARD_HOURS = {1: 0.4, 2: 0.9, 3: 1.8}   # часов дохода за сложность
+ORDER_REWARD_MIN = {1: 800, 2: 2200, 3: 5500}   # минимум печенек (холодный старт)
+ORDER_BP_XP = {1: 60, 2: 140, 3: 300}
+ORDERS_PER_DAY = 8                               # анти-гринд: заказов в день
+
+# ---------- Стартовый чеклист (интерактивный первый сеанс) ----------
+# Шаги проверяются по счётчикам профиля; финал — первый заказ.
+TUTORIAL_STEPS = ["clicks10", "merge1", "building1", "order1"]
+TUTORIAL_REWARD = 1500
+
+# ---------- Коллекция блестящих печенек ----------
+SHINY_CHANCE = 0.06        # шанс блестяшки при мердже
+SHINY_PITY = 25            # гарантированная блестяшка после N мерджей без неё
+# наборы (диапазоны уровней); каждый собранный набор даёт постоянный бонус
+COLLECTION_SETS = [(1, 6), (7, 12), (13, 18), (19, 24)]
+COLLECTION_SET_BONUS = 0.03  # +3% ко всему доходу за набор
+
+# ---------- QoL: квесты и стрик ----------
+QUEST_REROLLS_PER_DAY = 1    # бесплатный реролл одного квеста в день
+STREAK_FREEZE_PER_WEEK = 1   # пропуск ровно одного дня раз в неделю не сжигает стрик
+# catch-up: если BP-уровень отстаёт от темпа сезона больше чем на 2 — квесты дают x2 BP XP
+BP_CATCHUP_MULT = 2.0
+BP_CATCHUP_LAG = 2
+
+# ---------- Лиги ----------
+# (ключ, минимальный уровень); рейтинг и сезонные призы — внутри своей лиги,
+# у новичка реальный шанс на топ, а не таблица недостижимых ветеранов
+LEAGUES = [("bronze", 1), ("silver", 6), ("gold", 12), ("diamond", 20)]
+
+def league_of(level: int) -> tuple[str, int, int | None]:
+    """(ключ лиги, мин. уровень, макс. уровень включительно или None)."""
+    for i in range(len(LEAGUES) - 1, -1, -1):
+        key, lo = LEAGUES[i]
+        if level >= lo:
+            hi = LEAGUES[i + 1][1] - 1 if i + 1 < len(LEAGUES) else None
+            return key, lo, hi
+    return LEAGUES[0][0], 1, LEAGUES[1][1] - 1
+
 # ---------- Уведомления от бота ----------
 NOTIFY_MIN_INTERVAL_H = 20      # не чаще одного пуша в ~20 часов
 NOTIFY_SKIP_ACTIVE_H = 3        # не пушим тем, кто был онлайн последние 3 часа

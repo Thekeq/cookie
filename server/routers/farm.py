@@ -97,6 +97,9 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
                 "ON CONFLICT(user_id, building_key) DO UPDATE SET count = count + 1",
                 (tg["id"], body.key))
         gl.quest_progress(tg["id"], "buildings", 1)
+        gl.order_progress(tg["id"], "buildings", 1)
+    if not owned and not gl.farm_counts(tg["id"]).keys() - {body.key}:
+        gl.track(tg["id"], "first_building")
     return await farm_state(tg)
 
 

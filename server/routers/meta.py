@@ -60,6 +60,7 @@ async def auth(tg: dict = Depends(tg_user)):
     farm_income = gl.collect_farm(db.get_user(tg["id"]))
     # довыдаём Stars-покупки, зависшие в 'paid' после сбоя между оплатой и выдачей
     gl.fulfill_pending(tg["id"])
+    gl.track(tg["id"], "session")  # аналитика сессий
 
     state = gl.full_state(tg["id"])
     state["just_registered"] = just_registered
@@ -245,14 +246,21 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
 
 @router.get("/leaderboard")
 async def leaderboard(tg: dict = Depends(tg_user)):
-    """Сезонный топ: по уровню, при равном уровне — по season_earned.
-    Сезон длится SEASON_LENGTH_DAYS, топ-10 получают награды."""
+    """Сезонный топ ВНУТРИ СВОЕЙ ЛИГИ (по уровню, тай-брейк season_earned):
+    новичок соревнуется с новичками, а не с недостижимыми ветеранами.
+    Топ-10 каждой лиги получают призы в конце сезона."""
     gl.finalize_seasons()
     season = gl.current_season()
+    me = db.get_user(tg["id"])
+    my_level = me["level"] if me else 1
+    lkey, lo, hi = cfg.league_of(my_level)
+    cond = "level >= ?" + (" AND level <= ?" if hi is not None else "")
+    lparams = [lo] + ([hi] if hi is not None else [])
+
     top = db.q(
-        "SELECT user_id, username, first_name, level, season_earned "
-        "FROM users WHERE season_id = ? "
-        "ORDER BY level DESC, season_earned DESC LIMIT 100", (season,))
+        f"SELECT user_id, username, first_name, level, season_earned "
+        f"FROM users WHERE season_id = ? AND {cond} "
+        f"ORDER BY level DESC, season_earned DESC LIMIT 100", [season] + lparams)
     for i, row in enumerate(top):
         row["rank"] = i + 1
         row["name"] = row.pop("first_name") or row.pop("username") or "Player"
@@ -260,18 +268,20 @@ async def leaderboard(tg: dict = Depends(tg_user)):
         row["is_me"] = row["user_id"] == tg["id"]
         row["prize"] = cfg.season_reward(i + 1, row["season_earned"])
 
-    me = db.get_user(tg["id"])
     my_rank = None
     if me:
         my_rank = db.q1(
-            "SELECT COUNT(*) c FROM users WHERE season_id = ? AND "
-            "(level > ? OR (level = ? AND season_earned > ?))",
-            (season, me["level"], me["level"], me["season_earned"]))["c"] + 1
+            f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond} AND "
+            f"(level > ? OR (level = ? AND season_earned > ?))",
+            [season] + lparams + [me["level"], me["level"], me["season_earned"]])["c"] + 1
     return {
         "top": top,
         "me": {"rank": my_rank, "season_earned": me["season_earned"] if me else 0},
-        "players_total": db.q1("SELECT COUNT(*) c FROM users WHERE season_id = ?",
-                               (season,))["c"],
+        "players_total": db.q1(
+            f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond}",
+            [season] + lparams)["c"],
+        "league": {"key": lkey, "min_level": lo, "max_level": hi,
+                   "all": [k for k, _lo in cfg.LEAGUES]},
         "season": season + 1,
         "season_ends_at": gl.season_end_ts(season),
         "last_result": gl.my_last_season_result(tg["id"]),

@@ -75,6 +75,42 @@ class DataBase:
                 # --- CPS-лимит (переживает рестарт и мульти-worker) ---
                 'cps_ts': 'REAL DEFAULT 0',             # окно анти-чита: время
                 'cps_allowance': 'REAL DEFAULT 0',      # окно анти-чита: остаток кликов
+                # --- QoL: реролл квеста и заморозка стрика ---
+                'quest_reroll_day': 'TEXT',             # день, когда потрачен реролл
+                'streak_freeze_week': 'TEXT',           # ISO-неделя, когда потрачена заморозка
+                # --- коллекция блестящих печенек ---
+                'shiny_pity': 'INTEGER DEFAULT 0',      # мерджей без блестяшки (гарант при пороге)
+                # --- стартовый чеклист / заказы ---
+                'tutorial_done': 'INTEGER DEFAULT 0',
+                'orders_completed': 'INTEGER DEFAULT 0',
+                'orders_day': 'TEXT',                   # день счётчика заказов
+                'orders_day_count': 'INTEGER DEFAULT 0',
+            },
+            'events': {  # аналитика: одно событие = одна строка
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER',
+                'event': 'TEXT',
+                'value': 'REAL DEFAULT 0',
+                'created_at': 'REAL DEFAULT 0',
+            },
+            'orders': {  # заказы пекарни: offer (выбор из 3) -> active -> done
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER',
+                'slot': 'INTEGER',            # 1..3 для офферов
+                'template': 'TEXT',
+                'metric': 'TEXT',
+                'goal': 'REAL DEFAULT 0',
+                'progress': 'REAL DEFAULT 0',
+                'reward_cookies': 'REAL DEFAULT 0',
+                'reward_bp_xp': 'REAL DEFAULT 0',
+                'status': 'TEXT DEFAULT "offer"',
+                'created_at': 'REAL DEFAULT 0',
+            },
+            'collection': {  # альбом блестящих печенек: строка = открытый слот
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER',
+                'item_level': 'INTEGER',
+                'obtained_at': 'REAL DEFAULT 0',
             },
             'click_batches': {  # обработанные батчи кликов (дедуп ретраев, TTL ~1ч)
                 'id': 'INTEGER PRIMARY KEY',
@@ -190,6 +226,10 @@ class DataBase:
             "ON daily_quests(user_id, day, quest_key)")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_season_earned ON users(season_earned)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_name ON events(event, created_at)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, status)")
         self._dedupe_and_unique(db_file)
         self.connection.commit()
 
@@ -205,6 +245,7 @@ class DataBase:
         "ref_claims": ("user_id", "milestone_key"),
         "season_results": ("season_id", "user_id"),
         "click_batches": ("user_id", "batch_id"),
+        "collection": ("user_id", "item_level"),
     }
 
     def _has_duplicates(self) -> bool:
