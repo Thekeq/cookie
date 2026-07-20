@@ -98,6 +98,18 @@ T: dict[str, dict[str, str]] = {
         "uk": "Відкриває premium-нагороди батл-пасу",
         "ru": "Открывает premium-награды батл-пасса",
     },
+    "shop_offline_cap_6h_t": {"en": "Offline 6 hours", "uk": "Офлайн 6 годин", "ru": "Оффлайн 6 часов"},
+    "shop_offline_cap_6h_d": {
+        "en": "Offline income accumulates for 6 hours instead of 3. Forever!",
+        "uk": "Офлайн-дохід накопичується 6 годин замість 3. Назавжди!",
+        "ru": "Оффлайн-доход копится 6 часов вместо 3. Навсегда!",
+    },
+    "shop_offline_cap_12h_t": {"en": "Offline 12 hours", "uk": "Офлайн 12 годин", "ru": "Оффлайн 12 часов"},
+    "shop_offline_cap_12h_d": {
+        "en": "Offline income accumulates for 12 hours instead of 3. Forever!",
+        "uk": "Офлайн-дохід накопичується 12 годин замість 3. Назавжди!",
+        "ru": "Оффлайн-доход копится 12 часов вместо 3. Навсегда!",
+    },
     # ---------- достижения ----------
     "ach_clicks_100_t": {"en": "Warm-up", "uk": "Розминка", "ru": "Разминка"},
     "ach_clicks_100_d": {"en": "Make 100 clicks", "uk": "Зроби 100 кліків", "ru": "Сделай 100 кликов"},

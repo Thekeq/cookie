@@ -21,12 +21,30 @@ def click_upgrade_cost(click_level: int) -> float:
     return 100 * (1.8 ** (click_level - 1))
 
 # ---------- Merge ----------
-BOARD_SIZE = 25                 # 5x5
+BOARD_SIZE = 25                 # сетка 5x5 (рисуется целиком, но не вся открыта)
 MAX_ITEM_LEVEL = 24
 
-def spawn_cost(items_on_board: int) -> float:
-    """Цена спавна печеньки lvl1, растёт от заполненности доски"""
-    return 50 * (1.15 ** items_on_board)
+# Клетки — дефицит (фидбек: «нет опасности, что закончатся клетки»).
+# Базово открыто MERGE_BASE_CELLS, остальные — за уровни и приглашённых друзей.
+MERGE_BASE_CELLS = 12
+MERGE_CELL_LEVELS = (3, 5, 7, 9, 11, 13, 15, 18, 21)   # каждый уровень = +1 клетка
+MERGE_CELL_REFS = (1, 3, 5, 10)                        # каждый порог друзей = +1 клетка
+
+def merge_cells_unlocked(user_level: int, refs: int) -> int:
+    cells = MERGE_BASE_CELLS
+    cells += sum(1 for lvl in MERGE_CELL_LEVELS if user_level >= lvl)
+    cells += sum(1 for need in MERGE_CELL_REFS if refs >= need)
+    return min(cells, BOARD_SIZE)
+
+# Цена спавна масштабируется от дохода игрока: печенька всегда стоит заметную
+# долю часового дохода, а не «копейки навсегда» (фидбек: покупки слишком дешёвые)
+SPAWN_COST_GROWTH = 1.35        # каждая занятая клетка делает следующую дороже
+SPAWN_INCOME_SHARE = 1 / 25     # база lvl1 ≈ 2.4 минуты часового дохода
+
+def spawn_cost(items_on_board: int, income_per_hour: float = 0.0) -> float:
+    """Цена спавна печеньки lvl1: max(50, доля дохода) x рост от заполненности"""
+    base = max(50.0, income_per_hour * SPAWN_INCOME_SHARE)
+    return base * (SPAWN_COST_GROWTH ** items_on_board)
 
 # Прямая покупка печеньки уровня N: «честная» цена lvl1-эквивалента x премия.
 # 2.8^(N-1) против фактических 2^(N-1) слияний — дорого, но экономит время.
@@ -34,8 +52,11 @@ SPAWN_LEVEL_FACTOR = 2.8
 # топ-тиры только слиянием: напрямую можно купить максимум unlocked - 3
 SPAWN_DIRECT_GAP = 3
 
-def direct_spawn_cost(level: int, items_on_board: int) -> float:
-    return spawn_cost(items_on_board) * (SPAWN_LEVEL_FACTOR ** (level - 1))
+def direct_spawn_cost(level: int, items_on_board: int, income_per_hour: float = 0.0) -> float:
+    return spawn_cost(items_on_board, income_per_hour) * (SPAWN_LEVEL_FACTOR ** (level - 1))
+
+# Мусорка/печь: перетащил печеньку — клетка освободилась, вернулась часть цены
+TRASH_REFUND = 0.10
 
 def merge_reward_xp(new_level: int) -> float:
     """XP за создание печеньки уровня new_level. После 10 lvl рост гасим,
@@ -46,14 +67,17 @@ def merge_reward_xp(new_level: int) -> float:
 
 def passive_income_per_hour(item_level: int) -> float:
     """Пассивный доход cookies/час от печеньки на доске. После 12 lvl рост
-    мягче, чтобы пара топ-печенек не обгоняла всю ферму на порядки."""
+    мягче, чтобы пара топ-печенек не обгоняла всю ферму на порядки.
+    База 90: доска меньше (12-25 клеток), а доход мерджа должен конкурировать
+    с фермой (фидбек: «8к/ч — бабушки приносят столько за 80 секунд»)."""
     if item_level < 3:
         return 0
     if item_level <= 12:
-        return 20 * (2.2 ** (item_level - 3))
-    return 20 * (2.2 ** 9) * (1.6 ** (item_level - 12))
+        return 90 * (2.2 ** (item_level - 3))
+    return 90 * (2.2 ** 9) * (1.7 ** (item_level - 12))
 
-PASSIVE_CAP_HOURS = 3           # оффлайн-доход копится максимум 3 часа
+PASSIVE_CAP_HOURS = 3           # базовый кап оффлайн-дохода; Stars-покупка
+                                # offline_cap_* добавляет часы навсегда
 
 def item_unlock_level(item_level: int) -> int:
     """С какого уровня игрока доступна печенька item_level (спавн/merge выше — нельзя).
@@ -296,6 +320,10 @@ SHOP_ITEMS = {
     "cookies_pack":  ("Пачка печенек",   "2 часа твоего дохода мгновенно",        75,  {"type": "cookies", "income_hours": 2, "min_amount": 5000}),
     "cookies_crate": ("Ящик печенек",    "10 часов твоего дохода мгновенно",      300, {"type": "cookies", "income_hours": 10, "min_amount": 25000}),
     "bp_premium":    ("Premium Пасс",    "Открывает premium-награды батл-пасса",  BP_PREMIUM_STARS, {"type": "bp_premium"}),
+    # Постоянное расширение оффлайн-капа (ферма + доска). Имба — потому дорого.
+    # hours = ДОБАВКА к базовым 3ч; применяется как max(текущий бонус, hours)
+    "offline_cap_6h":  ("Оффлайн 6 часов",  "Оффлайн-доход копится 6 часов. Навсегда!",  400, {"type": "offline_cap", "hours": 3}),
+    "offline_cap_12h": ("Оффлайн 12 часов", "Оффлайн-доход копится 12 часов. Навсегда!", 900, {"type": "offline_cap", "hours": 9}),
 }
 
 BOOST_CLICK_X2_MULT = 2.0
@@ -316,7 +344,7 @@ FARM_BUILDINGS = {
 # 1.22 + пониженный cps топ-зданий: фидбек «залутал за часик и миллиарды»;
 # симуляция 72ч: earned 5.5B -> ~0.4B, фарм 70k -> 4k cps, ранний темп не тронут
 FARM_COST_GROWTH = 1.22          # цена растёт за каждое купленное здание
-FARM_OFFLINE_CAP_HOURS = 3       # оффлайн-фарм копится максимум 3 часа
+FARM_OFFLINE_CAP_HOURS = 3       # базовый кап оффлайн-фарма (+ Stars-бонус offline_cap_*)
 
 def building_cost(key: str, owned: int) -> float:
     return FARM_BUILDINGS[key]["base_cost"] * (FARM_COST_GROWTH ** owned)

@@ -535,12 +535,25 @@ def collect_all(user_id: int) -> dict:
     return db.get_user(user_id)
 
 
+def offline_bonus_hours(user: dict) -> float:
+    """Постоянная добавка к оффлайн-капу из Stars-покупки offline_cap_*."""
+    return user.get("offline_bonus_hours") or 0
+
+
+def farm_offline_cap_hours(user: dict) -> float:
+    return cfg.FARM_OFFLINE_CAP_HOURS + offline_bonus_hours(user)
+
+
+def passive_offline_cap_hours(user: dict) -> float:
+    return cfg.PASSIVE_CAP_HOURS + offline_bonus_hours(user)
+
+
 def collect_farm(user: dict) -> float:
     """Начисляет накопленный доход фермы, возвращает сколько упало.
     Таймер и деньги — одна транзакция: сбой не может «продвинуть» таймер,
     потеряв недоначисленный доход."""
     now = time.time()
-    seconds = min(cfg.FARM_OFFLINE_CAP_HOURS * 3600,
+    seconds = min(farm_offline_cap_hours(user) * 3600,
                   now - (user["farm_collected_at"] or now))
     if seconds <= 0:
         db.update_user(user["user_id"], farm_collected_at=now)
@@ -583,13 +596,39 @@ def add_cookies(user_id: int, amount: float, count_earned: bool = True):
     db.update_user(user_id, **fields)
 
 
+# ---------- merge-доска: клетки ----------
+
+def ref_count(user_id: int) -> int:
+    return db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
+
+
+def merge_cells_unlocked_for(user: dict) -> int:
+    """Сколько клеток доски открыто: база + уровни + приглашённые друзья."""
+    return cfg.merge_cells_unlocked(user["level"], ref_count(user["user_id"]))
+
+
+def board_cells_state(user: dict) -> dict:
+    """Инфо для фронта: сколько открыто и как открыть следующие."""
+    refs = ref_count(user["user_id"])
+    return {
+        "unlocked": cfg.merge_cells_unlocked(user["level"], refs),
+        "total": cfg.BOARD_SIZE,
+        "next_unlock_level": min((lvl for lvl in cfg.MERGE_CELL_LEVELS
+                                  if lvl > user["level"]), default=None),
+        "ref_cells": [{"friends": n, "done": refs >= n} for n in cfg.MERGE_CELL_REFS],
+        "refs": refs,
+        "trash_refund": cfg.TRASH_REFUND,
+    }
+
+
 # ---------- пассивный доход с merge-доски ----------
 
 def collect_passive(user: dict) -> float:
     """Начисляет накопленный пассивный доход, возвращает сколько упало.
     Таймер и деньги — одна транзакция (см. collect_farm)."""
     now = time.time()
-    hours = min(cfg.PASSIVE_CAP_HOURS, (now - (user["passive_collected_at"] or now)) / 3600)
+    hours = min(passive_offline_cap_hours(user),
+                (now - (user["passive_collected_at"] or now)) / 3600)
     if hours <= 0:
         return 0
     income = passive_per_hour(user["user_id"]) * hours
@@ -878,6 +917,11 @@ def _apply_purchase_effect(user_id: int, item_key: str):
                 (user_id, effect["key"], time.time() + effect["hours"] * 3600))
     elif effect["type"] == "bp_premium":
         db.update_user(user_id, bp_premium=1)
+    elif effect["type"] == "offline_cap":
+        # постоянный бонус; max — покупка старшего тира поверх младшего апгрейдит
+        user = db.get_user(user_id)
+        db.update_user(user_id, offline_bonus_hours=max(
+            offline_bonus_hours(user), effect["hours"]))
 
 
 def fulfill_charge(charge_id: str) -> bool:
@@ -912,6 +956,7 @@ def full_state(user_id: int) -> dict:
     db.update_user(user_id, last_seen_at=time.time())
     board = db.q("SELECT cell, item_level FROM board WHERE user_id = ? ORDER BY cell", (user_id,))
     items_count = len(board)
+    income = hourly_income(user_id)  # цены спавна масштабируются от дохода
     nxt = user["level"] + 1
     eff = upgrade_effects(user_id)
     owned_skins = {r["skin_key"] for r in
@@ -959,16 +1004,21 @@ def full_state(user_id: int) -> dict:
         "upgrades_owned": sorted(user_upgrades(user_id)),
         "skins_owned": sorted(owned_skins),
         "board": board,
-        "spawn_cost": cfg.spawn_cost(items_count),
+        "board_cells": board_cells_state(user),
+        "spawn_cost": cfg.spawn_cost(items_count, income),
         # прямая покупка печенек выше 1 lvl: доступные уровни и цены
         "spawn_direct": {
             "max_level": max(1, max(
                 (l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
                  if cfg.item_unlock_level(l) <= user["level"]), default=1)
                 - cfg.SPAWN_DIRECT_GAP),
-            "costs": {str(l): cfg.direct_spawn_cost(l, items_count)
+            "costs": {str(l): cfg.direct_spawn_cost(l, items_count, income)
                       for l in range(1, cfg.MAX_ITEM_LEVEL + 1)},
         },
+        # бейдж на вкладке пекарни: активный заказ выполнен и ждёт сдачи
+        "orders_claimable": bool(db.q1(
+            "SELECT id FROM orders WHERE user_id = ? AND status = 'active' "
+            "AND progress >= goal", (user_id,))),
         "passive_per_hour": passive_per_hour(user_id),
         "boosts": [
             {"key": r["boost_key"], "expires_at": r["expires_at"]}

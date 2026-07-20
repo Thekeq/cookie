@@ -39,7 +39,7 @@ def _pick_notification(user: dict, now: float) -> str | None:
     # 2) ферма упёрлась в оффлайн-кап — доход простаивает
     if user["farm_collected_at"]:
         idle_h = (now - user["farm_collected_at"]) / 3600
-        if idle_h >= cfg.FARM_OFFLINE_CAP_HOURS and gl.farm_cps(user["user_id"]) > 0:
+        if idle_h >= gl.farm_offline_cap_hours(user) and gl.farm_cps(user["user_id"]) > 0:
             return tr(lang, "notif_farm")
 
     # 3) энергия полная

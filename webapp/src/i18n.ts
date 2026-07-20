@@ -38,10 +38,17 @@ const dict = {
   // merge
   passive_income: { en: 'Passive income', uk: 'Пасивний дохід', ru: 'Пассивный доход' },
   passive_hint: { en: 'Cookies lvl 3+ generate income', uk: 'Печиво 3+ рівня приносить дохід', ru: 'Печеньки 3+ уровня приносят доход' },
+  per_hour: { en: '/h', uk: '/год', ru: '/ч' },
   board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },
   buy_cookie: { en: 'Buy cookie', uk: 'Купити печиво', ru: 'Купить печеньку' },
   merge_hint: { en: 'Drag a cookie onto the same one to merge. Max unlocked:', uk: 'Перетягни печиво на таке саме — вони зіллються. Максимум відкрито:', ru: 'Перетащи печеньку на такую же — они сольются. Максимум открыт:' },
   merged_lvl: { en: 'Created a level {n} cookie!', uk: 'Створено печиво {n} рівня!', ru: 'Создана печенька {n} уровня!' },
+  cells_count: { en: 'Cells: {a}/{b}', uk: 'Клітинки: {a}/{b}', ru: 'Клетки: {a}/{b}' },
+  cell_next_lvl: { en: '+1 at level {n}', uk: '+1 на {n} рівні', ru: '+1 на {n} уровне' },
+  cell_next_ref: { en: '+1 for {n} friends', uk: '+1 за {n} друзів', ru: '+1 за {n} друзей' },
+  trash_zone: { en: 'Melt · +{n}% back', uk: 'Переплавити · +{n}% назад', ru: 'Переплавить · +{n}% назад' },
+  trash_done: { en: 'Melted! +{n} 🍪 back', uk: 'Переплавлено! +{n} 🍪 назад', ru: 'Переплавлено! +{n} 🍪 назад' },
+  err_cell_locked: { en: 'This cell is locked', uk: 'Ця клітинка ще закрита', ru: 'Эта клетка ещё закрыта' },
 
   // уровни
   claim_level: { en: '🎉 Claim level {n}!', uk: '🎉 Забрати рівень {n}!', ru: '🎉 Забрать уровень {n}!' },
@@ -233,6 +240,10 @@ const dict = {
   tut_4_title: { en: 'Level up & earn', uk: 'Прокачуйся та заробляй', ru: 'Прокачивайся и зарабатывай' },
   tut_4_text: { en: 'Gain XP, walk the level path, claim achievements and battle pass rewards. Invite friends — you both get bonuses!', uk: 'Отримуй XP, крокуй шляхом рівнів, забирай досягнення та нагороди батл-пасу. Клич друзів — бонуси обом!', ru: 'Получай XP, иди по тропинке уровней, забирай достижения и награды батл-пасса. Зови друзей — бонусы обоим!' },
   // --- заказы пекарни ---
+  tab_bakery: { en: 'Bakery', uk: 'Пекарня', ru: 'Пекарня' },
+  bakery_pick: { en: 'Pick an order for the oven', uk: 'Обери замовлення для печі', ru: 'Выбери заказ для печи' },
+  bakery_baking: { en: 'Baking...', uk: 'Випікається...', ru: 'Печётся...' },
+  bakery_ready: { en: 'Order ready! Open the chest 🎁', uk: 'Замовлення готове! Відкрий скриню 🎁', ru: 'Заказ готов! Открывай сундук 🎁' },
   orders_title: { en: '🧾 Bakery orders', uk: '🧾 Замовлення пекарні', ru: '🧾 Заказы пекарни' },
   orders_hint: { en: 'Pick one order, complete it and open the chest. {n} left today.', uk: 'Обери одне замовлення, виконай і відкрий скриню. Сьогодні лишилось: {n}.', ru: 'Выбери один заказ, выполни и открой сундук. Сегодня осталось: {n}.' },
   order_take: { en: 'Take', uk: 'Взяти', ru: 'Взять' },

@@ -98,9 +98,19 @@ export interface GameState {
   upgrades_owned: string[]
   skins_owned: string[]
   board: BoardCell[]
+  board_cells: {
+    unlocked: number
+    total: number
+    next_unlock_level: number | null
+    ref_cells: { friends: number; done: boolean }[]
+    refs: number
+    trash_refund: number
+  }
   spawn_cost: number
   spawn_direct: { max_level: number; costs: Record<string, number> }
+  orders_claimable: boolean
   passive_per_hour: number
+  trash_refund?: number // ответ /api/merge/trash: сколько вернули
   passive_collected?: number
   boosts: { key: string; expires_at: number }[]
   claimable_level: number | null
@@ -164,4 +174,5 @@ export interface ShopItem {
   desc: string
   stars: number
   amount?: number // персональная сумма пачки (часы дохода покупателя)
+  owned?: boolean // постоянный апгрейд уже куплен
 }

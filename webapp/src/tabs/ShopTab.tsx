@@ -12,6 +12,8 @@ const ICONS: Record<string, string> = {
   cookies_pack: '🍪',
   cookies_crate: '🧺',
   bp_premium: '🎖️',
+  offline_cap_6h: '🌙',
+  offline_cap_12h: '🌌',
 }
 
 export default function ShopTab() {
@@ -57,13 +59,17 @@ export default function ShopTab() {
               </div>
             )}
           </div>
-          <button
-            className="claim-chip"
-            style={{ background: 'var(--accent)', color: '#2a1c05', whiteSpace: 'nowrap' }}
-            onClick={() => buy(it)}
-          >
-            ⭐ {it.stars}
-          </button>
+          {it.owned ? (
+            <span className="hint" style={{ whiteSpace: 'nowrap' }}>{t('bought')}</span>
+          ) : (
+            <button
+              className="claim-chip"
+              style={{ background: 'var(--accent)', color: '#2a1c05', whiteSpace: 'nowrap' }}
+              onClick={() => buy(it)}
+            >
+              ⭐ {it.stars}
+            </button>
+          )}
         </div>
       ))}
     </div>

@@ -71,6 +71,7 @@ interface Drag {
   x: number // координаты пальца внутри доски (для призрака)
   y: number
   over: number | null // клетка под пальцем
+  overTrash: boolean // палец над мусоркой
   moved: boolean // палец реально сдвинулся (отличаем от случайного тапа)
 }
 
@@ -80,12 +81,18 @@ export default function MergeTab() {
   const te = useTErr()
   const [drag, setDrag] = useState<Drag | null>(null)
   const [popCell, setPopCell] = useState<number | null>(null)
+  const [shinyCell, setShinyCell] = useState<number | null>(null)
   const [buyLevel, setBuyLevel] = useState(1) // уровень покупаемой печеньки
   const [showAlbum, setShowAlbum] = useState(false)
   const busy = useRef(false)
   const boardRef = useRef<HTMLDivElement>(null)
+  const trashRef = useRef<HTMLDivElement>(null)
 
   const boardMap = new Map(state.board.map((b) => [b.cell, b.item_level]))
+  const cellsOpen = state.board_cells?.unlocked ?? 25
+  // занятые ОТКРЫТЫЕ клетки: печеньки в закрытых (legacy) не блокируют спавн
+  const openBusy = state.board.filter((b) => b.cell < cellsOpen).length
+  const boardFull = openBusy >= cellsOpen
 
   const doMove = async (from: number, to: number) => {
     if (busy.current) return
@@ -98,12 +105,34 @@ export default function MergeTab() {
         sfxMerge(s.merged_level)
         setPopCell(to)
         setTimeout(() => setPopCell(null), 350)
-        if (s.shiny) toast(t('shiny_drop'))
-        else if (s.merged_level >= 5)
+        if (s.shiny) {
+          // золотая подсветка: сразу видно, что выпала блестяшка в альбом
+          setShinyCell(to)
+          setTimeout(() => setShinyCell(null), 1800)
+          toast(t('shiny_drop'))
+        } else if (s.merged_level >= 5)
           toast(`${t('merged_lvl', { n: s.merged_level })} ${COOKIE_SKINS[s.merged_level]}`)
       } else {
         haptic('light')
       }
+    } catch (e: any) {
+      sfxError()
+      toast(te(e.detail), true)
+    } finally {
+      busy.current = false
+    }
+  }
+
+  // печенька в мусорку/переплавку: клетка свободна, кэшбек частью цены
+  const doTrash = async (cell: number) => {
+    if (busy.current) return
+    busy.current = true
+    try {
+      const s = await api.post('/api/merge/trash', { cell })
+      setState(s)
+      hapticSuccess()
+      sfxBuy()
+      toast(t('trash_done', { n: fmt(s.trash_refund || 0) }))
     } catch (e: any) {
       sfxError()
       toast(te(e.detail), true)
@@ -124,6 +153,13 @@ export default function MergeTab() {
     return row * 5 + col
   }
 
+  const inTrash = (clientX: number, clientY: number): boolean => {
+    const rect = trashRef.current?.getBoundingClientRect()
+    if (!rect) return false
+    return clientX >= rect.left && clientX <= rect.right &&
+      clientY >= rect.top && clientY <= rect.bottom
+  }
+
   const onDragStart = (e: React.PointerEvent, cell: number) => {
     const lvl = boardMap.get(cell)
     if (!lvl || busy.current) return
@@ -135,18 +171,21 @@ export default function MergeTab() {
     setDrag({
       from: cell, level: lvl,
       x: e.clientX - rect.left, y: e.clientY - rect.top,
-      over: null, moved: false,
+      over: null, overTrash: false, moved: false,
     })
   }
 
   const onDragMove = (e: React.PointerEvent) => {
     if (!drag) return
     const rect = boardRef.current!.getBoundingClientRect()
-    const over = cellAt(e.clientX, e.clientY)
+    let over = cellAt(e.clientX, e.clientY)
+    // пустая закрытая клетка — не цель: сервер всё равно откажет
+    if (over !== null && over >= cellsOpen && !boardMap.has(over)) over = null
     setDrag({
       ...drag,
       x: e.clientX - rect.left, y: e.clientY - rect.top,
       over: over === drag.from ? null : over,
+      overTrash: inTrash(e.clientX, e.clientY),
       moved: true,
     })
   }
@@ -156,9 +195,16 @@ export default function MergeTab() {
     boardRef.current?.releasePointerCapture(e.pointerId)
     const target = cellAt(e.clientX, e.clientY)
     const { from, moved } = drag
+    const dropTrash = inTrash(e.clientX, e.clientY)
     setDrag(null)
-    // дроп на другую клетку после реального движения — ход
-    if (moved && target !== null && target !== from) doMove(from, target)
+    if (!moved) return
+    if (dropTrash) {
+      doTrash(from)
+      return
+    }
+    // дроп на другую открытую/занятую клетку — ход
+    if (target !== null && target !== from &&
+        !(target >= cellsOpen && !boardMap.has(target))) doMove(from, target)
   }
 
   const spawn = async () => {
@@ -178,6 +224,10 @@ export default function MergeTab() {
   const safeBuyLevel = Math.min(buyLevel, maxDirect)
   const buyCost = state.spawn_direct?.costs?.[String(safeBuyLevel)] ?? state.spawn_cost
 
+  // как открыть следующие клетки: уровень и/или друзья
+  const cells = state.board_cells
+  const nextRef = cells?.ref_cells?.find((r) => !r.done)
+
   return (
     <div>
       <div className="card">
@@ -188,7 +238,7 @@ export default function MergeTab() {
           </div>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontWeight: 800, color: 'var(--good)' }}>
-              +{fmt(state.passive_per_hour)}/ч
+              +{fmt(state.passive_per_hour)}{t('per_hour')}
             </div>
             <button
               className="claim-chip"
@@ -212,6 +262,7 @@ export default function MergeTab() {
       >
         {Array.from({ length: 25 }, (_, i) => {
           const lvl = boardMap.get(i)
+          const locked = i >= cellsOpen && !lvl
           const isSource = drag?.from === i
           const isOver = drag?.over === i
           // подсказка во время перетаскивания: одинаковый уровень = сольются
@@ -222,9 +273,11 @@ export default function MergeTab() {
               className={
                 'cell' +
                 (lvl ? ' has-item' : '') +
+                (locked ? ' locked' : '') +
                 (isSource ? ' drag-source' : '') +
                 (isOver ? (mergeOk ? ' drop-ok' : ' drop-over') : '') +
-                (popCell === i ? ' merge-pop' : '')
+                (popCell === i ? ' merge-pop' : '') +
+                (shinyCell === i ? ' shiny-pop' : '')
               }
               onPointerDown={(e) => onDragStart(e, i)}
             >
@@ -234,8 +287,10 @@ export default function MergeTab() {
                     {COOKIE_SKINS[lvl]}
                   </span>
                   <span className="item-lvl">{lvl}</span>
+                  {shinyCell === i && <span className="shiny-spark">✨</span>}
                 </>
               )}
+              {locked && <span className="cell-lock">🔒</span>}
             </div>
           )
         })}
@@ -247,6 +302,25 @@ export default function MergeTab() {
           </span>
         )}
       </div>
+
+      {/* мусорка-печь: появляется во время перетаскивания, дроп = переплавка */}
+      <div
+        ref={trashRef}
+        className={
+          'trash-zone' + (drag?.moved ? ' show' : '') + (drag?.overTrash ? ' over' : '')
+        }
+      >
+        🔥 {t('trash_zone', { n: Math.round((cells?.trash_refund ?? 0.1) * 100) })}
+      </div>
+
+      {/* прогресс открытия клеток: уровнями и друзьями */}
+      {cells && cells.unlocked < cells.total && (
+        <div className="hint" style={{ textAlign: 'center', marginBottom: 8 }}>
+          🔒 {t('cells_count', { a: cells.unlocked, b: cells.total })}
+          {cells.next_unlock_level && <> · {t('cell_next_lvl', { n: cells.next_unlock_level })}</>}
+          {nextRef && <> · {t('cell_next_ref', { n: nextRef.friends })}</>}
+        </div>
+      )}
 
       {/* выбор уровня покупаемой печеньки: топ-тиры только слиянием */}
       {maxDirect > 1 && (
@@ -267,9 +341,9 @@ export default function MergeTab() {
       <button
         className="btn"
         onClick={spawn}
-        disabled={state.board.length >= 25 || liveBalance < buyCost}
+        disabled={boardFull || liveBalance < buyCost}
       >
-        {state.board.length >= 25
+        {boardFull
           ? t('board_full')
           : `${t('buy_cookie')} ${COOKIE_SKINS[safeBuyLevel]} ${safeBuyLevel} · 🍪 ${fmt(buyCost)}`}
       </button>

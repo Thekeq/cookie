@@ -80,6 +80,8 @@ class DataBase:
                 'streak_freeze_week': 'TEXT',           # ISO-неделя, когда потрачена заморозка
                 # --- коллекция блестящих печенек ---
                 'shiny_pity': 'INTEGER DEFAULT 0',      # мерджей без блестяшки (гарант при пороге)
+                # --- Stars: постоянное расширение оффлайн-капа (часы сверх базовых) ---
+                'offline_bonus_hours': 'REAL DEFAULT 0',
                 # --- стартовый чеклист / заказы ---
                 'tutorial_done': 'INTEGER DEFAULT 0',
                 'orders_completed': 'INTEGER DEFAULT 0',

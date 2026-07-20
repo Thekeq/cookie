@@ -242,7 +242,10 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
     with db.tx():
         user = gl.collect_all(tg["id"])
         board = _board_map(tg["id"])
-        if len(board) >= cfg.BOARD_SIZE:
+        # спавн только в ОТКРЫТЫЕ клетки; печеньки в закрытых (legacy) не мешают
+        cells_open = gl.merge_cells_unlocked_for(user)
+        free_cells = [c for c in range(cells_open) if c not in board]
+        if not free_cells:
             raise HTTPException(400, "err_board_full")
 
         level = max(1, body.level)
@@ -253,10 +256,9 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         if level > max_direct:
             raise HTTPException(400, f"err_direct_cap|{max_direct}")
 
-        cost = cfg.direct_spawn_cost(level, len(board))
+        cost = cfg.direct_spawn_cost(level, len(board), gl.hourly_income(tg["id"]))
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
-        free_cells = [c for c in range(cfg.BOARD_SIZE) if c not in board]
         cell = free_cells[0]
         db.update_user(tg["id"], cookies=user["cookies"] - cost)
         db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
@@ -278,7 +280,9 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
 
     src = board[mv.from_cell]
     if mv.to_cell not in board:
-        # просто перенос
+        # перенос в пустую клетку — только в открытую (из закрытой выйти можно)
+        if mv.to_cell >= gl.merge_cells_unlocked_for(user):
+            raise HTTPException(400, "err_cell_locked")
         db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = ?",
                 (mv.to_cell, tg["id"], mv.from_cell))
         return gl.full_state(tg["id"])
@@ -315,6 +319,33 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
     state = gl.full_state(tg["id"])
     state["merged_level"] = new_level
     state["shiny"] = shiny
+    return state
+
+
+class TrashIn(BaseModel):
+    cell: int
+
+
+@router.post("/merge/trash")
+async def trash(body: TrashIn, tg: dict = Depends(tg_user)):
+    """Печенька в мусорку/печь: клетка освобождается, кэшбек TRASH_REFUND
+    от текущей цены прямой покупки того же уровня."""
+    _ensure_user(tg)
+    if not (0 <= body.cell < cfg.BOARD_SIZE):
+        raise HTTPException(400, "err_bad_move")
+    with db.tx():
+        board = _board_map(tg["id"])
+        if body.cell not in board:
+            raise HTTPException(400, "err_empty_cell")
+        level = board[body.cell]
+        db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], body.cell))
+        # кэшбек по цене доски УЖЕ без этой печеньки — не накрутить продажей
+        refund = (cfg.direct_spawn_cost(level, len(board) - 1, gl.hourly_income(tg["id"]))
+                  * cfg.TRASH_REFUND)
+        gl.add_cookies(tg["id"], refund, count_earned=False)
+    gl.track(tg["id"], "trash_item", level)
+    state = gl.full_state(tg["id"])
+    state["trash_refund"] = refund
     return state
 
 

@@ -68,7 +68,7 @@ async def farm_state(tg: dict = Depends(tg_user)):
         "buildings": buildings,
         "upgrades": upgrades,
         "skins": skins,
-        "offline_cap_hours": cfg.FARM_OFFLINE_CAP_HOURS,
+        "offline_cap_hours": gl.farm_offline_cap_hours(user),
     }
 
 

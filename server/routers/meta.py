@@ -205,6 +205,8 @@ async def shop(tg: dict = Depends(tg_user)):
     персональную сумму — покупатель видит, сколько получит именно он."""
     from server.i18n import tr
     income = gl.hourly_income(tg["id"])
+    user = db.get_user(tg["id"])
+    offline_bonus = gl.offline_bonus_hours(user) if user else 0
     items = []
     for k, (_t, _d, s, effect) in cfg.SHOP_ITEMS.items():
         item = {"key": k, "title": tr(tg["lang"], f"shop_{k}_t"),
@@ -212,6 +214,11 @@ async def shop(tg: dict = Depends(tg_user)):
         if effect.get("type") == "cookies" and "income_hours" in effect:
             item["amount"] = max(effect["min_amount"],
                                  income * effect["income_hours"])
+        # постоянные апгрейды не продаём повторно — фронт рисует «куплено»
+        if effect.get("type") == "offline_cap":
+            item["owned"] = offline_bonus >= effect["hours"]
+        if effect.get("type") == "bp_premium" and user:
+            item["owned"] = bool(user["bp_premium"])
         items.append(item)
     return {"items": items}
 
@@ -225,6 +232,12 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
     """Создаёт invoice-ссылку на оплату Stars через бота."""
     if body.item_key not in cfg.SHOP_ITEMS:
         raise HTTPException(400, "err_no_item")
+    # постоянный апгрейд уже куплен — не даём заплатить второй раз впустую
+    effect = cfg.SHOP_ITEMS[body.item_key][3]
+    if effect.get("type") == "offline_cap":
+        user = db.get_user(tg["id"])
+        if user and gl.offline_bonus_hours(user) >= effect["hours"]:
+            raise HTTPException(400, "err_owned")
     from server.i18n import tr
     _t, _d, stars, _effect = cfg.SHOP_ITEMS[body.item_key]
     title = tr(tg["lang"], f"shop_{body.item_key}_t")

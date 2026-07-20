@@ -7,6 +7,7 @@ import Onboarding from './Onboarding'
 import DailyModal from './DailyModal'
 import ClickerTab from './tabs/ClickerTab'
 import MergeTab from './tabs/MergeTab'
+import BakeryTab from './tabs/BakeryTab'
 import FarmTab from './tabs/FarmTab'
 import ProgressTab from './tabs/ProgressTab'
 import ProfileHubTab from './tabs/ProfileHubTab'
@@ -226,10 +227,11 @@ function Game() {
       </GameCtx.Provider>
     )
 
-  // 5 вкладок; «Прогресс» и «Профиль» содержат сегменты (Путь/Пасс/Топ и Профиль/Stars/Админ)
+  // 6 вкладок; «Прогресс» и «Профиль» содержат сегменты (Путь/Пасс/Топ и Профиль/Stars/Админ)
   const tabs = [
     { key: 'clicker', ico: state.user.skin_emoji || '🍪', label: t('tab_clicker') },
     { key: 'merge', ico: '🧩', label: t('tab_merge') },
+    { key: 'bakery', ico: '🧑‍🍳', label: t('tab_bakery'), badge: !!state.orders_claimable },
     { key: 'farm', ico: '🏭', label: t('tab_farm') },
     { key: 'progress', ico: '🗺️', label: t('tab_progress'), badge: !!state.claimable_level || state.quests_claimable > 0 },
     { key: 'profile', ico: '👤', label: t('tab_profile') },
@@ -254,6 +256,7 @@ function Game() {
         <div className="content">
           {tab === 'clicker' && <ClickerTab />}
           {tab === 'merge' && <MergeTab />}
+          {tab === 'bakery' && <BakeryTab />}
           {tab === 'farm' && <FarmTab />}
           {tab === 'progress' && <ProgressTab />}
           {tab === 'profile' && <ProfileHubTab />}
