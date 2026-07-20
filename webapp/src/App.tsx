@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from './api'
 import type { GameState } from './types'
 import { Lang, LangCtx, loadLang, saveLang, useT, useTErr } from './i18n'
@@ -21,6 +21,12 @@ interface Ctx {
   liveBalance: number
   /** предикт клика: мгновенно прибавляет к балансу, сервер подтвердит батчем */
   bumpBalance: (n: number) => void
+  /** текущий множитель комбо (живёт здесь — переживает смену вкладок) */
+  combo: number
+  /** регистрирует тап: очередь кликов живёт в App и не теряется при смене вкладки */
+  tapClick: (predicted: number) => void
+  /** дожидается отправки всех накопленных кликов; звать перед любой покупкой */
+  flushClicks: () => Promise<void>
 }
 
 const GameCtx = createContext<Ctx>(null!)
@@ -74,6 +80,80 @@ function Game() {
     setState(s)
     setLiveCookies(0)
   }, [])
+
+  // ---- очередь кликов живёт здесь, а не во вкладке кликера: не теряется
+  // при смене вкладки, и любая покупка может дождаться её отправки ----
+  const pendingClicks = useRef(0)
+  const clickRetry = useRef<{ id: string; n: number } | null>(null)
+  const clickInflight = useRef<Promise<void> | null>(null)
+  const lastTapAt = useRef(0)
+  const [combo, setCombo] = useState(1)
+
+  const tapClick = useCallback((predicted: number) => {
+    lastTapAt.current = Date.now()
+    pendingClicks.current += 1
+    setClickDelta((v) => v + predicted)
+  }, [])
+
+  const sendClickBatch = useCallback(async () => {
+    // ретрай потерянного ответа идёт тем же batch_id — сервер дедуплицирует
+    let batch = clickRetry.current
+    if (!batch) {
+      const n = pendingClicks.current
+      if (!n) return
+      pendingClicks.current = 0
+      batch = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, n }
+    }
+    try {
+      const r = await api.post('/api/click', { clicks: batch.n, batch_id: batch.id })
+      clickRetry.current = null
+      // серверное комбо принимаем, только если игрок ещё тапает —
+      // иначе устаревший ответ «воскресит» уже погасшее комбо
+      if (Date.now() - lastTapAt.current < 4000) setCombo(r.combo || 1)
+      setState((prev: GameState | null) =>
+        prev
+          ? {
+              ...prev,
+              golden: r.golden ?? prev.golden,
+              user: { ...prev.user, cookies: r.cookies, energy: r.energy, xp: r.xp ?? prev.user.xp },
+            }
+          : prev)
+    } catch {
+      clickRetry.current = batch // сеть моргнула — повторим тот же батч
+    }
+  }, [])
+
+  const flushClicks = useCallback(async () => {
+    // запросы не пересекаются: ждём текущий, потом дожимаем очередь
+    while (clickInflight.current) await clickInflight.current
+    while (pendingClicks.current > 0 || clickRetry.current) {
+      const p = sendClickBatch()
+      clickInflight.current = p
+      await p
+      clickInflight.current = null
+      if (clickRetry.current) break // сеть лежит — не крутимся вечно
+    }
+  }, [sendClickBatch])
+
+  // батч-отправка раз в 1.5 сек — работает с любой открытой вкладкой
+  useEffect(() => {
+    if (!state || showOnboarding) return
+    const timer = setInterval(() => {
+      if (clickInflight.current) return
+      const p = sendClickBatch()
+      clickInflight.current = p
+      p.finally(() => (clickInflight.current = null))
+    }, 1500)
+    return () => clearInterval(timer)
+  }, [state !== null, showOnboarding, sendClickBatch])
+
+  // локальное затухание комбо: пауза в тапах > 4с — гаснет сразу на клиенте
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (combo > 1 && Date.now() - lastTapAt.current > 4000) setCombo(1)
+    }, 400)
+    return () => clearInterval(timer)
+  }, [combo])
 
   // тик пассивного дохода: ферма (cps) + мердж-доска (в час) капают на глазах
   useEffect(() => {
@@ -137,7 +217,10 @@ function Game() {
 
   if (showOnboarding)
     return (
-      <GameCtx.Provider value={{ state, setState, refresh, toast, isAdmin, liveBalance: state.user.cookies, bumpBalance }}>
+      <GameCtx.Provider
+        value={{ state, setState, refresh, toast, isAdmin, liveBalance: state.user.cookies,
+                 bumpBalance, combo, tapClick, flushClicks }}
+      >
         <Onboarding onDone={() => setShowOnboarding(false)} />
       </GameCtx.Provider>
     )
@@ -155,7 +238,10 @@ function Game() {
   const liveBalance = state.user.cookies + liveCookies + clickDelta
 
   return (
-    <GameCtx.Provider value={{ state, setState, refresh, toast, isAdmin, liveBalance, bumpBalance }}>
+    <GameCtx.Provider
+      value={{ state, setState, refresh, toast, isAdmin, liveBalance,
+               bumpBalance, combo, tapClick, flushClicks }}
+    >
       <div className="app">
         <div className="header">
           <div className="balance">🍪 {fmt(liveBalance)}</div>

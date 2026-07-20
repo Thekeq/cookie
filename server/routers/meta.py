@@ -58,6 +58,8 @@ async def auth(tg: dict = Depends(tg_user)):
     # иначе шапка первые полминуты показывала «вчерашний» баланс
     passive = gl.collect_passive(db.get_user(tg["id"]))
     farm_income = gl.collect_farm(db.get_user(tg["id"]))
+    # довыдаём Stars-покупки, зависшие в 'paid' после сбоя между оплатой и выдачей
+    gl.fulfill_pending(tg["id"])
 
     state = gl.full_state(tg["id"])
     state["just_registered"] = just_registered
@@ -309,7 +311,12 @@ async def channel_claim(tg: dict = Depends(tg_user)):
     if member.status in ("left", "kicked"):
         raise HTTPException(400, "err_not_subscribed")
 
-    with db.tx():  # отметка и награда — одним куском
-        db.update_user(tg["id"], channel_claimed=1)
+    with db.tx():
+        # условный UPDATE закрывает гонку: два запроса могли пройти проверку
+        # выше до await get_chat_member — награду получит только один
+        db.exec("UPDATE users SET channel_claimed = 1 "
+                "WHERE user_id = ? AND channel_claimed = 0", (tg["id"],))
+        if db.cursor.rowcount == 0:
+            raise HTTPException(400, "err_claimed")
         gl.add_cookies(tg["id"], cfg.CHANNEL_REWARD, count_earned=False)
     return {"reward": cfg.CHANNEL_REWARD, "cookies": db.get_user(tg["id"])["cookies"]}

@@ -14,7 +14,7 @@ const U_ICONS: Record<string, string> = {
 }
 
 export default function FarmTab() {
-  const { refresh, toast, liveBalance } = useGame()
+  const { refresh, toast, liveBalance, flushClicks } = useGame()
   const t = useT()
   const te = useTErr()
   const [farm, setFarm] = useState<FarmState | null>(null)
@@ -29,6 +29,7 @@ export default function FarmTab() {
 
   const post = async (path: string, key: string) => {
     try {
+      await flushClicks() // сервер должен знать про все тапы до проверки цены
       const f = await api.post(path, { key })
       setFarm(f)
       sfxBuy()

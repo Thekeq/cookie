@@ -158,12 +158,15 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
 @router.post("/click/upgrade")
 async def upgrade_click(tg: dict = Depends(tg_user)):
     _ensure_user(tg)
-    user = gl.collect_all(tg["id"])  # свежий баланс: с натикавшим доходом
-    cost = cfg.click_upgrade_cost(user["click_level"])
-    if user["cookies"] < cost:
-        raise HTTPException(400, "err_no_cookies")
-    db.update_user(tg["id"], cookies=user["cookies"] - cost,
-                   click_level=user["click_level"] + 1)
+    # сбор дохода + проверка цены + списание — одна транзакция: параллельная
+    # покупка не спишет один и тот же баланс дважды
+    with db.tx():
+        user = gl.collect_all(tg["id"])
+        cost = cfg.click_upgrade_cost(user["click_level"])
+        if user["cookies"] < cost:
+            raise HTTPException(400, "err_no_cookies")
+        db.update_user(tg["id"], cookies=user["cookies"] - cost,
+                       click_level=user["click_level"] + 1)
     return gl.full_state(tg["id"])
 
 
@@ -218,25 +221,26 @@ class SpawnIn(BaseModel):
 @router.post("/merge/spawn")
 async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
     _ensure_user(tg)
-    user = gl.collect_all(tg["id"])  # свежий баланс: с натикавшим доходом
-    board = _board_map(tg["id"])
-    if len(board) >= cfg.BOARD_SIZE:
-        raise HTTPException(400, "err_board_full")
+    # сбор дохода + все проверки + списание — одна транзакция
+    with db.tx():
+        user = gl.collect_all(tg["id"])
+        board = _board_map(tg["id"])
+        if len(board) >= cfg.BOARD_SIZE:
+            raise HTTPException(400, "err_board_full")
 
-    level = max(1, body.level)
-    # прямой спавн ограничен: топ-тиры только слиянием
-    max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
-                        if cfg.item_unlock_level(l) <= user["level"]), default=1)
-    max_direct = max(1, max_unlocked - cfg.SPAWN_DIRECT_GAP)
-    if level > max_direct:
-        raise HTTPException(400, f"err_direct_cap|{max_direct}")
+        level = max(1, body.level)
+        # прямой спавн ограничен: топ-тиры только слиянием
+        max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
+                            if cfg.item_unlock_level(l) <= user["level"]), default=1)
+        max_direct = max(1, max_unlocked - cfg.SPAWN_DIRECT_GAP)
+        if level > max_direct:
+            raise HTTPException(400, f"err_direct_cap|{max_direct}")
 
-    cost = cfg.direct_spawn_cost(level, len(board))
-    if user["cookies"] < cost:
-        raise HTTPException(400, "err_no_cookies")
-    free_cells = [c for c in range(cfg.BOARD_SIZE) if c not in board]
-    cell = free_cells[0]
-    with db.tx():  # списание и печенька на доске — одним куском
+        cost = cfg.direct_spawn_cost(level, len(board))
+        if user["cookies"] < cost:
+            raise HTTPException(400, "err_no_cookies")
+        free_cells = [c for c in range(cfg.BOARD_SIZE) if c not in board]
+        cell = free_cells[0]
         db.update_user(tg["id"], cookies=user["cookies"] - cost)
         db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
                 (tg["id"], cell, level))

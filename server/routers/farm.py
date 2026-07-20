@@ -84,14 +84,14 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
         raise HTTPException(400, "err_no_item")
     if user["level"] < b["req_level"]:
         raise HTTPException(400, f"err_req_level|{b['req_level']}")
-    # доход до покупки забираем по старой ставке (и ферму, и пассивку доски) —
-    # проверка цены идёт по свежему балансу, который видит игрок
-    user = gl.collect_all(tg["id"])
-    owned = gl.farm_counts(tg["id"]).get(body.key, 0)
-    cost = cfg.building_cost(body.key, owned)
-    if user["cookies"] < cost:
-        raise HTTPException(400, "err_no_cookies")
-    with db.tx():  # списание и здание — одним куском
+    # сбор дохода (по старой ставке) + проверка цены + покупка — одна транзакция:
+    # проверяем тот же баланс, что видит игрок, без гонок параллельных покупок
+    with db.tx():
+        user = gl.collect_all(tg["id"])
+        owned = gl.farm_counts(tg["id"]).get(body.key, 0)
+        cost = cfg.building_cost(body.key, owned)
+        if user["cookies"] < cost:
+            raise HTTPException(400, "err_no_cookies")
         db.update_user(tg["id"], cookies=user["cookies"] - cost)
         db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, ?, 1) "
                 "ON CONFLICT(user_id, building_key) DO UPDATE SET count = count + 1",
@@ -110,12 +110,11 @@ async def buy_upgrade(body: KeyIn, tg: dict = Depends(tg_user)):
         raise HTTPException(400, f"err_req_level|{u['req_level']}")
     if body.key in gl.user_upgrades(tg["id"]):
         raise HTTPException(400, "err_owned")
-    # сначала собираем натикавший доход, потом проверяем цену —
-    # иначе «деньги есть, а купить не даёт» у игроков с большим доходом
-    user = gl.collect_all(tg["id"])
-    if user["cookies"] < u["cost"]:
-        raise HTTPException(400, "err_no_cookies")
-    with db.tx():  # списание и апгрейд — одним куском
+    # сбор натикавшего дохода + проверка цены + покупка — одна транзакция
+    with db.tx():
+        user = gl.collect_all(tg["id"])
+        if user["cookies"] < u["cost"]:
+            raise HTTPException(400, "err_no_cookies")
         db.update_user(tg["id"], cookies=user["cookies"] - u["cost"])
         db.exec("INSERT OR IGNORE INTO upgrades (user_id, upgrade_key) VALUES (?, ?)",
                 (tg["id"], body.key))
@@ -134,10 +133,10 @@ async def buy_skin(body: KeyIn, tg: dict = Depends(tg_user)):
              db.q("SELECT skin_key FROM skins WHERE user_id = ?", (tg["id"],))} | {"classic"}
     if body.key in owned:
         raise HTTPException(400, "err_owned")
-    user = gl.collect_all(tg["id"])  # свежий баланс перед проверкой цены
-    if user["cookies"] < s["cost"]:
-        raise HTTPException(400, "err_no_cookies")
-    with db.tx():  # списание и скин — одним куском
+    with db.tx():  # сбор дохода + проверка цены + покупка — одна транзакция
+        user = gl.collect_all(tg["id"])
+        if user["cookies"] < s["cost"]:
+            raise HTTPException(400, "err_no_cookies")
         db.update_user(tg["id"], cookies=user["cookies"] - s["cost"])
         db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
                 (tg["id"], body.key))

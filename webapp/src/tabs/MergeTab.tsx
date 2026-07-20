@@ -15,7 +15,7 @@ interface Drag {
 }
 
 export default function MergeTab() {
-  const { state, setState, toast, liveBalance } = useGame()
+  const { state, setState, toast, liveBalance, flushClicks } = useGame()
   const t = useT()
   const te = useTErr()
   const [drag, setDrag] = useState<Drag | null>(null)
@@ -101,6 +101,7 @@ export default function MergeTab() {
 
   const spawn = async () => {
     try {
+      await flushClicks() // сервер должен знать про все тапы до проверки цены
       const s = await api.post('/api/merge/spawn', { level: buyLevel })
       setState(s)
       haptic('medium')

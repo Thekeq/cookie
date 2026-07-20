@@ -12,19 +12,17 @@ interface Float {
 }
 
 export default function ClickerTab() {
-  const { state, setState, toast, refresh, liveBalance, bumpBalance } = useGame()
+  // очередь кликов, батчи и комбо живут в App (GameCtx): переживают смену
+  // вкладок, а покупки могут дождаться flushClicks() перед списанием
+  const { state, setState, toast, refresh, liveBalance, combo, tapClick, flushClicks } = useGame()
   const t = useT()
   const te = useTErr()
   const [floats, setFloats] = useState<Float[]>([])
-  const pending = useRef(0) // клики, ещё не отправленные на сервер
   const floatId = useRef(0)
   const wrapRef = useRef<HTMLDivElement>(null)
 
   // локальный предикт энергии: рисуем сразу, сервер подтверждает батчем
-  // (баланс живёт в App — liveBalance, общий для шапки и этой вкладки)
   const [localEnergy, setLocalEnergy] = useState(state.user.energy)
-  const [combo, setCombo] = useState(1)
-  const lastTapAt = useRef(0) // для локального затухания комбо
   // золотая печенька: сервер решает когда, клиент рисует и ловит тап
   const [golden, setGolden] = useState(state.golden)
   const [goldenPos] = useState(() => ({ left: 15 + Math.random() * 55, top: 18 + Math.random() * 40 }))
@@ -47,66 +45,6 @@ export default function ClickerTab() {
     return () => clearInterval(timer)
   }, [state.user.max_energy, state.user.energy_regen])
 
-  // локальное затухание комбо: пауза в тапах > 4с — комбо гаснет сразу на клиенте,
-  // не дожидаясь ответа сервера (сервер придёт к тому же выводу по своему окну)
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (combo > 1 && Date.now() - lastTapAt.current > 4000) setCombo(1)
-    }, 400)
-    return () => clearInterval(timer)
-  }, [combo])
-
-  // батч-отправка кликов раз в 1.5 сек; у каждого батча уникальный id:
-  // потерянный ответ ретраится тем же id, сервер не начислит дважды,
-  // а батчи с других устройств не конфликтуют (id не глобальный счётчик)
-  const retryBatch = useRef<{ id: string; n: number } | null>(null)
-  const inflight = useRef(false)
-  useEffect(() => {
-    const timer = setInterval(async () => {
-      if (inflight.current) return // запросы не пересекаются — ответы по порядку
-      let batch = retryBatch.current
-      if (!batch) {
-        const n = pending.current
-        if (!n) return
-        pending.current = 0
-        batch = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, n }
-      }
-      inflight.current = true
-      try {
-        const r = await api.post('/api/click', { clicks: batch.n, batch_id: batch.id })
-        retryBatch.current = null
-        // серверное комбо принимаем, только если игрок ещё тапает —
-        // иначе устаревший ответ «воскресит» уже погасшее комбо
-        if (Date.now() - lastTapAt.current < 4000) setCombo(r.combo || 1)
-        if (r.golden) setGolden(r.golden)
-        setState({ ...state, user: { ...state.user, cookies: r.cookies, energy: r.energy, xp: r.xp ?? state.user.xp } })
-      } catch {
-        /* сеть моргнула — повторим тот же батч, дедуп на сервере */
-        retryBatch.current = batch
-      } finally {
-        inflight.current = false
-      }
-    }, 1500)
-    return () => clearInterval(timer)
-  }, [state, setState])
-
-  // не теряем тапы при уходе со вкладки: остаток батча улетает при размонтировании
-  // (иначе их предикт висел бы в балансе «фантомом», которого нет на сервере)
-  useEffect(() => {
-    return () => {
-      const n = pending.current
-      if (!n) return
-      pending.current = 0
-      api
-        .post('/api/click', {
-          clicks: n,
-          batch_id: `${Date.now().toString(36)}-flush-${Math.random().toString(36).slice(2, 8)}`,
-        })
-        .then(() => refresh())
-        .catch(() => {})
-    }
-  }, [])
-
   // тик времени жизни золотой печеньки
   useEffect(() => {
     if (!golden?.active) return
@@ -124,9 +62,7 @@ export default function ClickerTab() {
     }
     haptic('light')
     sfxClick()
-    lastTapAt.current = Date.now()
-    pending.current += 1
-    bumpBalance(state.user.click_power * combo)
+    tapClick(state.user.click_power * combo)
     setLocalEnergy((en) => en - 1)
 
     const rect = wrapRef.current!.getBoundingClientRect()
@@ -156,6 +92,7 @@ export default function ClickerTab() {
 
   const upgrade = async () => {
     try {
+      await flushClicks() // сервер должен знать про все тапы до проверки цены
       const s = await api.post('/api/click/upgrade')
       setState(s)
       hapticSuccess()

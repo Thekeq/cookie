@@ -445,16 +445,20 @@ def collect_all(user_id: int) -> dict:
 
 
 def collect_farm(user: dict) -> float:
-    """Начисляет накопленный доход фермы, возвращает сколько упало."""
+    """Начисляет накопленный доход фермы, возвращает сколько упало.
+    Таймер и деньги — одна транзакция: сбой не может «продвинуть» таймер,
+    потеряв недоначисленный доход."""
     now = time.time()
     seconds = min(cfg.FARM_OFFLINE_CAP_HOURS * 3600,
                   now - (user["farm_collected_at"] or now))
-    db.update_user(user["user_id"], farm_collected_at=now)
     if seconds <= 0:
+        db.update_user(user["user_id"], farm_collected_at=now)
         return 0
     income = farm_cps(user["user_id"]) * seconds
-    if income > 0:
-        add_cookies(user["user_id"], income)
+    with db.tx():
+        db.update_user(user["user_id"], farm_collected_at=now)
+        if income > 0:
+            add_cookies(user["user_id"], income)
     return income
 
 
@@ -490,15 +494,17 @@ def add_cookies(user_id: int, amount: float, count_earned: bool = True):
 # ---------- пассивный доход с merge-доски ----------
 
 def collect_passive(user: dict) -> float:
-    """Начисляет накопленный пассивный доход, возвращает сколько упало."""
+    """Начисляет накопленный пассивный доход, возвращает сколько упало.
+    Таймер и деньги — одна транзакция (см. collect_farm)."""
     now = time.time()
     hours = min(cfg.PASSIVE_CAP_HOURS, (now - (user["passive_collected_at"] or now)) / 3600)
     if hours <= 0:
         return 0
     income = passive_per_hour(user["user_id"]) * hours
-    db.update_user(user["user_id"], passive_collected_at=now)
-    if income > 0:
-        add_cookies(user["user_id"], income)
+    with db.tx():
+        db.update_user(user["user_id"], passive_collected_at=now)
+        if income > 0:
+            add_cookies(user["user_id"], income)
     return income
 
 
@@ -555,6 +561,53 @@ def claim_achievement(user: dict, key: str) -> float:
                 add_cookies(user["user_id"], a["reward"], count_earned=False)
             return a["reward"]
     raise ValueError("err_no_item")
+
+
+# ---------- выдача Stars-покупок ----------
+
+def _apply_purchase_effect(user_id: int, item_key: str):
+    """Применяет эффект купленного товара. Вызывается внутри db.tx()."""
+    effect = cfg.SHOP_ITEMS[item_key][3]
+    if effect["type"] == "cookies":
+        if "income_hours" in effect:
+            amount = max(effect["min_amount"],
+                         hourly_income(user_id) * effect["income_hours"])
+        else:
+            amount = effect["amount"]
+        add_cookies(user_id, amount, count_earned=False)
+    elif effect["type"] == "energy_full":
+        user = db.get_user(user_id)
+        db.update_user(user_id, energy=cfg.max_energy(user["level"]),
+                       energy_updated_at=time.time())
+    elif effect["type"] == "boost":
+        db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
+                (user_id, effect["key"], time.time() + effect["hours"] * 3600))
+    elif effect["type"] == "bp_premium":
+        db.update_user(user_id, bp_premium=1)
+
+
+def fulfill_charge(charge_id: str) -> bool:
+    """Выдаёт оплаченную покупку по charge_id. Статус перечитывается УЖЕ
+    внутри BEGIN IMMEDIATE: два worker'а не выдадут одно и то же дважды.
+    Возвращает True, если выдали сейчас; False — уже было выдано/нет записи."""
+    with db.tx():
+        row = db.q1("SELECT user_id, item_key, status FROM purchases "
+                    "WHERE tg_payment_id = ?", (charge_id,))
+        if not row or row["status"] == "fulfilled" \
+                or row["item_key"] not in cfg.SHOP_ITEMS:
+            return False
+        _apply_purchase_effect(row["user_id"], row["item_key"])
+        db.exec("UPDATE purchases SET status = 'fulfilled' WHERE tg_payment_id = ?",
+                (charge_id,))
+        return True
+
+
+def fulfill_pending(user_id: int) -> int:
+    """Довыдаёт зависшие 'paid' покупки юзера (сбой между оплатой и выдачей).
+    Дёргается на /auth — игрок получает недовыданное при следующем входе."""
+    rows = db.q("SELECT tg_payment_id FROM purchases WHERE user_id = ? "
+                "AND status = 'paid' AND tg_payment_id IS NOT NULL", (user_id,))
+    return sum(1 for r in rows if fulfill_charge(r["tg_payment_id"]))
 
 
 # ---------- профиль целиком (для фронта) ----------

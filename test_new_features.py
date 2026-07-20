@@ -254,6 +254,44 @@ r = c.post("/api/click/upgrade", headers=H(UID))
 check("buy with pending farm income", r.status_code == 200, r.text[:150])
 check("balance collected before charge", db.get_user(UID)["cookies"] > 0)
 
+# --- Stars: зависшая 'paid' покупка довыдаётся на /auth, идемпотентно ---
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'boost_x2_1h', 50, 'test-charge-1', 'paid', ?)",
+        (UID, time.time()))
+c.post("/api/auth", headers=H(UID))
+row = db.q1("SELECT status FROM purchases WHERE tg_payment_id = 'test-charge-1'")
+check("stuck paid fulfilled on auth", row and row["status"] == "fulfilled", str(row))
+n_boosts = db.q1("SELECT COUNT(*) c FROM boosts WHERE user_id = ? "
+                 "AND boost_key = 'click_x2'", (UID,))["c"]
+check("boost granted", n_boosts >= 1)
+check("re-fulfill returns False", gl.fulfill_charge("test-charge-1") is False)
+n2 = db.q1("SELECT COUNT(*) c FROM boosts WHERE user_id = ? "
+           "AND boost_key = 'click_x2'", (UID,))["c"]
+check("no double fulfill", n2 == n_boosts)
+
+# --- сбор дохода атомарен: сбой начисления не двигает таймер (доход не теряется) ---
+db.update_user(UID, farm_collected_at=time.time() - 120)
+ts_before = db.get_user(UID)["farm_collected_at"]
+_orig_add2 = gl.add_cookies
+gl.add_cookies = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fail"))
+try:
+    gl.collect_farm(db.get_user(UID))
+except RuntimeError:
+    pass
+gl.add_cookies = _orig_add2
+check("collect atomic: timer not advanced on failure",
+      db.get_user(UID)["farm_collected_at"] == ts_before)
+r = c.get("/api/state", headers=H(UID))
+check("income recovered after failed collect", r.status_code == 200)
+
+# --- канал: условный UPDATE отдаёт награду ровно одному запросу ---
+db.update_user(UID, channel_claimed=0)
+db.exec("UPDATE users SET channel_claimed = 1 WHERE user_id = ? AND channel_claimed = 0", (UID,))
+first = db.cursor.rowcount
+db.exec("UPDATE users SET channel_claimed = 1 WHERE user_id = ? AND channel_claimed = 0", (UID,))
+second = db.cursor.rowcount
+check("channel conditional claim once", first == 1 and second == 0, f"{first},{second}")
+
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
           "ref_claims", "achievements", "boosts", "purchases"):
