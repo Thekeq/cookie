@@ -96,6 +96,18 @@ check("trash empty cell blocked", r.status_code == 400)
 check("spawn cost scales with income",
       cfg.spawn_cost(0, 100_000) > cfg.spawn_cost(0, 0) * 10)
 check("spawn cost floor 50", cfg.spawn_cost(0, 0) == 50)
+# lvl1 обязан оставаться в разумных минутах дохода при любой заполненности:
+# именно перемножение трёх экспонент раньше давало цену в 1e17 (фидбек)
+for _items in (0, 12, 24):
+    _mins = cfg.spawn_cost(_items, 1e9) / 1e9 * 60
+    check(f"lvl1 cost sane at {_items} items ({_mins:.0f} min)", _mins <= 30, f"{_mins:.1f}")
+check("direct lvl5 under 5h of income",
+      cfg.direct_spawn_cost(5, 12, 1e9) / 1e9 <= 5,
+      f"{cfg.direct_spawn_cost(5, 12, 1e9) / 1e9:.1f}h")
+# премия над честным merge-путём (2^(N-1)) остаётся умеренной
+check("direct premium over merge path ~3x at lvl10",
+      2.5 <= (cfg.SPAWN_LEVEL_FACTOR / 2) ** 9 <= 4.5,
+      str((cfg.SPAWN_LEVEL_FACTOR / 2) ** 9))
 
 # --- буст пассивки мерджа ---
 check("passive lvl3 = 90/h", cfg.passive_income_per_hour(3) == 90)
@@ -141,6 +153,47 @@ c.post("/api/orders/take", json={"slot": 1}, headers=H)
 db.exec("UPDATE orders SET progress = goal WHERE user_id = ? AND status = 'active'", (UID,))
 r = c.get("/api/state", headers=H)
 check("orders_claimable true when done", r.json()["orders_claimable"] is True)
+
+# --- заказы: награда считается от ТЕКУЩЕГО дохода, а не из хранимой строки ---
+# подделываем строку под «выписана до престижа»: 60M за лёгкий заказ
+db.exec("UPDATE orders SET reward_cookies = 60000000, reward_bp_xp = 9999 "
+        "WHERE user_id = ? AND status = 'active'", (UID,))
+st = gl.orders_state(db.get_user(UID))
+fresh_reward = gl.order_reward(
+    db.q1("SELECT template FROM orders WHERE user_id = ? AND status = 'active'",
+          (UID,))["template"], gl.hourly_income(UID))[0]
+check("stale reward not shown", st["active"]["reward_cookies"] < 60_000_000
+      and abs(st["active"]["reward_cookies"] - fresh_reward) < 1, str(st["active"]))
+before = db.get_user(UID)["cookies"]
+r = c.post("/api/orders/claim", headers=H)
+paid = db.get_user(UID)["cookies"] - before
+check("stale reward not paid", r.status_code == 200 and paid < 60_000_000
+      and abs(paid - fresh_reward) < 1, f"paid={paid}")
+
+# --- офферы пересчитываются под выросший доход, без «добивания за копейки» ---
+r = c.get("/api/orders", headers=H)
+cheap = [o["reward_cookies"] for o in r.json()["offers"]]
+db.exec("UPDATE farm SET count = 500 WHERE user_id = ? AND building_key = 'granny'", (UID,))
+r = c.get("/api/orders", headers=H)
+rich = [o["reward_cookies"] for o in r.json()["offers"]]
+check("offers rescale when income grows", all(b > a for a, b in zip(cheap, rich)),
+      f"{cheap} -> {rich}")
+check("offer goals rescale too",
+      db.q1("SELECT MAX(goal) g FROM orders WHERE user_id = ? AND status = 'offer'",
+            (UID,))["g"] > 0)
+
+# --- престиж чистит незавершённые заказы (иначе цель недостижима на 1 lvl) ---
+c.post("/api/orders/take", json={"slot": 1}, headers=H)
+db.update_user(UID, total_earned=cfg.PRESTIGE_MIN_EARNED * 2)
+r = c.post("/api/prestige", headers=H)
+check("prestige done", r.status_code == 200, r.text[:200])
+check("orders wiped on prestige", not db.q1(
+    "SELECT id FROM orders WHERE user_id = ? AND status != 'done'", (UID,)))
+r = c.get("/api/orders", headers=H)
+check("fresh offers after prestige are small",
+      all(o["reward_cookies"] <= max(cfg.ORDER_REWARD_MIN.values()) * 1.5
+          for o in r.json()["offers"]),
+      str([o["reward_cookies"] for o in r.json()["offers"]]))
 
 print(f"\n{ok} passed, {fail} failed")
 if fail:

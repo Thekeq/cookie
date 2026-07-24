@@ -292,6 +292,9 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   transition: border-color 0.12s, background 0.12s;
 }
 .spawn-lvl.active { border-color: var(--accent); background: rgba(240, 166, 59, 0.14); }
+/* тир не по карману: видно сразу, что цена — ориентир на будущее */
+.spawn-lvl.too-pricey { opacity: 0.4; }
+.spawn-lvl.too-pricey.active { opacity: 0.75; border-color: var(--bad); }
 .spawn-lvl-n {
   font-size: 10px; font-family: var(--font-display); font-weight: 800; color: var(--accent);
 }

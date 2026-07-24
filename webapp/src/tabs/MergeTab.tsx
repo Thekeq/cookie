@@ -83,6 +83,7 @@ export default function MergeTab() {
   const [popCell, setPopCell] = useState<number | null>(null)
   const [shinyCell, setShinyCell] = useState<number | null>(null)
   const [buyLevel, setBuyLevel] = useState(1) // уровень покупаемой печеньки
+  const levelTouched = useRef(false) // игрок сам выбрал тир — не подменяем
   const [showAlbum, setShowAlbum] = useState(false)
   const busy = useRef(false)
   const boardRef = useRef<HTMLDivElement>(null)
@@ -221,8 +222,21 @@ export default function MergeTab() {
   }
 
   const maxDirect = state.spawn_direct?.max_level || 1
-  const safeBuyLevel = Math.min(buyLevel, maxDirect)
-  const buyCost = state.spawn_direct?.costs?.[String(safeBuyLevel)] ?? state.spawn_cost
+  const costOf = (l: number) => state.spawn_direct?.costs?.[String(l)] ?? state.spawn_cost
+  // цена тира растёт как 2.3^lvl — показывать 20 недостижимых тиров бессмысленно.
+  // Даём то, что по карману, плюс один «на вырост» как ориентир
+  const affordable = Math.max(
+    1,
+    ...Array.from({ length: maxDirect }, (_, i) => i + 1).filter((l) => costOf(l) <= liveBalance),
+  )
+  const shownMax = Math.min(maxDirect, affordable + 1)
+  const safeBuyLevel = Math.min(buyLevel, shownMax)
+  const buyCost = costOf(safeBuyLevel)
+
+  // пока игрок сам не выбрал тир — держим выбор на лучшем доступном
+  useEffect(() => {
+    if (!levelTouched.current) setBuyLevel(affordable)
+  }, [affordable])
 
   // как открыть следующие клетки: уровень и/или друзья
   const cells = state.board_cells
@@ -323,13 +337,19 @@ export default function MergeTab() {
       )}
 
       {/* выбор уровня покупаемой печеньки: топ-тиры только слиянием */}
-      {maxDirect > 1 && (
+      {shownMax > 1 && (
         <div className="spawn-levels">
-          {Array.from({ length: maxDirect }, (_, i) => i + 1).map((l) => (
+          {Array.from({ length: shownMax }, (_, i) => i + 1).map((l) => (
             <button
               key={l}
-              className={'spawn-lvl' + (safeBuyLevel === l ? ' active' : '')}
-              onClick={() => setBuyLevel(l)}
+              className={
+                'spawn-lvl' + (safeBuyLevel === l ? ' active' : '') +
+                (costOf(l) > liveBalance ? ' too-pricey' : '')
+              }
+              onClick={() => {
+                levelTouched.current = true
+                setBuyLevel(l)
+              }}
             >
               <span>{COOKIE_SKINS[l]}</span>
               <span className="spawn-lvl-n">{l}</span>

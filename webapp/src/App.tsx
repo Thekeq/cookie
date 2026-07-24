@@ -33,11 +33,15 @@ interface Ctx {
 const GameCtx = createContext<Ctx>(null!)
 export const useGame = () => useContext(GameCtx)
 
+// суффиксы до дециллиона: поздние цены доски реально уходят за 1e15,
+// и «605062015.2B» вместо «605.1Qa» читалось как поломка
+const SUFFIX = ['', 'K', 'M', 'B', 'T', 'Qa', 'Qi', 'Sx', 'Sp', 'Oc', 'No', 'Dc']
+
 export function fmt(n: number): string {
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B'
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
-  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'K'
-  return Math.floor(n).toLocaleString('en')
+  if (!isFinite(n)) return '∞'
+  if (n < 1e4) return Math.floor(n).toLocaleString('en')
+  const tier = Math.min(SUFFIX.length - 1, Math.floor(Math.log10(n) / 3))
+  return (n / 1000 ** tier).toFixed(1) + SUFFIX[tier]
 }
 
 export default function App() {

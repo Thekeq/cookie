@@ -493,6 +493,9 @@ def do_prestige(user: dict) -> dict:
         db.exec("DELETE FROM board WHERE user_id = ?", (uid,))
         db.exec("DELETE FROM farm WHERE user_id = ?", (uid,))
         db.exec("DELETE FROM upgrades WHERE user_id = ?", (uid,))
+        # незавершённые заказы выписаны под старый доход: цель «заработай 60M»
+        # недостижима на 1 уровне, а награда по ней была бы читом
+        db.exec("DELETE FROM orders WHERE user_id = ? AND status != 'done'", (uid,))
         db.update_user(
             uid,
             cookies=0, click_level=1, level=1, xp=0,
@@ -699,10 +702,22 @@ def claim_achievement(user: dict, key: str) -> float:
 # Клей между режимами: ферма/клики/мердж дают прогресс одному активному заказу,
 # награда-сундук масштабируется от дохода. offer(3) -> active(1) -> done.
 
-def _order_params(user: dict, template_key: str) -> dict:
+def _order_difficulty(template_key: str) -> int:
+    return cfg.ORDER_TEMPLATES.get(template_key, {}).get("difficulty", 1)
+
+
+def order_reward(template_key: str, income: float) -> tuple[float, int]:
+    """Награда заказа СЧИТАЕТСЯ ЗАНОВО от текущего дохода, а не хранится в строке.
+    Иначе старый оффер, выписанный до престижа, платил бы 60M новичку 1 уровня,
+    а выросший игрок добивал бы копеечные заказы ради обновления расценок."""
+    diff = _order_difficulty(template_key)
+    return (max(cfg.ORDER_REWARD_MIN[diff], income * cfg.ORDER_REWARD_HOURS[diff]),
+            cfg.ORDER_BP_XP[diff])
+
+
+def _order_params(user: dict, template_key: str, income: float | None = None) -> dict:
     t = cfg.ORDER_TEMPLATES[template_key]
-    diff = t["difficulty"]
-    income = hourly_income(user["user_id"])
+    income = hourly_income(user["user_id"]) if income is None else income
     goal = t["goal"]
     if t["metric"] == "earned":
         goal = max(2000, round(income))          # ~час дохода
@@ -711,14 +726,15 @@ def _order_params(user: dict, template_key: str) -> dict:
         max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
                             if cfg.item_unlock_level(l) <= user["level"]), default=1)
         goal = max(3, max_unlocked - 1)
-    reward = max(cfg.ORDER_REWARD_MIN[diff], income * cfg.ORDER_REWARD_HOURS[diff])
+    reward, bp_xp = order_reward(template_key, income)
     return {"metric": t["metric"], "goal": goal, "reward_cookies": reward,
-            "reward_bp_xp": cfg.ORDER_BP_XP[diff]}
+            "reward_bp_xp": bp_xp}
 
 
-def _gen_order_offers(user: dict):
+def _gen_order_offers(user: dict, income: float | None = None):
     """3 оффера: по одному каждой сложности, шаблон случайный."""
     uid = user["user_id"]
+    income = hourly_income(uid) if income is None else income
     rnd = random.Random(f"{uid}:{int(time.time())}")
     now = time.time()
     with db.tx():
@@ -727,7 +743,7 @@ def _gen_order_offers(user: dict):
             keys = sorted(k for k, t in cfg.ORDER_TEMPLATES.items()
                           if t["difficulty"] == diff)
             key = rnd.choice(keys)
-            p = _order_params(user, key)
+            p = _order_params(user, key, income)
             db.exec(
                 "INSERT INTO orders (user_id, slot, template, metric, goal, progress, "
                 "reward_cookies, reward_bp_xp, status, created_at) "
@@ -736,12 +752,27 @@ def _gen_order_offers(user: dict):
                  p["reward_cookies"], p["reward_bp_xp"], now))
 
 
-def _pack_order(o: dict) -> dict:
+def _refresh_offers(user: dict, income: float):
+    """Непринятые офферы пересчитываются под текущий доход и уровень: игрок мог
+    вырасти (или сделать престиж) с момента их выписки. Цель активного заказа
+    НЕ трогаем — иначе накопленный прогресс потерял бы смысл."""
+    for o in db.q("SELECT id, template FROM orders WHERE user_id = ? AND status = 'offer'",
+                  (user["user_id"],)):
+        if o["template"] not in cfg.ORDER_TEMPLATES:
+            continue
+        p = _order_params(user, o["template"], income)
+        db.exec("UPDATE orders SET goal = ?, reward_cookies = ?, reward_bp_xp = ? "
+                "WHERE id = ?",
+                (p["goal"], p["reward_cookies"], p["reward_bp_xp"], o["id"]))
+
+
+def _pack_order(o: dict, income: float) -> dict:
+    reward, bp_xp = order_reward(o["template"], income)
     return {"slot": o["slot"], "template": o["template"], "metric": o["metric"],
             "goal": o["goal"], "progress": min(o["progress"], o["goal"]),
             "done": o["progress"] >= o["goal"],
-            "reward_cookies": o["reward_cookies"], "reward_bp_xp": o["reward_bp_xp"],
-            "difficulty": cfg.ORDER_TEMPLATES.get(o["template"], {}).get("difficulty", 1)}
+            "reward_cookies": reward, "reward_bp_xp": bp_xp,
+            "difficulty": _order_difficulty(o["template"])}
 
 
 def orders_state(user: dict) -> dict:
@@ -749,17 +780,20 @@ def orders_state(user: dict) -> dict:
     day = _utc_day(time.time())
     used = user["orders_day_count"] if user["orders_day"] == day else 0
     left = max(0, cfg.ORDERS_PER_DAY - used)
+    income = hourly_income(uid)
     active = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
     offers = []
     if not active and left > 0:
         offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
                       "ORDER BY slot", (uid,))
         if len(offers) != 3:
-            _gen_order_offers(user)
-            offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
-                          "ORDER BY slot", (uid,))
-    return {"active": _pack_order(active) if active else None,
-            "offers": [_pack_order(o) for o in offers],
+            _gen_order_offers(user, income)
+        else:
+            _refresh_offers(user, income)
+        offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
+                      "ORDER BY slot", (uid,))
+    return {"active": _pack_order(active, income) if active else None,
+            "offers": [_pack_order(o, income) for o in offers],
             "left_today": left, "per_day": cfg.ORDERS_PER_DAY}
 
 
@@ -775,11 +809,21 @@ def take_order(user: dict, slot: int) -> dict:
                 (uid, slot))
     if not row:
         raise ValueError("err_no_item")
+    # цель фиксируем по СЕГОДНЯШНЕМУ доходу: оффер мог пролежать с прошлой сессии
+    income = hourly_income(uid)
+    p = _order_params(user, row["template"], income) \
+        if row["template"] in cfg.ORDER_TEMPLATES else None
     with db.tx():
-        db.exec("UPDATE orders SET status = 'active' WHERE id = ?", (row["id"],))
+        if p:
+            db.exec("UPDATE orders SET goal = ?, reward_cookies = ?, reward_bp_xp = ?, "
+                    "status = 'active' WHERE id = ?",
+                    (p["goal"], p["reward_cookies"], p["reward_bp_xp"], row["id"]))
+            row = dict(row, goal=p["goal"])
+        else:
+            db.exec("UPDATE orders SET status = 'active' WHERE id = ?", (row["id"],))
         db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer'", (uid,))
     track(uid, "order_take")
-    return _pack_order(dict(row, status="active"))
+    return _pack_order(dict(row, status="active"), income)
 
 
 def order_progress(user_id: int, metric: str, amount: float):
@@ -806,17 +850,20 @@ def claim_order(user: dict) -> dict:
     day = _utc_day(time.time())
     used = user["orders_day_count"] if user["orders_day"] == day else 0
     first = user["orders_completed"] == 0
+    # платим по ТЕКУЩЕМУ доходу: хранимая сумма могла быть выписана до престижа
+    reward, bp_xp = order_reward(row["template"], hourly_income(uid))
     with db.tx():
-        db.exec("UPDATE orders SET status = 'done' WHERE id = ?", (row["id"],))
-        add_cookies(uid, row["reward_cookies"], count_earned=False)
+        db.exec("UPDATE orders SET status = 'done', reward_cookies = ?, reward_bp_xp = ? "
+                "WHERE id = ?", (reward, bp_xp, row["id"]))
+        add_cookies(uid, reward, count_earned=False)
         db.update_user(uid,
-                       bp_xp=db.get_user(uid)["bp_xp"] + row["reward_bp_xp"],
+                       bp_xp=db.get_user(uid)["bp_xp"] + bp_xp,
                        orders_completed=user["orders_completed"] + 1,
                        orders_day=day, orders_day_count=used + 1)
     track(uid, "order_done")
     if first:
         track(uid, "first_order")
-    return {"reward_cookies": row["reward_cookies"], "reward_bp_xp": row["reward_bp_xp"]}
+    return {"reward_cookies": reward, "reward_bp_xp": bp_xp}
 
 
 # ---------- коллекция блестящих печенек ----------
