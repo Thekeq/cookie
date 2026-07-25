@@ -23,7 +23,10 @@ export default function FarmTab() {
   useEffect(() => {
     api.get('/api/farm').then((f: FarmState) => {
       setFarm(f)
-      if (f.collected > 1) toast(`${t('farm_income')}: +${fmt(f.collected)} 🍪`)
+      if (f.collected > 1) {
+        toast(`${t('farm_income')}: +${fmt(f.collected)} 🍪`)
+        refresh() // доход уже в БД: без синка шапка полминуты врала бы
+      }
     })
   }, [])
 

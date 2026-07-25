@@ -82,8 +82,10 @@ export default function ClickerTab() {
     sfxFanfare()
     try {
       const r = await api.post('/api/golden/claim')
+      // r.bonus — сам бонус; r.cookies это баланс после начисления,
+      // раньше в тост уходил именно он и выглядело как «начислили весь баланс»
       if (r.effect === 'frenzy') toast(t('golden_frenzy', { n: r.seconds }))
-      else toast(t('golden_chain', { n: fmt(r.cookies) }))
+      else toast(t('golden_chain', { n: fmt(r.bonus) }))
       refresh()
     } catch {
       /* исчезла на сервере раньше — не страшно */

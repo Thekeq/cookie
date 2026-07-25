@@ -43,45 +43,74 @@ def league_brackets() -> list[tuple[str, int, int | None]]:
     return out
 
 
+SEASON_RESET_CHUNK = 500        # юзеров за один проход ролловера
+
+
 def finalize_seasons():
-    """Ленивый ролловер: если есть юзеры из прошлых сезонов — снапшотим их топ,
-    раздаём награды и сбрасываем сезонный прогресс. Вызывается из auth/state."""
+    """Ленивый ролловер: снапшотим топ прошлого сезона, раздаём награды и
+    сбрасываем сезонный прогресс. Сброс идёт ПОРЦИЯМИ — на большой базе один
+    UPDATE на всех держал бы write-lock, а ручка вызывается из четырёх мест.
+    Снапшот делается ровно один раз (маркер — наличие строк season_results),
+    иначе после частичного сброса победители пересчитались бы по остатку."""
     cur = current_season()
     stale = db.q("SELECT DISTINCT season_id s FROM users WHERE season_id < ?", (cur,))
     for row in stale:
         season = row["s"]
-        # весь ролловер сезона — одна транзакция: снапшот, сброс и награды
-        # либо происходят целиком, либо откатываются и повторятся при
-        # следующем запросе. OR IGNORE добивает частичные снапшоты прошлых сбоев.
+        if not db.q1("SELECT 1 x FROM season_results WHERE season_id = ? LIMIT 1",
+                     (season,)):
+            # снапшот + награды — одна транзакция и только на первом проходе.
+            # add_cookies(count_earned=False) не трогает season_earned, поэтому
+            # платить можно до сброса, не пачкая новый сезон
+            with db.tx():
+                now = time.time()
+                for uid, rank, earned in _season_winners(season):
+                    reward = cfg.season_reward(rank, earned)
+                    db.exec(
+                        "INSERT OR IGNORE INTO season_results (season_id, user_id, "
+                        "rank, earned, reward_cookies, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (season, uid, rank, earned, reward, now))
+                    if reward:
+                        add_cookies(uid, reward, count_earned=False)
+        # сброс сезонного прогресса порциями; премиум, купленный на стыке
+        # сезонов, переезжает в новый (bp_premium_next)
         with db.tx():
-            # топ-10 в КАЖДОЙ лиге: новички соревнуются с новичками
-            winners = []  # (user_id, rank, earned)
-            for key, lo, hi in league_brackets():
-                cond = "level >= ?" + (" AND level <= ?" if hi is not None else "")
-                params = [season, lo] + ([hi] if hi is not None else [])
-                top = db.q(
-                    f"SELECT user_id, season_earned FROM users "
-                    f"WHERE season_id = ? AND season_earned > 0 AND {cond} "
-                    f"ORDER BY level DESC, season_earned DESC LIMIT 10", params)
-                winners += [(u["user_id"], i + 1, u["season_earned"])
-                            for i, u in enumerate(top)]
-            now = time.time()
-            for uid, rank, earned in winners:
-                reward = cfg.season_reward(rank, earned)
-                db.exec(
-                    "INSERT OR IGNORE INTO season_results (season_id, user_id, rank, "
-                    "earned, reward_cookies, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (season, uid, rank, earned, reward, now))
-            # сброс сезонного прогресса всем игрокам этого сезона
             db.exec(
                 "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
-                "bp_premium = 0, bp_claimed_free = '[]', bp_claimed_premium = '[]' "
-                "WHERE season_id = ?", (cur, season))
-            # награды топам — уже после сброса, чтобы не попали в новый сезон
-            for uid, rank, earned in winners:
-                reward = cfg.season_reward(rank, earned)
-                if reward:
-                    add_cookies(uid, reward, count_earned=False)
+                "bp_premium = bp_premium_next, bp_premium_next = 0, "
+                "bp_claimed_free = '[]', bp_claimed_premium = '[]' "
+                "WHERE user_id IN (SELECT user_id FROM users "
+                "                  WHERE season_id = ? LIMIT ?)",
+                (cur, season, SEASON_RESET_CHUNK))
+
+
+def _season_winners(season: int) -> list[tuple[int, int, float]]:
+    """[(user_id, место, заработано)] — топ-10 в КАЖДОЙ лиге: новички
+    соревнуются с новичками. Место — по заработку ЗА СЕЗОН (он и сбрасывается),
+    уровень только тай-брейк: раньше сортировка по уровню делала таблицу
+    статичной, ведь уровень не обнуляется вместе с сезоном."""
+    winners = []
+    for _key, lo, hi in league_brackets():
+        cond = "level >= ?" + (" AND level <= ?" if hi is not None else "")
+        params = [season, lo] + ([hi] if hi is not None else [])
+        top = db.q(
+            f"SELECT user_id, season_earned FROM users "
+            f"WHERE season_id = ? AND season_earned > 0 AND {cond} "
+            f"ORDER BY season_earned DESC, level DESC LIMIT 10", params)
+        winners += [(u["user_id"], i + 1, u["season_earned"])
+                    for i, u in enumerate(top)]
+    return winners
+
+
+def grant_bp_premium(user_id: int, now: float | None = None):
+    """Выдаёт premium-пасс. Если до конца сезона осталось меньше
+    BP_PREMIUM_GRACE_DAYS — премиум переносится и на следующий сезон, иначе
+    покупка за 100⭐ накануне ролловера сгорала бы почти сразу."""
+    now = now or time.time()
+    fields = {"bp_premium": 1}
+    if season_end_ts(current_season()) - now <= cfg.BP_PREMIUM_GRACE_DAYS * 86400:
+        fields["bp_premium_next"] = 1
+    db.update_user(user_id, **fields)
 
 
 def my_last_season_result(user_id: int) -> dict | None:
@@ -159,17 +188,30 @@ def claim_daily(user: dict) -> dict:
 
 # ---------- ежедневные задания ----------
 
+_quest_keys_cache: dict[str, list[str]] = {}
+# (user_id, day), для которых строки заданий уже созданы в этом процессе —
+# quest_progress вызывается на каждое начисление печенек, а INSERT OR IGNORE
+# на три задания в горячем пути стоил дороже самого начисления
+_quest_rows_ready: set[tuple[int, str]] = set()
+
+
 def todays_quest_keys(day: str | None = None) -> list[str]:
     """Детерминированный выбор заданий дня — одинаковый для всех игроков."""
     day = day or _utc_day(time.time())
-    rnd = random.Random(day)
-    return rnd.sample(sorted(cfg.DAILY_QUEST_POOL), cfg.DAILY_QUESTS_PER_DAY)
+    if day not in _quest_keys_cache:
+        _quest_keys_cache.clear()  # держим только сегодняшний день
+        _quest_keys_cache[day] = random.Random(day).sample(
+            sorted(cfg.DAILY_QUEST_POOL), cfg.DAILY_QUESTS_PER_DAY)
+    return _quest_keys_cache[day]
 
 
 def _ensure_quest_rows(user_id: int, day: str, keys: list[str]):
     for key in keys:
         db.exec("INSERT OR IGNORE INTO daily_quests (user_id, day, quest_key) "
                 "VALUES (?, ?, ?)", (user_id, day, key))
+    if len(_quest_rows_ready) > 20_000:
+        _quest_rows_ready.clear()
+    _quest_rows_ready.add((user_id, day))
 
 
 def quest_reward_cookies(user_id: int, base: float) -> float:
@@ -203,15 +245,23 @@ def quests_state(user_id: int) -> list[dict]:
 
 
 def quest_progress(user_id: int, metric: str, amount: float):
-    """Инкремент прогресса заданий дня с данной метрикой. Дёшево: max 1-2 UPDATE."""
+    """Инкремент прогресса заданий дня с данной метрикой.
+
+    Горячий путь (зовётся из add_cookies на каждое начисление) — один UPDATE:
+    строки заданий создаём максимум раз за день на процесс, а не каждый раз."""
     if amount <= 0:
         return
     day = _utc_day(time.time())
-    for r in _user_quest_rows(user_id, day):
-        q = cfg.DAILY_QUEST_POOL.get(r["quest_key"])
-        if q and q["metric"] == metric and not r["claimed"]:
-            db.exec("UPDATE daily_quests SET progress = progress + ? WHERE id = ?",
-                    (amount, r["id"]))
+    keys = [k for k in todays_quest_keys(day)
+            if cfg.DAILY_QUEST_POOL[k]["metric"] == metric]
+    if not keys:
+        return
+    if (user_id, day) not in _quest_rows_ready:
+        _ensure_quest_rows(user_id, day, todays_quest_keys(day))
+    holes = ", ".join("?" * len(keys))
+    db.exec(f"UPDATE daily_quests SET progress = progress + ? "
+            f"WHERE user_id = ? AND day = ? AND claimed = 0 AND quest_key IN ({holes})",
+            (amount, user_id, day, *keys))
 
 
 def reroll_quest(user: dict, key: str) -> str:
@@ -314,7 +364,7 @@ def claim_ref_milestone(user: dict, key: str) -> dict:
             db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
                     (user["user_id"], ms["skin"]))
         elif ms["type"] == "bp_premium":
-            db.update_user(user["user_id"], bp_premium=1)
+            grant_bp_premium(user["user_id"])
     return {"type": ms["type"]}
 
 
@@ -378,16 +428,24 @@ def active_boosts(user_id: int) -> list[str]:
     return [r["boost_key"] for r in rows]
 
 
+def permanent_click_multiplier(user_id: int) -> float:
+    """Множитель клика БЕЗ временных бустов: апгрейды, престиж, коллекция.
+    Используется для оценки дохода (цены, награды) — иначе френзи x7 на 25 сек
+    раздувал бы награду заказа и цену спавна на всю сессию."""
+    user = db.get_user(user_id)
+    return (upgrade_effects(user_id)["click_mult"]
+            * cfg.prestige_multiplier(user["prestige_points"] if user else 0)
+            * collection_multiplier(user_id))
+
+
 def click_multiplier(user_id: int) -> float:
-    mult = upgrade_effects(user_id)["click_mult"]
+    mult = permanent_click_multiplier(user_id)
     boosts = active_boosts(user_id)
     if "click_x2" in boosts:
         mult *= cfg.BOOST_CLICK_X2_MULT
     if "golden_frenzy" in boosts:
         mult *= cfg.GOLDEN_EFFECTS["frenzy"]["mult"]
-    user = db.get_user(user_id)
-    return (mult * cfg.prestige_multiplier(user["prestige_points"] if user else 0)
-            * collection_multiplier(user_id))
+    return mult
 
 
 # ---------- золотая печенька ----------
@@ -439,7 +497,9 @@ def claim_golden(user: dict) -> dict:
     with db.tx():
         db.update_user(user["user_id"], golden_expires_at=0)
         add_cookies(user["user_id"], bonus)
-    return {"effect": "chain", "cookies": bonus}
+    # ключ "bonus", а не "cookies": роутер добавляет к ответу баланс под
+    # ключом "cookies" и раньше затирал им сам бонус
+    return {"effect": "chain", "bonus": bonus}
 
 
 # ---------- комбо ----------
@@ -571,10 +631,13 @@ def collect_farm(user: dict) -> float:
 
 # ---------- XP и уровни ----------
 
-def add_xp(user: dict, xp: float) -> dict:
-    """Начисляет XP; level-up происходит на вкладке уровней (claim), тут только копим."""
-    db.update_user(user["user_id"], xp=user["xp"] + xp, bp_xp=user["bp_xp"] + xp)
-    return dict(user, xp=user["xp"] + xp, bp_xp=user["bp_xp"] + xp)
+def add_xp(user: dict, xp: float, bp_xp: float | None = None) -> dict:
+    """Начисляет XP; level-up происходит на вкладке уровней (claim), тут только
+    копим. bp_xp можно задать отдельно: у мерджа он ограничен капом, иначе одно
+    топ-слияние закрывало бы весь сезонный пасс."""
+    bp_xp = xp if bp_xp is None else bp_xp
+    db.update_user(user["user_id"], xp=user["xp"] + xp, bp_xp=user["bp_xp"] + bp_xp)
+    return dict(user, xp=user["xp"] + xp, bp_xp=user["bp_xp"] + bp_xp)
 
 
 def claimable_level(user: dict) -> int | None:
@@ -605,16 +668,43 @@ def ref_count(user_id: int) -> int:
     return db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
 
 
+def compact_board(user_id: int, earned_cells: int) -> int:
+    """Сдвигает печеньки в начало доски, если они стоят ВНЕ заслуженной зоны, и
+    возвращает их количество. Нужно игрокам, набравшим 25 предметов до введения
+    закрытых клеток: иначе половина доски оказывалась в закрытой зоне — двигать
+    нельзя, доска считается полной, спавн запрещён.
+
+    Обычную доску не трогаем: переставлять печеньки под игроком из-за дырки
+    в середине нельзя. Переезд в два прохода через отрицательные номера —
+    UNIQUE(user_id, cell) не даёт менять номера напрямую."""
+    rows = db.q("SELECT id, cell FROM board WHERE user_id = ? ORDER BY cell", (user_id,))
+    if not rows:
+        return 0
+    top = rows[-1]["cell"]
+    if top >= earned_cells and top >= len(rows):  # легаси-доска и есть куда сжать
+        with db.tx():
+            for i, r in enumerate(rows):
+                db.exec("UPDATE board SET cell = ? WHERE id = ?", (-1 - i, r["id"]))
+            for i, r in enumerate(rows):
+                db.exec("UPDATE board SET cell = ? WHERE id = ?", (i, r["id"]))
+    return len(rows)
+
+
 def merge_cells_unlocked_for(user: dict) -> int:
-    """Сколько клеток доски открыто: база + уровни + приглашённые друзья."""
-    return cfg.merge_cells_unlocked(user["level"], ref_count(user["user_id"]))
+    """Сколько клеток доски открыто: база + уровни + друзья. Уже занятые клетки
+    не отбираем (грандфазер старых досок) — по мере переплавки лишних печенек
+    доска сама сходится к честному лимиту."""
+    earned = cfg.merge_cells_unlocked(user["level"], ref_count(user["user_id"]))
+    items = compact_board(user["user_id"], earned)
+    return min(cfg.BOARD_SIZE, max(earned, items))
 
 
 def board_cells_state(user: dict) -> dict:
     """Инфо для фронта: сколько открыто и как открыть следующие."""
     refs = ref_count(user["user_id"])
     return {
-        "unlocked": cfg.merge_cells_unlocked(user["level"], refs),
+        "unlocked": merge_cells_unlocked_for(user),
+        "earned": cfg.merge_cells_unlocked(user["level"], refs),
         "total": cfg.BOARD_SIZE,
         "next_unlock_level": min((lvl for lvl in cfg.MERGE_CELL_LEVELS
                                   if lvl > user["level"]), default=None),
@@ -643,11 +733,13 @@ def collect_passive(user: dict) -> float:
 
 
 def hourly_income(user_id: int) -> float:
-    """Оценка часового дохода игрока для масштабируемых наград:
-    ферма + пассивка доски + скромная оценка кликов (5 мин активного тапа)."""
+    """Оценка часового дохода игрока для масштабируемых наград и цен:
+    ферма + пассивка доски + скромная оценка кликов (5 мин активного тапа).
+    Берём ТОЛЬКО постоянные множители: под золотой печенькой доход не должен
+    подскакивать в 7 раз (это раздувало награды заказов и цены на доске)."""
     user = db.get_user(user_id)
     clicks_estimate = (cfg.click_power(user["click_level"])
-                       * click_multiplier(user_id) * 5 * 60)
+                       * permanent_click_multiplier(user_id) * 5 * 60)
     return farm_cps(user_id) * 3600 + passive_per_hour(user_id) + clicks_estimate
 
 
@@ -766,6 +858,22 @@ def _refresh_offers(user: dict, income: float):
                 (p["goal"], p["reward_cookies"], p["reward_bp_xp"], o["id"]))
 
 
+def _order_unreachable(user: dict, o: dict, income: float) -> bool:
+    """Заказ стал невыполнимым: цель зафиксирована по старому прогрессу, а
+    прогресс сбросился (престиж). «Сделай печеньку 23 уровня» при максимуме 8
+    не закрыть никогда, а активный заказ всего один — вкладка пекарни намертво
+    блокируется вместе с шагом чеклиста (фидбек)."""
+    if o["progress"] >= o["goal"]:
+        return False
+    if o["metric"] == "make_item":
+        max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
+                            if cfg.item_unlock_level(l) <= user["level"]), default=1)
+        return o["goal"] > max_unlocked
+    if o["metric"] == "earned":
+        return o["goal"] > max(2000.0, income) * cfg.ORDER_STALE_FACTOR
+    return False
+
+
 def _pack_order(o: dict, income: float) -> dict:
     reward, bp_xp = order_reward(o["template"], income)
     return {"slot": o["slot"], "template": o["template"], "metric": o["metric"],
@@ -782,6 +890,12 @@ def orders_state(user: dict) -> dict:
     left = max(0, cfg.ORDERS_PER_DAY - used)
     income = hourly_income(uid)
     active = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
+    # мёртвый заказ снимаем сами и БЕСПЛАТНО (дневной лимит не тратится):
+    # игрок в него не виноват, а иначе пекарня заблокирована навсегда
+    if active and _order_unreachable(user, active, income):
+        db.exec("DELETE FROM orders WHERE id = ?", (active["id"],))
+        track(uid, "order_stale_dropped")
+        active = None
     offers = []
     if not active and left > 0:
         offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
@@ -826,6 +940,23 @@ def take_order(user: dict, slot: int) -> dict:
     return _pack_order(dict(row, status="active"), income)
 
 
+def abandon_order(user: dict) -> dict:
+    """Отказ от активного заказа по своей воле. В отличие от снятия мёртвого
+    заказа стоит одну попытку из дневного лимита — иначе можно было бы
+    бесконечно перебирать офферы в поисках удобного."""
+    uid = user["user_id"]
+    row = db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
+    if not row:
+        raise ValueError("err_no_item")
+    day = _utc_day(time.time())
+    used = user["orders_day_count"] if user["orders_day"] == day else 0
+    with db.tx():
+        db.exec("DELETE FROM orders WHERE id = ?", (row["id"],))
+        db.update_user(uid, orders_day=day, orders_day_count=used + 1)
+    track(uid, "order_abandon")
+    return orders_state(db.get_user(uid))
+
+
 def order_progress(user_id: int, metric: str, amount: float):
     """Прогресс активного заказа. make_item — «лучший достигнутый уровень»."""
     if amount <= 0:
@@ -868,18 +999,31 @@ def claim_order(user: dict) -> dict:
 
 # ---------- коллекция блестящих печенек ----------
 
-def roll_shiny(user: dict, item_level: int) -> bool:
-    """Бросок на блестяшку при мердже; pity гарантирует дроп раз в SHINY_PITY."""
+def roll_shiny(user: dict, item_level: int) -> int | None:
+    """Бросок на блестяшку при мердже; pity гарантирует дроп раз в SHINY_PITY.
+    Возвращает уровень попавший в альбом или None.
+
+    Если выпавший уровень уже собран, отдаём ближайший НЕсобранный (не выше
+    выпавшего): раньше дубликат молча терялся в INSERT OR IGNORE, но pity
+    обнулялся — альбом можно было не добить никогда."""
+    uid = user["user_id"]
     pity = user["shiny_pity"] + 1
     if pity < cfg.SHINY_PITY and random.random() >= cfg.SHINY_CHANCE:
-        db.update_user(user["user_id"], shiny_pity=pity)
-        return False
+        db.update_user(uid, shiny_pity=pity)
+        return None
+    owned = {r["item_level"] for r in
+             db.q("SELECT item_level FROM collection WHERE user_id = ?", (uid,))}
+    target = item_level if item_level not in owned else next(
+        (l for l in range(item_level - 1, 0, -1) if l not in owned), None)
+    if target is None:  # всё до этого уровня собрано — pity сохраняем на будущее
+        db.update_user(uid, shiny_pity=pity)
+        return None
     with db.tx():
-        db.update_user(user["user_id"], shiny_pity=0)
+        db.update_user(uid, shiny_pity=0)
         db.exec("INSERT OR IGNORE INTO collection (user_id, item_level, obtained_at) "
-                "VALUES (?, ?, ?)", (user["user_id"], item_level, time.time()))
-    track(user["user_id"], "shiny_drop", item_level)
-    return True
+                "VALUES (?, ?, ?)", (uid, target, time.time()))
+    track(uid, "shiny_drop", target)
+    return target
 
 
 def collection_sets_done(user_id: int) -> int:
@@ -956,14 +1100,16 @@ def _apply_purchase_effect(user_id: int, item_key: str):
             amount = effect["amount"]
         add_cookies(user_id, amount, count_earned=False)
     elif effect["type"] == "energy_full":
+        # именно energy_cap, а не cfg.max_energy: иначе купленный за Stars
+        # «полный бак» игнорировал апгрейды energy_cap_* и недоливал до 750
         user = db.get_user(user_id)
-        db.update_user(user_id, energy=cfg.max_energy(user["level"]),
+        db.update_user(user_id, energy=energy_cap(user),
                        energy_updated_at=time.time())
     elif effect["type"] == "boost":
         db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
                 (user_id, effect["key"], time.time() + effect["hours"] * 3600))
     elif effect["type"] == "bp_premium":
-        db.update_user(user_id, bp_premium=1)
+        grant_bp_premium(user_id)
     elif effect["type"] == "offline_cap":
         # постоянный бонус; max — покупка старшего тира поверх младшего апгрейдит
         user = db.get_user(user_id)

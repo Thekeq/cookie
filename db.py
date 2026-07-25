@@ -42,6 +42,8 @@ class DataBase:
                 'source_code': 'TEXT',
                 'bp_xp': 'REAL DEFAULT 0',
                 'bp_premium': 'INTEGER DEFAULT 0',
+                # премиум, купленный на стыке сезонов, переносится в новый сезон
+                'bp_premium_next': 'INTEGER DEFAULT 0',
                 'bp_claimed_free': 'TEXT DEFAULT "[]"',     # json-список уровней БП
                 'bp_claimed_premium': 'TEXT DEFAULT "[]"',
                 'farm_collected_at': 'REAL DEFAULT 0',      # когда забирали доход фермы
@@ -141,6 +143,9 @@ class DataBase:
                 'user_id': 'INTEGER',
                 'cell': 'INTEGER',        # 0..24
                 'item_level': 'INTEGER',  # уровень печеньки в клетке
+                # сколько печенек фактически вложено (спавн + сумма родителей
+                # при мердже) — от этого считается возврат при переплавке
+                'paid': 'REAL DEFAULT 0',
             },
             'referrals': {
                 'id': 'INTEGER PRIMARY KEY',

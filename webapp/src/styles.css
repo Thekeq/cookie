@@ -443,6 +443,19 @@ input.field:focus { border-color: var(--accent); }
 @keyframes fadeIn { from { opacity: 0; } }
 @keyframes popIn { from { transform: scale(0.85); opacity: 0; } }
 
+/* модалка оффлайн-дохода */
+.offline-emoji {
+  font-size: 60px; line-height: 1;
+  filter: drop-shadow(0 6px 18px rgba(240, 166, 59, 0.35));
+}
+.offline-amount {
+  margin: 12px 0 16px;
+  font-family: var(--font-display); font-weight: 800; font-size: 30px;
+  color: var(--good);
+  text-shadow: 0 0 14px rgba(127, 217, 138, 0.35);
+  animation: popIn 0.35s ease 0.1s backwards;
+}
+
 .daily-grid {
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
 }

@@ -58,6 +58,16 @@ export default function BakeryTab() {
     }
   }
 
+  const abandonOrder = async () => {
+    try {
+      const r = await api.post('/api/orders/abandon')
+      setOrders(r.orders)
+    } catch (e: any) {
+      sfxError()
+      toast(te(e.detail), true)
+    }
+  }
+
   const claimOrder = async () => {
     try {
       await flushClicks() // тапы должны долететь до сервера (метрика clicks)
@@ -140,6 +150,13 @@ export default function BakeryTab() {
             {active.done ? t('order_claim') : `${fmt(active.progress)}/${fmt(active.goal)}`}
           </button>
         </div>
+      )}
+
+      {/* не сложился заказ — можно отказаться ценой одной попытки из лимита */}
+      {active && !active.done && (
+        <button className="btn secondary" style={{ fontSize: 13 }} onClick={abandonOrder}>
+          {t('order_abandon')}
+        </button>
       )}
 
       {/* --- офферы: три заказа разной сложности --- */}

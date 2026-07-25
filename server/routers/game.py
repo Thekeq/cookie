@@ -196,6 +196,8 @@ async def golden_claim(tg: dict = Depends(tg_user)):
         r = gl.claim_golden(user)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # ВАЖНО: бонус живёт в "bonus", а "cookies" — это баланс после начисления.
+    # Раньше баланс перезатирал бонус, и тост показывал «+весь твой баланс»
     r["cookies"] = db.get_user(tg["id"])["cookies"]
     return r
 
@@ -231,6 +233,25 @@ def _board_map(user_id: int) -> dict[int, int]:
             for r in db.q("SELECT cell, item_level FROM board WHERE user_id = ?", (user_id,))}
 
 
+def _best_free_cell(free_cells: list[int], board: dict[int, int]) -> int:
+    """Свободная клетка с максимумом занятых соседей: новая печенька ложится
+    рядом с остальными, а не в дальний угол противня (сетка 5 в ряд)."""
+    def neighbours(cell: int) -> int:
+        row, col = divmod(cell, 5)
+        around = []
+        if col > 0:
+            around.append(cell - 1)
+        if col < 4:
+            around.append(cell + 1)
+        if row > 0:
+            around.append(cell - 5)
+        if row < 4:
+            around.append(cell + 5)
+        return sum(1 for c in around if c in board)
+
+    return max(free_cells, key=lambda c: (neighbours(c), -c))
+
+
 class SpawnIn(BaseModel):
     level: int = 1  # прямая покупка печеньки уровня N (дорого, экономит слияния)
 
@@ -259,10 +280,11 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         cost = cfg.direct_spawn_cost(level, len(board), gl.hourly_income(tg["id"]))
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
-        cell = free_cells[0]
+        cell = _best_free_cell(free_cells, board)
         db.update_user(tg["id"], cookies=user["cookies"] - cost)
-        db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, ?, ?)",
-                (tg["id"], cell, level))
+        # paid — фактически вложенное; от него считается возврат при переплавке
+        db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, ?, ?, ?)",
+                (tg["id"], cell, level, cost))
         gl.quest_progress(tg["id"], "spawns", 1)
         gl.order_progress(tg["id"], "spawns", 1)
     return gl.full_state(tg["id"])
@@ -289,6 +311,10 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
 
     dst = board[mv.to_cell]
     if src != dst:
+        # свап тоже только в открытую зону: иначе закрытой клеткой можно было
+        # пользоваться, обменивая её содержимое (легаси-доски)
+        if mv.to_cell >= gl.merge_cells_unlocked_for(user):
+            raise HTTPException(400, "err_cell_locked")
         # свап — три шага через временную клетку, строго одной транзакцией
         with db.tx():
             db.exec("UPDATE board SET cell = -1 WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
@@ -304,21 +330,28 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
     if cfg.item_unlock_level(new_level) > user["level"]:
         raise HTTPException(400, f"err_item_locked|{cfg.item_unlock_level(new_level)}")
     with db.tx():  # удаление + апгрейд + счётчики — одним куском
+        # вложенное складываем: слияние двух печенек стоило суммы их цен,
+        # от этой суммы потом считается возврат при переплавке
+        paid = db.q1("SELECT COALESCE(SUM(paid), 0) p FROM board "
+                     "WHERE user_id = ? AND cell IN (?, ?)",
+                     (tg["id"], mv.from_cell, mv.to_cell))["p"]
         db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
-        db.exec("UPDATE board SET item_level = ? WHERE user_id = ? AND cell = ?",
-                (new_level, tg["id"], mv.to_cell))
+        db.exec("UPDATE board SET item_level = ?, paid = ? WHERE user_id = ? AND cell = ?",
+                (new_level, paid, tg["id"], mv.to_cell))
         db.update_user(tg["id"], total_merges=user["total_merges"] + 1)
-        gl.add_xp(db.get_user(tg["id"]), cfg.merge_reward_xp(new_level))
+        gl.add_xp(db.get_user(tg["id"]), cfg.merge_reward_xp(new_level),
+                  cfg.merge_reward_bp_xp(new_level))
         gl.quest_progress(tg["id"], "merges", 1)
         gl.order_progress(tg["id"], "merges", 1)
         gl.order_progress(tg["id"], "make_item", new_level)
-        shiny = gl.roll_shiny(db.get_user(tg["id"]), new_level)
+        shiny_level = gl.roll_shiny(db.get_user(tg["id"]), new_level)
     if user["total_merges"] == 0:
         gl.track(tg["id"], "first_merge")
 
     state = gl.full_state(tg["id"])
     state["merged_level"] = new_level
-    state["shiny"] = shiny
+    state["shiny"] = shiny_level is not None
+    state["shiny_level"] = shiny_level
     return state
 
 
@@ -328,20 +361,22 @@ class TrashIn(BaseModel):
 
 @router.post("/merge/trash")
 async def trash(body: TrashIn, tg: dict = Depends(tg_user)):
-    """Печенька в мусорку/печь: клетка освобождается, кэшбек TRASH_REFUND
-    от текущей цены прямой покупки того же уровня."""
+    """Печенька в мусорку/печь: клетка освобождается, возвращается TRASH_REFUND
+    от ФАКТИЧЕСКИ вложенного (board.paid). По текущей цене считать нельзя:
+    доска, собранная в бедности, переплавлялась бы по ценам богатого игрока."""
     _ensure_user(tg)
     if not (0 <= body.cell < cfg.BOARD_SIZE):
         raise HTTPException(400, "err_bad_move")
     with db.tx():
-        board = _board_map(tg["id"])
-        if body.cell not in board:
+        row = db.q1("SELECT item_level, paid FROM board WHERE user_id = ? AND cell = ?",
+                    (tg["id"], body.cell))
+        if not row:
             raise HTTPException(400, "err_empty_cell")
-        level = board[body.cell]
+        level = row["item_level"]
         db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], body.cell))
-        # кэшбек по цене доски УЖЕ без этой печеньки — не накрутить продажей
-        refund = (cfg.direct_spawn_cost(level, len(board) - 1, gl.hourly_income(tg["id"]))
-                  * cfg.TRASH_REFUND)
+        # строки, созданные до появления paid, оцениваем по минимальной цене
+        invested = row["paid"] or cfg.legacy_item_value(level)
+        refund = invested * cfg.TRASH_REFUND
         gl.add_cookies(tg["id"], refund, count_earned=False)
     gl.track(tg["id"], "trash_item", level)
     state = gl.full_state(tg["id"])
@@ -427,6 +462,18 @@ async def order_take(body: TakeOrder, tg: dict = Depends(tg_user)):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"active": active}
+
+
+@router.post("/orders/abandon")
+async def order_abandon(tg: dict = Depends(tg_user)):
+    """Отказ от заказа: тратит одну попытку из дневного лимита.
+    Мёртвые заказы (цель недостижима после престижа) снимаются сами и бесплатно."""
+    user = _ensure_user(tg)
+    try:
+        orders = gl.abandon_order(user)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"orders": orders}
 
 
 @router.post("/orders/claim")

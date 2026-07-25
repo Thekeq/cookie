@@ -100,6 +100,9 @@ export interface GameState {
   board: BoardCell[]
   board_cells: {
     unlocked: number
+    /** заслуженные клетки (уровни+друзья); unlocked может быть больше на
+     *  старых досках — уже занятые клетки не отбираем */
+    earned: number
     total: number
     next_unlock_level: number | null
     ref_cells: { friends: number; done: boolean }[]
@@ -129,6 +132,8 @@ export interface GameState {
   } | null
   merged_level?: number
   shiny?: boolean
+  /** уровень, попавший в альбом (не всегда равен merged_level) */
+  shiny_level?: number | null
   prestige: {
     points: number
     count: number
@@ -143,7 +148,7 @@ export interface GameState {
 export interface LevelNode {
   level: number
   xp_required: number
-  reward: { cookies: number; energy_bonus: number }
+  reward: { cookies: number; max_energy_up: number }
   unlocks_items: number[]
   reached: boolean
 }

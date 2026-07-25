@@ -107,10 +107,16 @@ export default function MergeTab() {
         setPopCell(to)
         setTimeout(() => setPopCell(null), 350)
         if (s.shiny) {
-          // золотая подсветка: сразу видно, что выпала блестяшка в альбом
+          // золотая подсветка: сразу видно, что выпала блестяшка в альбом.
+          // shiny_level может отличаться от merged_level — дубликат заменяется
+          // на недостающий уровень, чтобы бросок не уходил в пустоту
           setShinyCell(to)
           setTimeout(() => setShinyCell(null), 1800)
-          toast(t('shiny_drop'))
+          toast(
+            s.shiny_level
+              ? `${t('shiny_drop')} ${COOKIE_SKINS[s.shiny_level]} ${s.shiny_level}`
+              : t('shiny_drop'),
+          )
         } else if (s.merged_level >= 5)
           toast(`${t('merged_lvl', { n: s.merged_level })} ${COOKIE_SKINS[s.merged_level]}`)
       } else {

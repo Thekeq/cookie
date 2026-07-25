@@ -5,6 +5,7 @@ import { Lang, LangCtx, loadLang, saveLang, useT, useTErr } from './i18n'
 import { unlockAudio } from './sound'
 import Onboarding from './Onboarding'
 import DailyModal from './DailyModal'
+import OfflineModal from './OfflineModal'
 import ClickerTab from './tabs/ClickerTab'
 import MergeTab from './tabs/MergeTab'
 import BakeryTab from './tabs/BakeryTab'
@@ -20,8 +21,6 @@ interface Ctx {
   isAdmin: boolean
   /** единый живой баланс для всех вкладок: сервер + пассивный тик + предикт кликов */
   liveBalance: number
-  /** предикт клика: мгновенно прибавляет к балансу, сервер подтвердит батчем */
-  bumpBalance: (n: number) => void
   /** текущий множитель комбо (живёт здесь — переживает смену вкладок) */
   combo: number
   /** регистрирует тап: очередь кликов живёт в App и не теряется при смене вкладки */
@@ -69,12 +68,13 @@ function Game() {
   const [showOnboarding, setShowOnboarding] = useState(!localStorage.getItem('onboarded'))
   // попап ежедневной награды — один раз за сессию, если есть что забрать
   const [dailyShown, setDailyShown] = useState(false)
+  // оффлайн-доход показываем модалкой: тост про «+N» рядом с уже выросшим
+  // балансом читался как «написали, но не начислили»
+  const [offlineIncome, setOfflineIncome] = useState(0)
   // живой баланс: тикает каждую секунду со скоростью фермы + пассивки мерджа
   const [liveCookies, setLiveCookies] = useState(0)
   // предикт кликов: тапы падают сюда мгновенно, сервер подтверждает батчем
   const [clickDelta, setClickDelta] = useState(0)
-
-  const bumpBalance = useCallback((n: number) => setClickDelta((v) => v + n), [])
 
   const toast = useCallback((text: string, err = false) => {
     setToastMsg({ text, err })
@@ -191,7 +191,7 @@ function Game() {
         setState(s)
         if (s.just_registered) toast(t('welcome'))
         if (s.passive_collected && s.passive_collected > 1)
-          toast(`${t('offline_income')}: +${fmt(s.passive_collected)} 🍪`)
+          setOfflineIncome(s.passive_collected)
         api.get('/api/admin/stats').then(() => setIsAdmin(true)).catch(() => {})
       })
       .catch((e) => setError(e instanceof ApiError ? te(e.detail) : t('open_in_tg')))
@@ -225,7 +225,7 @@ function Game() {
     return (
       <GameCtx.Provider
         value={{ state, setState, refresh, toast, isAdmin, liveBalance: state.user.cookies,
-                 bumpBalance, combo, tapClick, flushClicks }}
+                 combo, tapClick, flushClicks }}
       >
         <Onboarding onDone={() => setShowOnboarding(false)} />
       </GameCtx.Provider>
@@ -247,7 +247,7 @@ function Game() {
   return (
     <GameCtx.Provider
       value={{ state, setState, refresh, toast, isAdmin, liveBalance,
-               bumpBalance, combo, tapClick, flushClicks }}
+               combo, tapClick, flushClicks }}
     >
       <div className="app">
         <div className="header">
@@ -277,7 +277,10 @@ function Game() {
           ))}
         </div>
         {toastMsg && <div className={'toast' + (toastMsg.err ? ' error' : '')}>{toastMsg.text}</div>}
-        {state.daily?.can_claim && !dailyShown && (
+        {offlineIncome > 1 && (
+          <OfflineModal amount={offlineIncome} onClose={() => setOfflineIncome(0)} />
+        )}
+        {offlineIncome <= 1 && state.daily?.can_claim && !dailyShown && (
           <DailyModal daily={state.daily} onClose={() => setDailyShown(true)} />
         )}
       </div>

@@ -22,6 +22,9 @@ const dict = {
   error: { en: 'Error', uk: 'Помилка', ru: 'Ошибка' },
   welcome: { en: 'Welcome to Cookie Merge! 🍪', uk: 'Ласкаво просимо до Cookie Merge! 🍪', ru: 'Добро пожаловать в Cookie Merge! 🍪' },
   offline_income: { en: 'Offline income', uk: 'Дохід офлайн', ru: 'Пассивный доход' },
+  offline_title: { en: 'While you were away', uk: 'Поки тебе не було', ru: 'Пока тебя не было' },
+  offline_text: { en: 'The bakery kept working and baked cookies for you', uk: 'Пекарня працювала й напекла тобі печива', ru: 'Пекарня работала и напекла тебе печенек' },
+  offline_ok: { en: 'Nice! 🍪', uk: 'Чудово! 🍪', ru: 'Отлично! 🍪' },
   open_in_tg: { en: 'Open the app from Telegram', uk: 'Відкрий застосунок з Telegram', ru: 'Открой приложение из Telegram' },
   level: { en: 'Level', uk: 'Рівень', ru: 'Уровень' },
 
@@ -157,7 +160,7 @@ const dict = {
   // сезоны
   season_ends: { en: 'Season ends in {n}', uk: 'Сезон закінчиться через {n}', ru: 'Сезон закончится через {n}' },
   season_num: { en: 'Season {n}', uk: 'Сезон {n}', ru: 'Сезон {n}' },
-  lb_season_hint: { en: 'Ranked by level; ties by cookies earned. Top-10 get prizes at season end. Progress resets each season!', uk: 'Рейтинг за рівнем, за рівності — за печивками. Топ-10 отримають призи наприкінці сезону. Прогрес скидається щосезону!', ru: 'Рейтинг по уровню, при равенстве — по печенькам. Топ-10 получат призы в конце сезона. Прогресс сбрасывается каждый сезон!' },
+  lb_season_hint: { en: 'Ranked by cookies earned this season; ties by level. Top-10 of each league get prizes at season end, then season earnings reset!', uk: 'Рейтинг за печивом, заробленим цього сезону, за рівності — за рівнем. Топ-10 кожної ліги отримають призи наприкінці сезону, потім сезонний заробіток скидається!', ru: 'Рейтинг по печенькам, заработанным за сезон, при равенстве — по уровню. Топ-10 каждой лиги получают призы в конце сезона, затем сезонный заработок сбрасывается!' },
   lb_last_season: { en: 'Last season: #{r} — +{n} 🍪', uk: 'Минулий сезон: #{r} — +{n} 🍪', ru: 'Прошлый сезон: #{r} — +{n} 🍪' },
   days_short: { en: '{n}d', uk: '{n}д', ru: '{n}д' },
   hours_short: { en: '{n}h', uk: '{n}год', ru: '{n}ч' },
@@ -247,6 +250,7 @@ const dict = {
   orders_title: { en: '🧾 Bakery orders', uk: '🧾 Замовлення пекарні', ru: '🧾 Заказы пекарни' },
   orders_hint: { en: 'Pick one order, complete it and open the chest. {n} left today.', uk: 'Обери одне замовлення, виконай і відкрий скриню. Сьогодні лишилось: {n}.', ru: 'Выбери один заказ, выполни и открой сундук. Сегодня осталось: {n}.' },
   order_take: { en: 'Take', uk: 'Взяти', ru: 'Взять' },
+  order_abandon: { en: '✖️ Give up the order (uses 1 of today\'s)', uk: '✖️ Відмовитись від замовлення (мінус 1 сьогодні)', ru: '✖️ Отказаться от заказа (минус 1 на сегодня)' },
   order_claim: { en: 'Deliver order', uk: 'Здати замовлення', ru: 'Сдать заказ' },
   order_done_toast: { en: 'Order delivered! +{n} 🍪 and +{m} BP XP', uk: 'Замовлення здано! +{n} 🍪 та +{m} BP XP', ru: 'Заказ сдан! +{n} 🍪 и +{m} BP XP' },
   orders_limit: { en: 'New orders tomorrow', uk: 'Нові замовлення завтра', ru: 'Новые заказы завтра' },

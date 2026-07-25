@@ -75,10 +75,21 @@ async def _notify_pass(bot):
         await asyncio.sleep(0.05)
 
 
+def _prune_events():
+    """TTL аналитики: таблица events росла без ограничений (по событию 'session'
+    на каждое открытие приложения). Админка смотрит окна максимум 7 дней."""
+    db.exec("DELETE FROM events WHERE created_at < ?",
+            (time.time() - cfg.EVENTS_TTL_DAYS * 86400,))
+
+
 async def run_notifier(bot):
     while True:
         try:
             await _notify_pass(bot)
         except Exception:
             log.exception("notifier pass failed")
+        try:
+            _prune_events()
+        except Exception:
+            log.exception("events prune failed")
         await asyncio.sleep(CHECK_INTERVAL)

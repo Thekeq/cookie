@@ -259,8 +259,10 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
 
 @router.get("/leaderboard")
 async def leaderboard(tg: dict = Depends(tg_user)):
-    """Сезонный топ ВНУТРИ СВОЕЙ ЛИГИ (по уровню, тай-брейк season_earned):
-    новичок соревнуется с новичками, а не с недостижимыми ветеранами.
+    """Сезонный топ ВНУТРИ СВОЕЙ ЛИГИ: лига определяется уровнем (новичок
+    соревнуется с новичками), а место внутри лиги — заработком ЗА СЕЗОН, ведь
+    именно он и обнуляется. Раньше сортировка шла по уровню, который сезон не
+    сбрасывает: таблица стояла на месте, а престиж ронял игрока на дно.
     Топ-10 каждой лиги получают призы в конце сезона."""
     gl.finalize_seasons()
     season = gl.current_season()
@@ -273,7 +275,7 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     top = db.q(
         f"SELECT user_id, username, first_name, level, season_earned "
         f"FROM users WHERE season_id = ? AND {cond} "
-        f"ORDER BY level DESC, season_earned DESC LIMIT 100", [season] + lparams)
+        f"ORDER BY season_earned DESC, level DESC LIMIT 100", [season] + lparams)
     for i, row in enumerate(top):
         row["rank"] = i + 1
         row["name"] = row.pop("first_name") or row.pop("username") or "Player"
@@ -285,8 +287,9 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     if me:
         my_rank = db.q1(
             f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond} AND "
-            f"(level > ? OR (level = ? AND season_earned > ?))",
-            [season] + lparams + [me["level"], me["level"], me["season_earned"]])["c"] + 1
+            f"(season_earned > ? OR (season_earned = ? AND level > ?))",
+            [season] + lparams + [me["season_earned"], me["season_earned"],
+                                  me["level"]])["c"] + 1
     return {
         "top": top,
         "me": {"rank": my_rank, "season_earned": me["season_earned"] if me else 0},

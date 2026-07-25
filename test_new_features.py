@@ -364,8 +364,18 @@ check("collection set 1 done", col["sets"][0]["done"] is True, str(col["sets"][0
 check("collection multiplier +3%", abs(col["multiplier"] - 1.03) < 1e-9,
       str(col["multiplier"]))
 db.update_user(UID, shiny_pity=cfg.SHINY_PITY)
-check("pity guarantees shiny", gl.roll_shiny(db.get_user(UID), 7) is True)
+# roll_shiny возвращает уровень, попавший в альбом (или None)
+check("pity guarantees shiny", gl.roll_shiny(db.get_user(UID), 7) == 7)
 check("pity reset after drop", db.get_user(UID)["shiny_pity"] == 0)
+# дубликат не должен съедать гарант: 1-7 уже собраны, бросок на 7 отдаёт
+# ближайший НЕсобранный уровень, а не теряется в INSERT OR IGNORE
+db.update_user(UID, shiny_pity=cfg.SHINY_PITY)
+dup = gl.roll_shiny(db.get_user(UID), 7)
+check("duplicate roll gives a missing level", dup is None or dup not in range(1, 8),
+      str(dup))
+db.exec("DELETE FROM collection WHERE user_id = ? AND item_level = 4", (UID,))
+db.update_user(UID, shiny_pity=cfg.SHINY_PITY)
+check("duplicate roll fills the hole", gl.roll_shiny(db.get_user(UID), 7) == 4)
 
 # --- лиги ---
 db.update_user(UID, level=3)

@@ -195,6 +195,187 @@ check("fresh offers after prestige are small",
           for o in r.json()["offers"]),
       str([o["reward_cookies"] for o in r.json()["offers"]]))
 
+# --- золотая печенька: в ответе бонус, а не весь баланс ---
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 0, 10, 1000)", (UID,))
+db.update_user(UID, cookies=5_000_000, golden_next_at=time.time() - 1,
+               golden_expires_at=0, golden_effect="chain", level=5)
+c.get("/api/state", headers=H)          # активирует печеньку
+# эффект при активации выбирается случайно — фиксируем chain (он даёт печеньки)
+db.update_user(UID, golden_effect="chain")
+before = db.get_user(UID)["cookies"]
+r = c.post("/api/golden/claim", headers=H)
+g = r.json()
+paid = db.get_user(UID)["cookies"] - before
+check("golden returns bonus, not balance",
+      g.get("bonus") is not None and abs(g["bonus"] - paid) < 1,
+      f"bonus={g.get('bonus')} paid={paid}")
+check("golden balance separate", g["cookies"] > g["bonus"], str(g))
+
+# --- доход для цен и наград не раздувается временными бустами ---
+db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
+db.update_user(UID, click_level=20)
+calm = gl.hourly_income(UID)
+db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, 'golden_frenzy', ?)",
+        (UID, time.time() + 60))
+check("frenzy does not inflate income", abs(gl.hourly_income(UID) - calm) < 1,
+      f"{calm} -> {gl.hourly_income(UID)}")
+check("frenzy still boosts clicks", gl.click_multiplier(UID) > gl.permanent_click_multiplier(UID))
+db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
+
+# --- переплавка возвращает долю вложенного, а не текущей цены ---
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 0, 5, 10000)", (UID,))
+before = db.get_user(UID)["cookies"]
+r = c.post("/api/merge/trash", json={"cell": 0}, headers=H)
+check("refund is 10% of paid", abs(r.json()["trash_refund"] - 1000) < 1, r.text[:200])
+# рост дохода не должен увеличивать возврат за уже купленное
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 0, 5, 10000)", (UID,))
+db.exec("UPDATE farm SET count = 5000 WHERE user_id = ? AND building_key = 'granny'", (UID,))
+r = c.post("/api/merge/trash", json={"cell": 0}, headers=H)
+check("refund ignores income growth", abs(r.json()["trash_refund"] - 1000) < 1, r.text[:200])
+
+# --- мердж складывает вложенное ---
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.update_user(UID, level=10)
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 0, 4, 700)", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 1, 4, 300)", (UID,))
+c.post("/api/merge/move", json={"from_cell": 0, "to_cell": 1}, headers=H)
+check("merge sums paid",
+      abs(db.q1("SELECT paid FROM board WHERE user_id = ? AND cell = 1", (UID,))["paid"]
+          - 1000) < 1)
+
+# --- BP XP за мердж ограничен капом ---
+check("merge bp xp capped", cfg.merge_reward_bp_xp(24) == cfg.MERGE_BP_XP_CAP)
+check("top merge is a small slice of the pass",
+      cfg.merge_reward_bp_xp(24) / cfg.bp_total_xp(cfg.BP_MAX_LEVEL) < 0.05,
+      str(cfg.merge_reward_bp_xp(24) / cfg.bp_total_xp(cfg.BP_MAX_LEVEL)))
+check("low merges keep full bp xp", cfg.merge_reward_bp_xp(5) == cfg.merge_reward_xp(5))
+
+# --- полный бак за Stars учитывает апгрейды энергии ---
+db.exec("INSERT OR IGNORE INTO upgrades (user_id, upgrade_key) VALUES (?, 'energy_cap_500')",
+        (UID,))
+db.update_user(UID, energy=0)
+gl._apply_purchase_effect(UID, "energy_full")
+cap = gl.energy_cap(db.get_user(UID))
+check("energy_full respects upgrades", db.get_user(UID)["energy"] == cap and cap >= 500,
+      f"energy={db.get_user(UID)['energy']} cap={cap}")
+
+# --- мёртвый заказ снимается сам и бесплатно ---
+db.exec("DELETE FROM orders WHERE user_id = ?", (UID,))
+db.update_user(UID, level=3, orders_day=None, orders_day_count=0)
+db.exec("INSERT INTO orders (user_id, slot, template, metric, goal, progress, "
+        "reward_cookies, reward_bp_xp, status, created_at) "
+        "VALUES (?, 1, 'special', 'make_item', 23, 8, 100, 10, 'active', ?)",
+        (UID, time.time()))
+st = gl.orders_state(db.get_user(UID))
+check("unreachable make_item order dropped", st["active"] is None, str(st["active"]))
+check("fresh offers instead", len(st["offers"]) == 3)
+check("daily limit untouched", db.get_user(UID)["orders_day_count"] == 0)
+# «заработай 60M» после престижа тоже недостижим
+db.exec("DELETE FROM orders WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO orders (user_id, slot, template, metric, goal, progress, "
+        "reward_cookies, reward_bp_xp, status, created_at) "
+        "VALUES (?, 1, 'profit', 'earned', 60000000, 0, 100, 10, 'active', ?)",
+        (UID, time.time()))
+db.exec("DELETE FROM farm WHERE user_id = ?", (UID,))
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.update_user(UID, click_level=1)
+check("unreachable earned order dropped",
+      gl.orders_state(db.get_user(UID))["active"] is None)
+
+# --- отказ от заказа тратит попытку из лимита ---
+st = gl.orders_state(db.get_user(UID))
+c.post("/api/orders/take", json={"slot": 1}, headers=H)
+used_before = db.get_user(UID)["orders_day_count"]
+r = c.post("/api/orders/abandon", headers=H)
+check("abandon ok", r.status_code == 200 and r.json()["orders"]["active"] is None,
+      r.text[:200])
+check("abandon costs one daily order",
+      db.get_user(UID)["orders_day_count"] == used_before + 1)
+r = c.post("/api/orders/abandon", headers=H)
+check("abandon without order blocked", r.status_code == 400)
+
+# --- премиум, купленный на стыке сезонов, переезжает в новый ---
+db.update_user(UID, bp_premium=0, bp_premium_next=0)
+gl.grant_bp_premium(UID, now=gl.season_end_ts(gl.current_season()) - 3600)
+u = db.get_user(UID)
+check("premium carries over when bought near rollover",
+      u["bp_premium"] == 1 and u["bp_premium_next"] == 1, str(dict(u)["bp_premium_next"]))
+db.update_user(UID, bp_premium=0, bp_premium_next=0)
+gl.grant_bp_premium(UID, now=gl.season_end_ts(gl.current_season()) - 10 * 86400)
+check("premium mid-season does not carry",
+      db.get_user(UID)["bp_premium_next"] == 0)
+# ролловер переносит bp_premium_next в bp_premium
+db.update_user(UID, bp_premium=1, bp_premium_next=1,
+               season_id=gl.current_season() - 1, season_earned=1234)
+gl.finalize_seasons()
+u = db.get_user(UID)
+check("rollover keeps carried premium", u["bp_premium"] == 1 and u["bp_premium_next"] == 0,
+      str((u["bp_premium"], u["bp_premium_next"])))
+check("rollover reset season progress", u["season_earned"] == 0 and u["bp_xp"] == 0)
+
+# --- легаси-доска: занятые клетки не отбираем, обычную не переставляем ---
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.update_user(UID, level=1)
+for cell in (0, 3, 20, 24):
+    db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, ?, 2, 100)",
+            (UID, cell))
+open_cells = gl.merge_cells_unlocked_for(db.get_user(UID))
+cells_now = sorted(r["cell"] for r in
+                   db.q("SELECT cell FROM board WHERE user_id = ?", (UID,)))
+check("legacy board compacted", cells_now == [0, 1, 2, 3], str(cells_now))
+check("legacy keeps base cells", open_cells == cfg.MERGE_BASE_CELLS, str(open_cells))
+# доска внутри заслуженной зоны с дыркой — не трогаем
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+for cell in (0, 2, 5):
+    db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, ?, 2, 100)",
+            (UID, cell))
+gl.merge_cells_unlocked_for(db.get_user(UID))
+check("normal board left alone",
+      sorted(r["cell"] for r in db.q("SELECT cell FROM board WHERE user_id = ?", (UID,)))
+      == [0, 2, 5])
+
+# --- спавн ложится рядом с занятыми клетками ---
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.update_user(UID, cookies=10_000_000)
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 6, 2, 100)", (UID,))
+c.post("/api/merge/spawn", json={"level": 1}, headers=H)
+spawned = [r["cell"] for r in
+           db.q("SELECT cell FROM board WHERE user_id = ? AND item_level = 1", (UID,))]
+check("spawn lands next to existing cookie", spawned and spawned[0] in (1, 5, 7, 11),
+      str(spawned))
+
+# --- лидерборд ранжирует по заработку за сезон ---
+r = c.get("/api/leaderboard", headers=H)
+top = r.json()["top"]
+check("leaderboard sorted by season_earned",
+      all(top[i]["season_earned"] >= top[i + 1]["season_earned"]
+          for i in range(len(top) - 1)), str([x["season_earned"] for x in top]))
+
+# --- прогресс квестов пишется без предварительного ensure ---
+day = gl._utc_day(time.time())
+# метрику берём из фактических заданий дня: пул выбирается детерминированно,
+# и «кликов» среди сегодняшних трёх может не оказаться
+metric = cfg.DAILY_QUEST_POOL[gl.todays_quest_keys(day)[0]]["metric"]
+db.exec("DELETE FROM daily_quests WHERE user_id = ?", (UID,))
+gl._quest_rows_ready.discard((UID, day))
+gl.quest_progress(UID, metric, 7)
+rows = db.q("SELECT quest_key, progress FROM daily_quests WHERE user_id = ? AND day = ?",
+            (UID, day))
+check("quest rows created lazily", len(rows) == cfg.DAILY_QUESTS_PER_DAY, str(rows))
+hit = [r for r in rows if cfg.DAILY_QUEST_POOL[r["quest_key"]]["metric"] == metric]
+check(f"progress applied to '{metric}' quests",
+      len(hit) >= 1 and all(r["progress"] == 7 for r in hit), str(hit))
+# claimed-задания прогресс не получают
+db.exec("UPDATE daily_quests SET claimed = 1 WHERE user_id = ? AND day = ?", (UID, day))
+gl.quest_progress(UID, metric, 5)
+check("claimed quests do not advance",
+      all(r["progress"] == 7 for r in
+          db.q("SELECT progress FROM daily_quests WHERE user_id = ? AND day = ? "
+               "AND quest_key IN (%s)" % ", ".join("?" * len(hit)),
+               (UID, day, *[r["quest_key"] for r in hit]))))
+
 print(f"\n{ok} passed, {fail} failed")
 if fail:
     raise SystemExit(1)
