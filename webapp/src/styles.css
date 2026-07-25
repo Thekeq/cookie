@@ -499,60 +499,177 @@ input.field:focus { border-color: var(--accent); }
   100% { transform: rotate(-2deg) scale(1.03); }
 }
 
-/* ---------- пекарня: сцена печи ---------- */
+/* ---------- пекарня: печь как индикатор прогресса ----------
+   Тезис сцены: тесто за стеклом допечено ровно настолько, насколько
+   выполнен заказ. Один параметр --bake (0..1) ведёт всё: жар в камере,
+   стрелку термостата, цвет и размер печенья, пар над духовкой. */
 .oven-scene {
-  position: relative; margin-bottom: 10px; padding: 18px 14px 12px;
+  --bake: 0;
+  --raw: #edd6ab;          /* сырое тесто */
+  --baked: #b0691f;        /* румяная корка */
+  --chip: #4a2a0c;         /* шоколад */
+  position: relative; margin-bottom: 10px; padding: 16px 14px 12px;
   text-align: center;
-  background: linear-gradient(180deg, rgba(255, 224, 168, 0.03), transparent 40%), var(--dough);
+  background:
+    radial-gradient(88% 66% at 50% 74%,
+      rgba(240, 166, 59, calc(0.03 + var(--bake) * 0.10)), transparent 70%),
+    linear-gradient(180deg, rgba(255, 224, 168, 0.03), transparent 40%), var(--dough);
   border: 1px solid var(--card-edge); border-radius: var(--radius);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
   overflow: hidden;
 }
-.oven-body {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 110px; height: 96px; border-radius: 16px 16px 10px 10px;
-  background: linear-gradient(180deg, #4a3013, #2e1d0a);
-  border: 2px solid rgba(255, 224, 168, 0.18);
-  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5), 0 4px 10px rgba(0, 0, 0, 0.35);
+.oven-scene:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* готово — вся печь становится кнопкой «забрать» */
+.oven-scene.ready {
+  cursor: pointer; border-color: rgba(240, 166, 59, 0.45);
+  animation: ovenReady 1.9s ease-in-out infinite;
 }
-.oven-door {
-  width: 82px; height: 64px; border-radius: 12px;
-  display: flex; align-items: center; justify-content: center;
-  background: radial-gradient(80% 80% at 50% 60%, rgba(240, 120, 30, 0.25), rgba(0, 0, 0, 0.55));
-  border: 2px solid rgba(255, 224, 168, 0.22);
-  box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.6);
+@keyframes ovenReady {
+  0%, 100% { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), 0 0 0 0 rgba(240, 166, 59, 0); }
+  50% { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), 0 0 20px 2px rgba(240, 166, 59, 0.26); }
 }
-.oven-scene.baking .oven-door {
-  box-shadow: inset 0 0 18px rgba(255, 120, 0, 0.55);
+
+.oven-unit {
+  position: relative; width: min(258px, 100%); margin: 0 auto;
+  padding: 10px 10px 0; border-radius: 14px 14px 9px 9px;
+  background: linear-gradient(180deg, #56381a, #34220d 62%, #241608);
+  border: 1px solid rgba(255, 224, 168, 0.16);
+  box-shadow: inset 0 1px 0 rgba(255, 224, 168, 0.18), 0 6px 14px rgba(0, 0, 0, 0.4);
+  perspective: 620px;
 }
-.oven-fire { font-size: 34px; }
-.oven-scene.baking .oven-fire { animation: fireFlicker 0.5s ease-in-out infinite alternate; }
-@keyframes fireFlicker {
-  from { transform: scale(0.92) rotate(-3deg); filter: brightness(0.95); }
-  to { transform: scale(1.12) rotate(3deg); filter: brightness(1.2); }
+/* камера: жар растёт вместе с прогрессом */
+.oven-cavity {
+  position: relative; height: 96px; border-radius: 9px; overflow: hidden;
+  background: radial-gradient(78% 88% at 50% 96%,
+    rgba(255, 138, 28, calc(0.10 + var(--bake) * 0.40)), rgba(0, 0, 0, 0.88) 74%);
+  border: 1px solid rgba(0, 0, 0, 0.6);
+  box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.8);
+  transition: background 0.6s ease;
 }
-/* конвейер: печеньки едут в печь, пока заказ выполняется */
-.oven-belt { position: absolute; left: 0; right: 0; top: 46px; height: 30px; pointer-events: none; }
-.belt-cookie {
-  position: absolute; left: -30px; font-size: 22px;
-  animation: beltRide 3.3s linear infinite;
+.oven-scene.idle .oven-cavity { filter: brightness(0.5) saturate(0.6); }
+.oven-rack {
+  position: absolute; left: 14px; right: 14px; bottom: 20px; height: 5px;
+  background: repeating-linear-gradient(90deg,
+    rgba(255, 224, 168, 0.26) 0 1px, transparent 1px 9px);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.55);
 }
-@keyframes beltRide {
-  0% { left: -10%; opacity: 0; transform: rotate(0deg); }
-  15% { opacity: 1; }
-  80% { opacity: 1; }
-  100% { left: 105%; opacity: 0; transform: rotate(300deg); }
+
+/* печенье: растекается и румянится по мере выполнения заказа */
+.bake-item {
+  position: absolute; left: 50%; bottom: 23px;
+  width: calc(38px + var(--bake) * 36px);
+  height: calc(30px + var(--bake) * 14px);
+  transform: translateX(-50%);
+  transition: width 0.6s ease, height 0.6s ease;
 }
-/* сундук готового заказа: подпрыгивает и светится — тапабельный */
-.oven-chest {
-  font-size: 40px; cursor: pointer;
-  filter: drop-shadow(0 0 12px rgba(255, 215, 0, 0.8));
-  animation: chestBounce 0.9s ease-in-out infinite;
+.bake-item span { position: absolute; inset: 0; border-radius: 50%; }
+.bake-baked {
+  background: radial-gradient(70% 70% at 38% 28%, #d68f3d, var(--baked) 68%, #85490f);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.5), inset 0 -3px 7px rgba(0, 0, 0, 0.3);
 }
-@keyframes chestBounce {
-  0%, 100% { transform: translateY(0) scale(1); }
-  40% { transform: translateY(-8px) scale(1.08); }
+.bake-raw {
+  background: radial-gradient(70% 70% at 38% 28%, #f8e9ca, var(--raw) 74%, #d5b98b);
+  opacity: calc(1 - var(--bake) * 1.15);
+  transition: opacity 0.6s ease;
 }
+.bake-chips {
+  opacity: calc(var(--bake) * 2 - 0.6);
+  transition: opacity 0.6s ease;
+  background:
+    radial-gradient(3px 3px at 30% 46%, var(--chip) 96%, transparent),
+    radial-gradient(2.5px 2.5px at 61% 31%, var(--chip) 96%, transparent),
+    radial-gradient(3px 3px at 51% 69%, var(--chip) 96%, transparent),
+    radial-gradient(2px 2px at 74% 58%, var(--chip) 96%, transparent);
+}
+.oven-scene.baking .bake-item { animation: doughBob 2.6s ease-in-out infinite; }
+@keyframes doughBob {
+  0%, 100% { transform: translateX(-50%) translateY(0); }
+  50% { transform: translateX(-50%) translateY(-3px); }
+}
+.oven-scene.ready .bake-item {
+  filter: drop-shadow(0 0 10px rgba(255, 190, 80, 0.6));
+  animation: cookieReady 2.2s ease-in-out infinite;
+}
+@keyframes cookieReady {
+  0%, 100% { transform: translateX(-50%) translateY(0) rotate(-2deg); }
+  50% { transform: translateX(-50%) translateY(-7px) rotate(2deg); }
+}
+
+/* волны жара поднимаются от пода, пока печётся */
+.oven-heat { position: absolute; inset: 0; opacity: 0; transition: opacity 0.5s; }
+.oven-scene.baking .oven-heat { opacity: 1; }
+.oven-heat i {
+  position: absolute; bottom: -12px; width: 26px; height: 38px; border-radius: 50%;
+  background: radial-gradient(50% 50% at 50% 50%, rgba(255, 150, 50, 0.32), transparent 70%);
+  filter: blur(3px); animation: heatRise 3.4s ease-in infinite;
+}
+@keyframes heatRise {
+  0% { transform: translateY(0) scaleX(1); opacity: 0; }
+  25% { opacity: 0.9; }
+  100% { transform: translateY(-92px) scaleX(1.5); opacity: 0; }
+}
+
+/* дверца: стекло с ручкой, на готовности распахивается влево */
+.oven-glass {
+  position: absolute; left: 10px; right: 10px; top: 10px; height: 96px;
+  border-radius: 9px; border: 1px solid rgba(255, 224, 168, 0.18);
+  background: linear-gradient(115deg,
+    rgba(255, 224, 168, 0.15) 0 17%, rgba(255, 224, 168, 0.03) 29% 46%,
+    rgba(0, 0, 0, 0.28) 62%);
+  transform-origin: left center;
+  transition: transform 0.75s cubic-bezier(0.2, 0.85, 0.25, 1), opacity 0.5s;
+}
+.oven-glass::before {
+  content: ''; position: absolute; left: 16px; right: 16px; top: 7px; height: 5px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #e6cfa4, #8d7043);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+.oven-scene.ready .oven-glass { transform: rotateY(-104deg); opacity: 0.85; }
+/* свет из открытой печи ложится на пол сцены */
+.oven-spill {
+  position: absolute; left: 50%; bottom: 26px; width: 230px; height: 62px;
+  transform: translateX(-50%); pointer-events: none; opacity: 0;
+  background: radial-gradient(58% 100% at 50% 0%, rgba(255, 190, 90, 0.32), transparent 70%);
+  transition: opacity 0.6s ease 0.25s;
+}
+.oven-scene.ready .oven-spill { opacity: 1; }
+
+/* панель: термостат отматывает 270° за время выпечки */
+.oven-panel { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 3px; }
+.oven-dial {
+  position: relative; flex: none; width: 16px; height: 16px; border-radius: 50%;
+  background: linear-gradient(180deg, #dcc08f, #8a6a3c);
+  border: 1px solid rgba(0, 0, 0, 0.5);
+  transform: rotate(calc(-135deg + var(--bake) * 270deg));
+  transition: transform 0.6s cubic-bezier(0.3, 1.4, 0.5, 1);
+}
+.oven-dial::after {
+  content: ''; position: absolute; left: 50%; top: 2px; width: 2px; height: 6px;
+  margin-left: -1px; background: #2b1a08; border-radius: 1px;
+}
+.oven-tier { font-size: 13px; }
+.oven-readout {
+  flex: 1; text-align: right;
+  font-family: var(--font-display); font-weight: 800; font-size: 13px;
+  letter-spacing: 0.06em; color: var(--glaze);
+  text-shadow: 0 0 10px rgba(240, 166, 59, 0.5);
+}
+.oven-scene.idle .oven-readout { color: var(--hint); text-shadow: none; }
+
+/* пар над открытой печью */
+.oven-steam { position: absolute; left: 0; right: 0; top: 18px; height: 78px; pointer-events: none; }
+.oven-steam i {
+  position: absolute; bottom: 0; width: 8px; height: 22px; border-radius: 50%;
+  background: linear-gradient(180deg, rgba(255, 240, 215, 0.55), transparent);
+  filter: blur(2.5px); animation: steamRise 2.8s ease-out infinite;
+}
+@keyframes steamRise {
+  0% { transform: translateY(10px) scale(0.7); opacity: 0; }
+  30% { opacity: 0.8; }
+  100% { transform: translateY(-52px) scale(1.5); opacity: 0; }
+}
+
 .oven-caption {
   margin-top: 10px; font-family: var(--font-display); font-weight: 700;
   font-size: 14px; color: var(--glaze);

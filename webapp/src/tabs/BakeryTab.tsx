@@ -1,6 +1,8 @@
 // Пекарня: заказы — полноценный режим игры со своей вкладкой.
-// Сцена печи: idle (выбор заказа) -> baking (печенья едут в печь) -> ready (сундук).
-import { useEffect, useState } from 'react'
+// Сцена печи: idle (пусто) -> baking (тесто румянится) -> ready (дверца открыта).
+// Печь и есть индикатор прогресса: --bake = progress/goal ведёт жар, тесто,
+// стрелку термостата и пар, поэтому отдельная полоска прогресса не нужна.
+import { CSSProperties, useEffect, useState } from 'react'
 import { api, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
@@ -88,6 +90,8 @@ export default function BakeryTab() {
   if (!orders) return null
   const active = orders.active
   const mode = active ? (active.done ? 'ready' : 'baking') : 'idle'
+  // степень готовности: 0 — сырое тесто, 1 — печенье готово
+  const bake = active ? (active.done ? 1 : Math.min(1, active.progress / active.goal)) : 0
 
   return (
     <div>
@@ -100,29 +104,58 @@ export default function BakeryTab() {
         </div>
       </div>
 
-      {/* --- сцена печи --- */}
-      <div className={'oven-scene ' + mode}>
-        {/* конвейер печенек к печи — крутится, пока заказ печётся */}
-        {mode === 'baking' && (
-          <div className="oven-belt">
-            {[0, 1, 2].map((i) => (
-              <span key={i} className="belt-cookie" style={{ animationDelay: `${i * 1.1}s` }}>
-                🍪
-              </span>
+      {/* --- сцена печи: готовая печь тапабельна целиком --- */}
+      <div
+        className={'oven-scene ' + mode}
+        style={{ '--bake': bake } as CSSProperties}
+        role={mode === 'ready' ? 'button' : undefined}
+        tabIndex={mode === 'ready' ? 0 : undefined}
+        onClick={mode === 'ready' ? claimOrder : undefined}
+        onKeyDown={(e) => {
+          if (mode === 'ready' && (e.key === 'Enter' || e.key === ' ')) claimOrder()
+        }}
+      >
+        <div className="oven-unit">
+          <div className="oven-cavity">
+            <div className="oven-rack" />
+            {active && (
+              <div className="bake-item">
+                <span className="bake-baked" />
+                <span className="bake-raw" />
+                <span className="bake-chips" />
+              </div>
+            )}
+            <div className="oven-heat">
+              {[
+                { left: '20%', animationDelay: '0s' },
+                { left: '47%', animationDelay: '1.1s' },
+                { left: '72%', animationDelay: '2.2s' },
+              ].map((st, i) => (
+                <i key={i} style={st} />
+              ))}
+            </div>
+          </div>
+          <div className="oven-glass" />
+          <div className="oven-panel">
+            <span className="oven-dial" />
+            {active && <span className="oven-tier">{DIFF_CHEST[active.difficulty]}</span>}
+            <span className="oven-readout">
+              {mode === 'idle' ? '—' : `${Math.round(bake * 100)}%`}
+            </span>
+          </div>
+        </div>
+        <div className="oven-spill" />
+        {mode === 'ready' && (
+          <div className="oven-steam">
+            {[
+              { left: '44%', animationDelay: '0s' },
+              { left: '50%', animationDelay: '0.9s' },
+              { left: '56%', animationDelay: '1.7s' },
+            ].map((st, i) => (
+              <i key={i} style={st} />
             ))}
           </div>
         )}
-        <div className="oven-body">
-          <div className="oven-door">
-            {mode === 'ready' ? (
-              <span className="oven-chest" onClick={claimOrder}>
-                {DIFF_CHEST[active!.difficulty]}
-              </span>
-            ) : (
-              <span className="oven-fire">{mode === 'baking' ? '🔥' : '💤'}</span>
-            )}
-          </div>
-        </div>
         <div className="oven-caption">
           {mode === 'idle' && t('bakery_pick')}
           {mode === 'baking' && t('bakery_baking')}
@@ -139,11 +172,9 @@ export default function BakeryTab() {
               {orderText(active)}{' '}
               <span style={{ color: 'var(--accent)' }}>{DIFF_STARS[active.difficulty]}</span>
             </b>
+            {/* прогресс показывает сама печь — здесь только награда */}
             <div className="hint">
               🎁 🍪 {fmt(active.reward_cookies)} · 🎖️ {fmt(active.reward_bp_xp)} XP
-            </div>
-            <div className="progress-bar" style={{ marginTop: 5 }}>
-              <div style={{ width: `${Math.min(100, (active.progress / active.goal) * 100)}%` }} />
             </div>
           </div>
           <button className="claim-chip" disabled={!active.done} onClick={claimOrder}>
