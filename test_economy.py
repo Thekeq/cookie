@@ -717,6 +717,65 @@ check("8g.6 баланс победителя сходится с книгой",
       abs(ec.reconcile(S1_)["cookies"]["drift"]) < 1e-6, ec.reconcile(S1_)["cookies"])
 
 # ==========================================================================
+# 8h. Stars-покупка выдаётся один раз, и переход статуса решает база
+# ==========================================================================
+PU = BASE + 16
+db.create_user(PU, "pu", "PU")
+
+
+def paid_row(cid, item="cookies_pack"):
+    db.exec("DELETE FROM purchases WHERE tg_payment_id = ?", (cid,))
+    db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+            "status, created_at) VALUES (?, ?, 75, ?, 'paid', ?)",
+            (PU, item, cid, time.time()))
+
+
+CID = f"charge-econ-{PU}"
+paid_row(CID)
+before = db.get_user(PU)["cookies"]
+check("8h.1 покупка выдана", gl.fulfill_charge(CID) is True)
+granted = db.get_user(PU)["cookies"] - before
+check("8h.2 печеньки начислены", granted > 0, granted)
+check("8h.3 движение помечено токеном платежа",
+      len([r for r in ledger(PU, "cookies")
+           if r["operation_id"] == f"purchase:{CID}"]) == 1)
+check("8h.4 статус стал fulfilled",
+      db.q1("SELECT status FROM purchases WHERE tg_payment_id = ?",
+            (CID,))["status"] == "fulfilled")
+
+check("8h.5 повторная выдача отбита охраной статуса",
+      gl.fulfill_charge(CID) is False)
+check("8h.6 ...и ничего не начислила",
+      abs(db.get_user(PU)["cookies"] - (before + granted)) < 1e-6)
+
+# статус вернули в 'paid' руками — охрана пропустит, и держит уже только книга
+db.exec("UPDATE purchases SET status = 'paid' WHERE tg_payment_id = ?", (CID,))
+check("8h.7 без охраны статуса второе начисление держит книга",
+      gl.fulfill_charge(CID) is True)
+check("8h.8 ...и денег не добавилось",
+      abs(db.get_user(PU)["cookies"] - (before + granted)) < 1e-6,
+      db.get_user(PU)["cookies"])
+check("8h.9 строка в книге по-прежнему одна",
+      len([r for r in ledger(PU, "cookies")
+           if r["operation_id"] == f"purchase:{CID}"]) == 1)
+
+check("8h.10 возврат оформлен", gl.revoke_charge(CID) is True)
+check("8h.11 повторный возврат — no-op", gl.revoke_charge(CID) is False)
+check("8h.12 возврат по несуществующему платежу — no-op",
+      gl.revoke_charge("charge-nope") is False)
+check("8h.13 выдача после возврата не проходит", gl.fulfill_charge(CID) is False)
+
+# compare-and-set: статус уехал между чтением и записью
+paid_row(CID + "-b", "boost_x2_1h")
+gl.fulfill_charge(CID + "-b")
+db.exec("UPDATE purchases SET status = 'refunded' WHERE tg_payment_id = ?",
+        (CID + "-b",))
+check("8h.14 уже возвращённое не возвращается второй раз",
+      gl.revoke_charge(CID + "-b") is False)
+
+check("8h.15 пустой charge_id не выдаёт ничего", gl.fulfill_charge("") is False)
+
+# ==========================================================================
 # 9. drift_report ловит запись мимо книги
 # ==========================================================================
 D = BASE + 8

@@ -1797,35 +1797,51 @@ def _revoke_purchase_effect(user_id: int, item_key: str):
 
 def revoke_charge(charge_id: str) -> bool:
     """Возврат звёзд: снимаем выданное и помечаем покупку 'refunded'.
-    Идемпотентно — повторный refund ничего не меняет."""
+    Идемпотентно — повторный refund ничего не меняет.
+
+    Переход статуса — compare-and-set по ТОМУ ЖЕ значению, которое мы прочитали
+    и на котором приняли решение откатывать эффект. Раньше UPDATE стоял без
+    охраны: между чтением 'paid' и записью 'refunded' успевала пройти выдача, и
+    возврат оформлялся, не сняв только что выданное. Не сошлось — перечитываем
+    и решаем заново по актуальному статусу."""
     with db.tx():
-        row = db.q1("SELECT user_id, item_key, status FROM purchases "
-                    "WHERE tg_payment_id = ?", (charge_id,))
-        if not row or row["status"] == "refunded":
-            return False
-        if row["status"] == "fulfilled":
-            _revoke_purchase_effect(row["user_id"], row["item_key"])
-        db.exec("UPDATE purchases SET status = 'refunded' WHERE tg_payment_id = ?",
-                (charge_id,))
-        return True
+        for _ in range(2):
+            row = db.q1("SELECT user_id, item_key, status FROM purchases "
+                        "WHERE tg_payment_id = ?", (charge_id,))
+            if not row or row["status"] == "refunded":
+                return False
+            if db.exec("UPDATE purchases SET status = 'refunded' "
+                       "WHERE tg_payment_id = ? AND status = ?",
+                       (charge_id, row["status"])) == 0:
+                continue                     # статус уехал под нами
+            if row["status"] == "fulfilled":
+                _revoke_purchase_effect(row["user_id"], row["item_key"])
+            return True
+        return False
 
 
-def _apply_purchase_effect(user_id: int, item_key: str):
-    """Применяет эффект купленного товара. Вызывается внутри db.tx()."""
+def _apply_purchase_effect(user_id: int, item_key: str, charge_id: str = ""):
+    """Применяет эффект купленного товара. Вызывается внутри db.tx().
+
+    `charge_id` идёт в токен операции: один платёж — одно движение денег, даже
+    если выдачу когда-нибудь позовут в обход охраны статуса."""
     effect = cfg.SHOP_ITEMS[item_key][3]
+    op = f"purchase:{charge_id}" if charge_id else None
     if effect["type"] == "cookies":
         if "income_hours" in effect:
             amount = max(effect["min_amount"],
                          hourly_income(user_id) * effect["income_hours"])
         else:
             amount = effect["amount"]
-        add_cookies(user_id, amount, count_earned=False)
+        add_cookies(user_id, amount, count_earned=False, operation_id=op,
+                    reason="purchase_cookies")
     elif effect["type"] == "energy_full":
         # именно energy_cap, а не cfg.max_energy: иначе купленный за Stars
         # «полный бак» игнорировал апгрейды energy_cap_* и недоливал до 750.
         # Выдаём бак целиком: клэмп в grant_energy всё равно доведёт ровно до
         # потолка, а в книгу ляжет фактически влившееся
-        grant_energy(user_id, energy_cap(db.get_user(user_id)), "energy_stars_full")
+        grant_energy(user_id, energy_cap(db.get_user(user_id)),
+                     "energy_stars_full", operation_id=op)
     elif effect["type"] == "boost":
         db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
                 (user_id, effect["key"], time.time() + effect["hours"] * 3600))
@@ -1839,15 +1855,24 @@ def _apply_purchase_effect(user_id: int, item_key: str):
 
 
 def fulfill_charge(charge_id: str) -> bool:
-    """Выдаёт оплаченную покупку по charge_id. Статус перечитывается УЖЕ
-    внутри BEGIN IMMEDIATE: два worker'а не выдадут одно и то же дважды.
-    Возвращает True, если выдали сейчас; False — уже было выдано/нет записи."""
+    """Выдаёт оплаченную покупку по charge_id.
+    Возвращает True, если выдали сейчас; False — уже было выдано/нет записи.
+
+    Право на выдачу забирается ПЕРВЫМ стейтментом: 'paid' -> 'fulfilled' под
+    охраной статуса, и только выигравший rowcount применяет эффект. Раньше
+    статус читался, потом применялся эффект, и только потом записывался новый
+    статус — два worker'а (или webhook и /auth, а они приходят вплотную) успевали
+    прочитать 'paid' оба и выдать товар дважды.
+
+    Промежуточное 'fulfilled' перед проверкой «а есть ли что выдавать» наружу не
+    видно: всё внутри одной транзакции, и в 'void' строка уезжает до коммита."""
     if not charge_id:
         return False
     with db.tx():
-        row = db.q1("SELECT user_id, item_key, status FROM purchases "
-                    "WHERE tg_payment_id = ?", (charge_id,))
-        if not row or row["status"] != "paid":
+        row = db.q1w("UPDATE purchases SET status = 'fulfilled' "
+                     "WHERE tg_payment_id = ? AND status = 'paid' "
+                     "RETURNING user_id, item_key", (charge_id,))
+        if row is None:
             return False
         # Товар исчез из конфига или уже куплен навсегда — выдать нечего.
         # Раньше такая строка вечно висела в 'paid': fulfill_pending перебирал
@@ -1857,9 +1882,7 @@ def fulfill_charge(charge_id: str) -> bool:
             db.exec("UPDATE purchases SET status = 'void' WHERE tg_payment_id = ?",
                     (charge_id,))
             return False
-        _apply_purchase_effect(row["user_id"], row["item_key"])
-        db.exec("UPDATE purchases SET status = 'fulfilled' WHERE tg_payment_id = ?",
-                (charge_id,))
+        _apply_purchase_effect(row["user_id"], row["item_key"], charge_id)
         return True
 
 
