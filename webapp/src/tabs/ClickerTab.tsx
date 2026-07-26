@@ -123,6 +123,11 @@ export default function ClickerTab() {
   const frenzy = state.boosts.find((b) => b.key === 'golden_frenzy')
   const tut = state.tutorial
 
+  // потолок прокачки клика привязан к уровню игрока — кнопка должна
+  // объяснять это заранее, а не отдавать ошибку по тапу
+  const clickCapped = state.click_max_level != null
+    && state.user.click_level >= state.click_max_level
+
   const ev = state.event
   const evLeft = ev ? Math.max(0, ev.ends_at - Date.now() / 1000) : 0
 
@@ -218,12 +223,22 @@ export default function ClickerTab() {
           <div>
             <b>{t('click_power')} · {state.user.click_level}</b>
             <div className="hint">
-              {t('next_level_click')}: +{state.user.click_level + 1} {t('per_click')}
+              {/* показываем реальную силу следующего уровня, а не «+N»:
+                  она растёт экспоненциально, и +1 было прямой дезинформацией */}
+              {clickCapped
+                ? t('click_capped')
+                : `${t('next_level_click')}: 🍪 ${fmt(state.user.click_power_next ?? 0)} ${t('per_click')}`}
             </div>
           </div>
         </div>
-        <button className="btn" disabled={liveBalance < state.user.click_upgrade_cost} onClick={upgrade}>
-          {t('upgrade_for')} 🍪 {fmt(state.user.click_upgrade_cost)}
+        <button
+          className="btn"
+          disabled={clickCapped || liveBalance < state.user.click_upgrade_cost}
+          onClick={upgrade}
+        >
+          {clickCapped
+            ? t('click_capped_btn')
+            : `${t('upgrade_for')} 🍪 ${fmt(state.user.click_upgrade_cost)}`}
         </button>
       </div>
     </div>

@@ -6,6 +6,7 @@ import { unlockAudio } from './sound'
 import Onboarding from './Onboarding'
 import DailyModal from './DailyModal'
 import OfflineModal from './OfflineModal'
+import WhatsNew, { markWhatsNewSeen, shouldShowWhatsNew } from './WhatsNew'
 import ClickerTab from './tabs/ClickerTab'
 import MergeTab from './tabs/MergeTab'
 import BakeryTab from './tabs/BakeryTab'
@@ -71,6 +72,9 @@ function Game() {
   // оффлайн-доход показываем модалкой: тост про «+N» рядом с уже выросшим
   // балансом читался как «написали, но не начислили»
   const [offlineIncome, setOfflineIncome] = useState(0)
+  // экран «что нового»: игрок узнавал об изменениях баланса, натыкаясь
+  // на другие числа — теперь один раз на версию ему это проговаривают
+  const [showWhatsNew, setShowWhatsNew] = useState(shouldShowWhatsNew())
   // живой баланс: тикает каждую секунду со скоростью фермы + пассивки мерджа
   const [liveCookies, setLiveCookies] = useState(0)
   // энергия тикает так же — иначе шапка стоит мёртвой до ответа сервера
@@ -325,8 +329,11 @@ function Game() {
         {offlineIncome > 1 && (
           <OfflineModal amount={offlineIncome} onClose={() => setOfflineIncome(0)} />
         )}
-        {offlineIncome <= 1 && state.daily?.can_claim && !dailyShown && (
+        {offlineIncome <= 1 && !showWhatsNew && state.daily?.can_claim && !dailyShown && (
           <DailyModal daily={state.daily} onClose={() => setDailyShown(true)} />
+        )}
+        {showWhatsNew && offlineIncome <= 1 && (
+          <WhatsNew onClose={() => { markWhatsNewSeen(); setShowWhatsNew(false) }} />
         )}
       </div>
     </GameCtx.Provider>

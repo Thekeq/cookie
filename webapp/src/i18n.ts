@@ -38,6 +38,8 @@ const dict = {
   click_power: { en: 'Click power', uk: 'Сила кліку', ru: 'Сила клика' },
   next_level_click: { en: 'Next level', uk: 'Наступний рівень', ru: 'Следующий уровень' },
   upgrade_for: { en: 'Upgrade for', uk: 'Прокачати за', ru: 'Прокачать за' },
+  click_capped: { en: 'Level up to upgrade the click further', uk: 'Візьми новий рівень, щоб качати далі', ru: 'Возьми новый уровень, чтобы качать дальше' },
+  click_capped_btn: { en: 'Cap reached', uk: 'Межу досягнуто', ru: 'Достигнут потолок' },
   click_upgraded: { en: 'Click power upgraded! 💪', uk: 'Силу кліку прокачано! 💪', ru: 'Сила клика прокачана! 💪' },
 
   // merge
@@ -224,6 +226,27 @@ const dict = {
   event_night_shift: { en: 'Night Shift', uk: 'Нічна зміна', ru: 'Ночная смена' },
   event_banner: { en: 'x{m} to everything you bake', uk: 'x{m} до всього, що печеш', ru: 'x{m} ко всему, что печёшь' },
   event_ends: { en: 'ends in {n}', uk: 'лишилось {n}', ru: 'осталось {n}' },
+
+  // престиж: модалка вместо системного confirm
+  cancel: { en: 'Not yet', uk: 'Ще ні', ru: 'Пока нет' },
+  prestige_modal_hint: { en: 'You will gain {n} prestige points. This cannot be undone.', uk: 'Ти отримаєш {n} очок престижу. Це не скасувати.', ru: 'Ты получишь {n} очков престижа. Отменить нельзя.' },
+  prestige_lose: { en: 'Burns down', uk: 'Згорає', ru: 'Сгорает' },
+  prestige_keep: { en: 'Stays', uk: 'Лишається', ru: 'Остаётся' },
+  prestige_lose_cookies: { en: 'Cookies', uk: 'Печиво', ru: 'Печеньки' },
+  prestige_keep_level: { en: 'Level {a} of {b}', uk: 'Рівень {a} з {b}', ru: 'Уровень {a} из {b}' },
+  prestige_confirm_btn: { en: 'Fire up a new bakery', uk: 'Розпалити нову пекарню', ru: 'Растопить новую печь' },
+  prestige_burning: { en: 'Cooling down…', uk: 'Вистигає…', ru: 'Остывает…' },
+
+  // экран «что нового»
+  whats_new_title: { en: "What's new", uk: 'Що нового', ru: 'Что нового' },
+  whats_new_ok: { en: 'Got it', uk: 'Зрозуміло', ru: 'Понятно' },
+
+  // пункты «что нового» — на языке игрока, не разработчика
+  wn_click: { en: 'Click upgrades keep paying off now — power grows exponentially instead of +1 per level', uk: 'Прокачка кліку тепер окупається — сила росте експоненційно, а не на +1 за рівень', ru: 'Прокачка клика снова окупается: сила растёт экспоненциально, а не на +1 за уровень' },
+  wn_merge: { en: 'Merging always raises income — past level 12 it used to lower it by 15%', uk: 'Злиття завжди підвищує дохід — вище 12 рівня воно знижувало його на 15%', ru: 'Слияние всегда повышает доход — выше 12 уровня оно его снижало на 15%' },
+  wn_recipe: { en: 'Set the dough before you leave: a bigger offline bonus for coming back on time', uk: 'Постав опару перед виходом: більший офлайн-бонус за вчасне повернення', ru: 'Поставь закваску перед выходом: больше оффлайн-дохода, если вернёшься вовремя' },
+  wn_event: { en: 'Weekend events multiply everything you bake', uk: 'Івенти вихідних множать усе, що ти печеш', ru: 'Ивенты выходных множат всё, что ты печёшь' },
+  wn_rewards: { en: 'Daily, achievement and level rewards scale with your income instead of going stale', uk: 'Щоденні нагороди, ачівки та рівні масштабуються з доходом', ru: 'Дейлики, ачивки и награды за уровни масштабируются с доходом и больше не обесцениваются' },
 
   // серверные ошибки (коды err_* из API, параметр после |)
   err_no_user: { en: 'Open the app via the bot (/start)', uk: 'Відкрий застосунок через бота (/start)', ru: 'Открой приложение через бота (/start)' },

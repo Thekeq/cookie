@@ -218,4 +218,24 @@ export function unlockAudio() {
   ensureCtx()
   loadSamples()
   startMusic()
+  bindVisibility()
+}
+
+// Свёрнутое приложение продолжало играть музыку в фоне: вебвью не всегда
+// глушит Web Audio сам, и игрок слышал наш луп поверх чужой музыки, не
+// понимая, откуда он. Останавливаем на уход и возвращаем на возврат.
+let visibilityBound = false
+
+function bindVisibility() {
+  if (visibilityBound) return
+  visibilityBound = true
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      stopMusic()
+      ctx?.suspend?.()
+    } else {
+      ctx?.resume?.()
+      if (musicOn) startMusic()
+    }
+  })
 }

@@ -1569,6 +1569,10 @@ def full_state(user_id: int) -> dict:
             "energy_regen": cfg.ENERGY_REGEN_PER_SEC + eff["energy_regen"],
             "click_level": user["click_level"],
             "click_power": cfg.click_power(user["click_level"]) * click_multiplier(user_id),
+            # сила СЛЕДУЮЩЕГО уровня приходит с сервера: она растёт
+            # экспоненциально, и клиентское «+1 за уровень» дезинформировало
+            "click_power_next": (cfg.click_power(user["click_level"] + 1)
+                                 * click_multiplier(user_id)),
             "click_upgrade_cost": cfg.click_upgrade_cost(user["click_level"]),
             "total_clicks": user["total_clicks"],
             "total_merges": user["total_merges"],

@@ -738,6 +738,49 @@ input.field:focus { border-color: var(--accent); }
 }
 .oven-scene.idle .oven-caption { color: var(--hint); }
 
+.wn-list { display: flex; flex-direction: column; gap: 10px; }
+.wn-row { display: flex; gap: 10px; align-items: flex-start; font-size: 13.5px; line-height: 1.4; }
+.wn-ico { font-size: 20px; flex: none; width: 26px; text-align: center; }
+
+/* ---------- престиж: сцена вместо системного confirm ---------- */
+.prestige-modal { text-align: center; }
+.prestige-scene {
+  display: flex; align-items: center; justify-content: center; gap: 14px;
+  font-size: 40px; margin-bottom: 10px;
+}
+.prestige-old { filter: grayscale(0.7); opacity: 0.7; }
+.prestige-arrow { font-size: 20px; color: var(--hint); }
+.prestige-new { animation: sparkPulse 1.8s ease-in-out infinite; }
+.prestige-gain {
+  font-family: var(--font-display); font-weight: 800; font-size: 34px;
+  color: var(--glaze); text-shadow: 0 0 18px rgba(240, 166, 59, 0.5);
+}
+.prestige-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+.prestige-col {
+  background: var(--card); border: 1px solid var(--card-edge);
+  border-radius: 12px; padding: 9px; font-size: 12px; text-align: left;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.prestige-col.lose { border-color: rgba(232, 122, 109, 0.3); }
+.prestige-col.keep { border-color: rgba(127, 217, 138, 0.3); }
+.prestige-col-t {
+  font-family: var(--font-display); font-weight: 700; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px;
+}
+.prestige-col.lose .prestige-col-t { color: var(--bad); }
+.prestige-col.keep .prestige-col-t { color: var(--good); }
+/* подтверждение: старая печь остывает, новая разгорается */
+.prestige-modal.burning .prestige-old { animation: oldFade 0.9s ease forwards; }
+.prestige-modal.burning .prestige-new { animation: newFlare 0.9s ease forwards; }
+@keyframes oldFade {
+  to { opacity: 0; transform: scale(0.5) translateY(14px); filter: grayscale(1); }
+}
+@keyframes newFlare {
+  0% { transform: scale(1); }
+  60% { transform: scale(1.9); filter: drop-shadow(0 0 26px rgba(255, 217, 138, 0.9)); }
+  100% { transform: scale(1.4); filter: drop-shadow(0 0 16px rgba(255, 217, 138, 0.7)); }
+}
+
 /* ---------- ивент выходных: баннер над кликером ---------- */
 .event-banner {
   display: flex; align-items: center; gap: 10px; width: 100%;

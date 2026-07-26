@@ -11,6 +11,8 @@ export interface UserState {
   energy_regen?: number
   click_level: number
   click_power: number
+  /** сила следующего уровня — считает сервер, кривая экспоненциальная */
+  click_power_next?: number
   click_upgrade_cost: number
   total_clicks: number
   total_merges: number
@@ -150,6 +152,9 @@ export interface GameState {
     min_earned: number
     can_prestige: boolean
     mult_per_point: number
+    /** что останется после перерождения — видно ДО нажатия кнопки */
+    kept_level?: number
+    next_multiplier?: number
   }
 }
 

@@ -7,6 +7,7 @@ import {
 } from '../sound'
 import type { Achievement, RefMilestone } from '../types'
 import { useBusy } from '../useBusy'
+import PrestigeModal from '../PrestigeModal'
 
 // username бота для реф-ссылок; при деплое поменяй на своего
 const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
@@ -81,10 +82,14 @@ export default function ProfileTab() {
     }
   }
 
+  // window.confirm для необратимого действия — чужой шрифт, чужие кнопки и
+  // ни слова о том, что сгорит, а что останется. Заменено сценой-модалкой.
+  const [prestigeAsk, setPrestigeAsk] = useState(false)
+
   const doPrestige = async () => {
     const p = state.prestige
     if (!p?.can_prestige) return
-    if (!window.confirm(t('prestige_confirm', { n: p.gain_available }))) return
+    setPrestigeAsk(false)
     try {
       const s = await api.post('/api/prestige')
       hapticSuccess()
@@ -233,7 +238,7 @@ export default function ProfileTab() {
           </div>
         )}
         {state.prestige?.can_prestige ? (
-          <button className="btn" onClick={doPrestige}>
+          <button className="btn" onClick={() => setPrestigeAsk(true)}>
             {t('prestige_gain', { n: state.prestige.gain_available })} ✨
           </button>
         ) : (
@@ -300,6 +305,17 @@ export default function ProfileTab() {
           )}
         </div>
       ))}
+
+      {prestigeAsk && state.prestige && (
+        <PrestigeModal
+          points={state.prestige.gain_available}
+          multiplier={state.prestige.next_multiplier ?? state.prestige.multiplier}
+          keptLevel={state.prestige.kept_level ?? 1}
+          level={state.user.level}
+          onConfirm={doPrestige}
+          onClose={() => setPrestigeAsk(false)}
+        />
+      )}
     </div>
   )
 }
