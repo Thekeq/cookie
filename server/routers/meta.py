@@ -138,11 +138,10 @@ async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
         if promo["reward_cookies"]:
             gl.add_cookies(tg["id"], promo["reward_cookies"], count_earned=False)
         if promo["reward_energy"]:
-            user = gl.refresh_energy(db.get_user(tg["id"]))
-            # клэмп по потолку: излишек всё равно срезался бы первым
+            # клэмп по потолку теперь внутри grant_energy, и он считается от
+            # фактического остатка: излишек всё равно срезался бы первым
             # refresh_energy, и игрок молча терял выданное
-            db.update_user(tg["id"], energy=min(gl.energy_cap(user),
-                                                user["energy"] + promo["reward_energy"]))
+            gl.grant_energy(tg["id"], promo["reward_energy"], "energy_promo")
     return {"reward_cookies": promo["reward_cookies"], "reward_energy": promo["reward_energy"],
             "cookies": db.get_user(tg["id"])["cookies"]}
 
@@ -217,10 +216,7 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
         if reward["cookies"]:
             gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
         if reward.get("energy"):
-            fresh = gl.refresh_energy(db.get_user(tg["id"]))
-            # клэмп по потолку: излишек срезал бы первый же refresh_energy
-            db.update_user(tg["id"], energy=min(gl.energy_cap(fresh),
-                                                fresh["energy"] + reward["energy"]))
+            gl.grant_energy(tg["id"], reward["energy"], "energy_bp_reward")
     return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}
 
 

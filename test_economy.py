@@ -6,11 +6,12 @@
   3. после обычной сессии сумма движений СХОДИТСЯ с колонкой — а если кто-то
      напишет мимо книги, сверка это покажет.
 
-Известные незакрытые дыры (сознательно, каждая — свой шаг плана): реген и трата
-энергии в книгу не пишутся вовсе, xp/bp_xp ещё не переведены на ledger (S7-S8),
-сброс престижа обнуляет cookies напрямую (S14), отзыв покупки за Stars списывает
-напрямую (S17). Поэтому drift сверяется по cookies и total_earned — по тем
-валютам, которые УЖЕ полностью в книге.
+Известные незакрытые дыры (сознательно, каждая — свой шаг плана): сброс престижа
+обнуляет cookies напрямую (S14), отзыв покупки за Stars списывает напрямую (S17).
+Реген и трата энергии не пишутся в книгу и не будут — энергия производная от
+времени, а не запас (см. LEDGERED_PARTIAL); в книгу идут только её выдачи.
+Поэтому drift сверяется по cookies, xp и total_earned — по тем валютам, которые
+УЖЕ полностью в книге.
 """
 import hashlib
 import hmac
@@ -486,6 +487,135 @@ u = db.get_user(N)
 check("8c.3 новый день сбрасывает счётчик в единицу",
       u["orders_day_count"] == 1 and u["orders_day"] == "1970-01-01")
 check("8c.4 всего выполненных не сбрасывается днём", u["orders_completed"] == 1)
+
+# ==========================================================================
+# 8d. Энергия: реген в SQL, выдачи в книгу, трата от фактического остатка
+# ==========================================================================
+E = BASE + 11
+db.create_user(E, "e", "E")
+CAP = gl.energy_cap(db.get_user(E))
+PER = cfg.ENERGY_PER_CLICK
+
+# --- реген
+db.update_user(E, energy=0.0, energy_updated_at=time.time() - 100)
+u = gl.refresh_energy(db.get_user(E))
+want = 100 * cfg.ENERGY_REGEN_PER_SEC
+check("8d.1 реген начислен за прошедшее время", abs(u["energy"] - want) < 2.0,
+      f"{u['energy']} вместо ~{want}")
+check("8d.2 ...и записан в базу", abs(db.get_user(E)["energy"] - u["energy"]) < 1e-6)
+
+db.update_user(E, energy=0.0, energy_updated_at=time.time() - 100_000)
+u = gl.refresh_energy(db.get_user(E))
+check("8d.3 реген упирается в бак, а не переливает", u["energy"] == float(CAP),
+      u["energy"])
+
+# метка в будущем = параллельный запрос уже досчитал энергию за нас
+db.update_user(E, energy=10.0, energy_updated_at=time.time() + 600)
+u = gl.refresh_energy(db.get_user(E))
+check("8d.4 метка из будущего не даёт начислить интервал второй раз",
+      u["energy"] == 10.0 and db.get_user(E)["energy"] == 10.0, u["energy"])
+
+# NULL в метке: раньше такой аккаунт просто не регенерировал бы никогда
+db.exec("UPDATE users SET energy = 5.0, energy_updated_at = NULL WHERE user_id = ?",
+        (E,))
+u = gl.refresh_energy(db.get_user(E))
+check("8d.5 NULL в метке не отравляет выражение", u["energy"] == 5.0, u["energy"])
+check("8d.6 ...и метка проставляется", db.get_user(E)["energy_updated_at"] is not None)
+
+# --- выдачи
+db.update_user(E, energy=0.0, energy_updated_at=time.time())
+before_rows = len(ledger(E, "energy"))
+new = gl.grant_energy(E, 200.0, "energy_promo")
+check("8d.7 выдача долила ровно сколько просили", abs(new - 200.0) < 0.5, new)
+rows = ledger(E, "energy")
+check("8d.8 выдача попала в книгу", len(rows) == before_rows + 1
+      and rows[-1]["reason"] == "energy_promo" and abs(rows[-1]["amount"] - 200.0) < 0.5)
+
+new = gl.grant_energy(E, 10_000.0, "energy_bp_reward")
+check("8d.9 выдача сверх бака срезана по потолку", new == float(CAP), new)
+rows = ledger(E, "energy")
+check("8d.10 в книге записан ФАКТ, а не запрошенное",
+      abs(rows[-1]["amount"] - (CAP - 200.0)) < 0.5, rows[-1]["amount"])
+
+n_rows = len(ledger(E, "energy"))
+new = gl.grant_energy(E, 500.0, "energy_stars_full")
+check("8d.11 выдача в полный бак ничего не меняет", new == float(CAP))
+check("8d.12 ...и не пишет строку на ноль", len(ledger(E, "energy")) == n_rows)
+
+check("8d.13 нулевая выдача — no-op", gl.grant_energy(E, 0.0, "energy_promo") == float(CAP))
+raises("8d.14 NaN в выдаче ловится до SQL",
+       lambda: gl.grant_energy(E, float("nan"), "energy_promo"),
+       ValueError, "err_bad_amount")
+
+# идемпотентность: тот же токен не доливает второй раз
+db.update_user(E, energy=0.0, energy_updated_at=time.time())
+op = f"test:energy:{E}"
+first = gl.grant_energy(E, 100.0, "energy_promo", operation_id=op)
+second = gl.grant_energy(E, 100.0, "energy_promo", operation_id=op)
+check("8d.15 повтор токена не доливает",
+      abs(first - 100.0) < 0.5 and second == first,
+      f"{first} / {second}")
+check("8d.16 ...и не удваивает строку в книге",
+      len([r for r in ledger(E, "energy") if r["operation_id"] == op]) == 1)
+
+# --- трата под клики
+db.update_user(E, energy=100.0, energy_updated_at=time.time())
+check("8d.17 хватает энергии — оплачены все клики",
+      gl.spend_energy_clicks(E, 40) == 40)
+check("8d.18 ...и списано ровно за них",
+      abs(db.get_user(E)["energy"] - (100.0 - 40 * PER)) < 1e-6,
+      db.get_user(E)["energy"])
+
+db.update_user(E, energy=7.0 * PER, energy_updated_at=time.time())
+paid = gl.spend_energy_clicks(E, 50)
+check("8d.19 не хватает — оплачено столько, на сколько хватило", paid == 7, paid)
+check("8d.20 ...и энергия не ушла в минус", db.get_user(E)["energy"] >= 0,
+      db.get_user(E)["energy"])
+
+db.update_user(E, energy=0.0, energy_updated_at=time.time())
+check("8d.21 пустой бак — ни одного оплаченного клика",
+      gl.spend_energy_clicks(E, 50) == 0)
+check("8d.22 нулевой батч не трогает базу", gl.spend_energy_clicks(E, 0) == 0
+      and db.get_user(E)["energy"] == 0.0)
+
+# два батча вплотную не могут оплатиться из одного и того же остатка
+db.update_user(E, energy=30.0 * PER, energy_updated_at=time.time())
+a = gl.spend_energy_clicks(E, 20)
+b = gl.spend_energy_clicks(E, 20)
+check("8d.23 два батча вплотную суммарно не превышают бак", a + b == 30,
+      f"{a} + {b}")
+
+check("8d.24 трата энергии в книгу не пишется — она обратная сторона регена",
+      all(r["amount"] > 0 for r in ledger(E, "energy")))
+check("8d.25 энергия по-прежнему вне сверки", "energy" not in ec.reconcile(E))
+
+# ==========================================================================
+# 8e. Окно античита копится в SQL и не восстанавливается двумя батчами вплотную
+# ==========================================================================
+W = BASE + 12
+db.create_user(W, "w", "W")
+t0 = time.time()
+gl.bump_click_window(W, "2030-01-01", 30, t0)
+u = db.get_user(W)
+check("8e.1 первый батч получает полный запас минус свои клики",
+      abs(u["cps_allowance"] - (cfg.MAX_CPS * 3 - 30)) < 1e-6, u["cps_allowance"])
+check("8e.2 клики посчитаны", u["total_clicks"] == 30 and u["clicks_day_count"] == 30)
+
+gl.bump_click_window(W, "2030-01-01", 30, t0)  # тот же момент времени
+u = db.get_user(W)
+check("8e.3 батч вплотную не намерил себе допуск заново",
+      abs(u["cps_allowance"] - (cfg.MAX_CPS * 3 - 60)) < 1e-6, u["cps_allowance"])
+check("8e.4 ...и клики сложились, а не затёрлись", u["clicks_day_count"] == 60)
+
+gl.bump_click_window(W, "2030-01-01", 0, t0 + 10)
+u = db.get_user(W)
+check("8e.5 за 10 секунд окно упирается в трёхсекундный запас",
+      abs(u["cps_allowance"] - cfg.MAX_CPS * 3) < 1e-6, u["cps_allowance"])
+
+gl.bump_click_window(W, "2030-01-02", 5, t0 + 20)
+u = db.get_user(W)
+check("8e.6 новый день сбрасывает дневной счётчик, но не общий",
+      u["clicks_day_count"] == 5 and u["total_clicks"] == 65, dict(u)["clicks_day_count"])
 
 # ==========================================================================
 # 9. drift_report ловит запись мимо книги

@@ -505,16 +505,136 @@ def energy_cap(user: dict, eff: dict | None = None) -> int:
 
 
 def refresh_energy(user: dict) -> dict:
-    """Доначисляет энергию по прошедшему времени. Возвращает свежего юзера."""
+    """Доначисляет энергию по прошедшему времени. Возвращает свежего юзера.
+
+    И прошедшее время, и сложение считает база. Раньше и то и другое брали из
+    прочитанного заранее словаря: два запроса игрока, пришедшие вплотную (а на
+    активной игре они идут вплотную постоянно), читали одну и ту же
+    `energy_updated_at` и оба записывали энергию «как будто трат не было» —
+    списанные клики возвращались игроку сами.
+
+    `energy_updated_at <= now` — не оптимизация, а защита от отката времени:
+    если параллельный запрос уже досчитал энергию до более поздней метки, наш
+    UPDATE не проходит вовсе, вместо того чтобы начислить тот же интервал
+    второй раз. Тогда возвращаем то, что прочитали, — оно не хуже.
+
+    Реген в книгу не пишется намеренно: он производная от времени, а не минт
+    (см. LEDGERED_PARTIAL)."""
     now = time.time()
-    eff = upgrade_effects(user["user_id"])
+    uid = user["user_id"]
+    eff = upgrade_effects(uid)
     cap = energy_cap(user, eff)
     regen = cfg.ENERGY_REGEN_PER_SEC + eff["energy_regen"]
-    elapsed = max(0, now - (user["energy_updated_at"] or now))
-    energy = min(cap, user["energy"] + elapsed * regen)
-    db.update_user(user["user_id"], energy=energy, energy_updated_at=now)
-    user = dict(user, energy=energy, energy_updated_at=now)
-    return user
+    # COALESCE обязателен: NULL в метке отравил бы всё выражение, LEAST(cap, NULL)
+    # дал бы NULL, а охрана перестала бы срабатывать — энергия встала бы навсегда
+    row = db.q1w(
+        f"UPDATE users SET "
+        f"energy = {db.LEAST}(?, energy + (? - COALESCE(energy_updated_at, ?)) * ?), "
+        f"energy_updated_at = ? "
+        f"WHERE user_id = ? AND COALESCE(energy_updated_at, 0) <= ? "
+        f"RETURNING energy, energy_updated_at",
+        (cap, now, now, regen, now, uid, now))
+    return dict(user, **row) if row else user
+
+
+def grant_energy(user_id: int, amount: float, reason: str,
+                 operation_id: str | None = None) -> float:
+    """Доливает энергию с клэмпом по потолку. Возвращает новое значение.
+
+    Клэмп обязателен и раньше стоял в питоне на каждом вызывающем: без него
+    выданный сверх бака излишек всё равно срезал бы первый же `refresh_energy`,
+    и игрок молча терял часть награды. Теперь он в SQL и, значит, считается от
+    фактического остатка, а не от прочитанного.
+
+    В отличие от регена, выдача — это минт, и она пишется в книгу: по ней видно,
+    сколько энергии зашло за Stars, за промокод и за пасс. Записываем ФАКТ, то
+    есть сколько влилось после клэмпа, а не сколько просили.
+
+    `operation_id` делает выдачу идемпотентной: повтор ничего не доливает."""
+    amount = economy._sane(amount, "grant_energy")
+    if amount <= 0:
+        return db.get_user(user_id)["energy"]
+    op = operation_id or economy.auto_op(user_id, reason)
+    with db.tx():
+        if operation_id and economy.already_recorded(operation_id, "energy"):
+            return db.get_user(user_id)["energy"]
+        # сперва доначисляем реген: иначе клэмп сравнивал бы бак с устаревшим
+        # остатком и срезал бы выдачу сильнее, чем нужно
+        before = refresh_energy(db.get_user(user_id))
+        row = db.q1w(f"UPDATE users SET energy = {db.LEAST}(?, energy + ?), "
+                     f"user_revision = user_revision + 1 "
+                     f"WHERE user_id = ? RETURNING energy",
+                     (energy_cap(before), amount, user_id))
+        if row is None:
+            raise ValueError("err_no_user")
+        moved = row["energy"] - before["energy"]
+        if moved:
+            economy.record(user_id, "energy", moved, reason, row["energy"], op)
+        return row["energy"]
+
+
+def bump_click_window(user_id: int, day: str, clicks: int, now: float):
+    """Счётчики кликов и окно античита — одним относительным UPDATE.
+
+    Окно CPS тут важнее счётчиков: это античит, и потерянный апдейт в нём значит,
+    что второй батч намерил себе допуск заново — ровно то, чего добивается
+    автокликер, присылая батчи вплотную. Раньше и накопление окна, и вычитание
+    кликов считались в питоне от заранее прочитанного словаря.
+
+    Зовётся и при отказе (clicks=0): иначе батч, отбитый пустой энергией,
+    оставлял бы окно нетронутым, и допуск копился бы, пока энергия не вернётся."""
+    db.exec(
+        "UPDATE users SET "
+        "total_clicks = total_clicks + ?, "
+        "clicks_day = ?, "
+        "clicks_day_count = CASE WHEN clicks_day = ? THEN clicks_day_count + ? "
+        "                        ELSE ? END, "
+        # окно копится со скоростью MAX_CPS от своей же прошлой метки и упирается
+        # в трёхсекундный запас; пустая метка = первый батч, ему дают полный запас
+        f"cps_allowance = {db.LEAST}(?, CASE WHEN COALESCE(cps_ts, 0) = 0 THEN ? "
+        f"                                  ELSE cps_allowance + (? - cps_ts) * ? "
+        f"                             END) - ?, "
+        "cps_ts = ?, "
+        "user_revision = user_revision + 1 "
+        "WHERE user_id = ?",
+        (clicks, day, day, clicks, clicks,
+         cfg.MAX_CPS * 3, cfg.MAX_CPS * 3, now, cfg.MAX_CPS, clicks,
+         now, user_id))
+
+
+def spend_energy_clicks(user_id: int, clicks: int) -> int:
+    """Списывает энергию под клики и возвращает, сколько кликов ОПЛАЧЕНО.
+
+    Число оплаченных кликов теперь определяет база. Раньше его считали от
+    заранее прочитанной энергии (`min(clicks, energy // ENERGY_PER_CLICK)`), и
+    два батча, пришедшие вплотную, оба мерили один и тот же остаток: второй
+    батч играл бесплатно. Именно этим и пользуется автокликер — он и присылает
+    батчи вплотную.
+
+    Охрана `energy >= ?` не проходит только если энергию сняли параллельно; на
+    этот случай пересчитываем лимит по фактическому остатку и пробуем ещё раз.
+    Двух попыток достаточно: вторая идёт от значения, прочитанного уже внутри
+    транзакции. Не сошлось и там — клики не оплачены, это честнее, чем выдать
+    награду в долг.
+
+    В книгу не пишем: расход энергии — обратная сторона регена, а он в книгу
+    не идёт (см. LEDGERED_PARTIAL)."""
+    per = cfg.ENERGY_PER_CLICK
+    with db.tx():
+        for _ in range(2):
+            if clicks <= 0:
+                return 0
+            need = clicks * per
+            if db.exec("UPDATE users SET energy = energy - ?, "
+                       "user_revision = user_revision + 1 "
+                       "WHERE user_id = ? AND energy >= ?",
+                       (need, user_id, need)):
+                return clicks
+            row = db.q1("SELECT energy FROM users WHERE user_id = ?", (user_id,))
+            if not row:
+                return 0
+            clicks = int(min(clicks, row["energy"] // per))
+        return 0
 
 
 # ---------- бусты ----------
@@ -1642,10 +1762,10 @@ def _apply_purchase_effect(user_id: int, item_key: str):
         add_cookies(user_id, amount, count_earned=False)
     elif effect["type"] == "energy_full":
         # именно energy_cap, а не cfg.max_energy: иначе купленный за Stars
-        # «полный бак» игнорировал апгрейды energy_cap_* и недоливал до 750
-        user = db.get_user(user_id)
-        db.update_user(user_id, energy=energy_cap(user),
-                       energy_updated_at=time.time())
+        # «полный бак» игнорировал апгрейды energy_cap_* и недоливал до 750.
+        # Выдаём бак целиком: клэмп в grant_energy всё равно доведёт ровно до
+        # потолка, а в книгу ляжет фактически влившееся
+        grant_energy(user_id, energy_cap(db.get_user(user_id)), "energy_stars_full")
     elif effect["type"] == "boost":
         db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
                 (user_id, effect["key"], time.time() + effect["hours"] * 3600))

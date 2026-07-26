@@ -145,12 +145,16 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
         allowance = min(cfg.MAX_CPS * 3, allowance + (now - last_ts) * cfg.MAX_CPS)
         clicks = int(min(clicks, allowance))
 
-        # энергия
-        clicks = int(min(clicks, user["energy"] // cfg.ENERGY_PER_CLICK))
+        # энергия: сколько кликов оплачено, решает база, а не прочитанный выше
+        # словарь — иначе два батча вплотную оба мерят один остаток
+        clicks = gl.spend_energy_clicks(tg["id"], clicks)
         if clicks <= 0:
-            db.update_user(tg["id"], cps_ts=now, cps_allowance=allowance)
+            # окно всё равно двигаем: иначе отказ из-за пустой энергии копил бы
+            # допуск, и следующий батч прошёл бы поверх лимита
+            gl.bump_click_window(tg["id"], gl._utc_day(now), 0, now)
+            fresh = db.get_user(tg["id"])
             return {"accepted": 0, "earned": 0, "combo": gl.current_combo(user),
-                    "energy": user["energy"], "cookies": user["cookies"]}
+                    "energy": fresh["energy"], "cookies": fresh["cookies"]}
 
         combo = gl.update_combo(user, clicks, now)
         earned = (clicks * cfg.click_power(user["click_level"], gl.income_base(tg["id"]))
@@ -162,13 +166,7 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
         under_cap = max(0, min(clicks, cfg.CLICK_XP_SOFT_CAP - day_count))
         xp = under_cap * cfg.CLICK_XP_RATE + (clicks - under_cap) * cfg.CLICK_XP_RATE_CAPPED
 
-        db.update_user(
-            tg["id"],
-            energy=user["energy"] - clicks * cfg.ENERGY_PER_CLICK,
-            total_clicks=user["total_clicks"] + clicks,
-            clicks_day=today, clicks_day_count=day_count + clicks,
-            cps_ts=now, cps_allowance=allowance - clicks,
-        )
+        gl.bump_click_window(tg["id"], today, clicks, now)
         gl.add_cookies(tg["id"], earned)
         gl.add_xp(tg["id"], xp)
         gl.quest_progress(tg["id"], "clicks", clicks)
@@ -444,8 +442,7 @@ async def claim_level(tg: dict = Depends(tg_user)):
         gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
         if reward.get("full_refill"):
             fresh = db.get_user(tg["id"])
-            db.update_user(tg["id"], energy=gl.energy_cap(fresh),
-                           energy_updated_at=time.time())
+            gl.grant_energy(tg["id"], gl.energy_cap(fresh), "energy_level_refill")
     state = gl.full_state(tg["id"])
     state["level_up"] = {"level": nxt, "reward": reward}
     return state
