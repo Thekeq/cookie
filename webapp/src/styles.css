@@ -738,6 +738,17 @@ input.field:focus { border-color: var(--accent); }
 }
 .oven-scene.idle .oven-caption { color: var(--hint); }
 
+/* ---------- экран ошибки: тупик должен иметь выход ---------- */
+.error-emoji { font-size: 54px; animation: errorWobble 2.4s ease-in-out infinite; }
+@keyframes errorWobble {
+  0%, 100% { transform: rotate(-4deg); }
+  50% { transform: rotate(4deg); }
+}
+.error-text {
+  font-size: 15px; padding: 0 30px; text-align: center;
+  color: var(--text); max-width: 340px;
+}
+
 /* ---------- доступность: без анимаций по запросу системы ---------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

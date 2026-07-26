@@ -5,6 +5,7 @@ import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxFanfare } from '../sound'
 import type { Quest } from '../types'
+import { useBusy } from '../useBusy'
 
 const METRIC_ICO: Record<string, string> = {
   clicks: '👆', merges: '🧩', spawns: '🍪', buildings: '🏭', earned: '💰', make_item: '⭐',
@@ -27,7 +28,9 @@ export default function QuestsTab() {
     load()
   }, [])
 
-  const claim = async (key: string) => {
+  const { busy, run } = useBusy()
+
+  const claim = (key: string) => run(key, async () => {
     try {
       const r = await api.post('/api/quests/claim', { key })
       hapticSuccess()
@@ -39,7 +42,7 @@ export default function QuestsTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const reroll = async (key: string) => {
     try {
@@ -84,7 +87,8 @@ export default function QuestsTab() {
               <div style={{ width: `${(q.progress / q.goal) * 100}%` }} />
             </div>
           </div>
-          <button className="claim-chip" disabled={!q.done || q.claimed} onClick={() => claim(q.key)}>
+          <button className="claim-chip" disabled={!q.done || q.claimed || busy === q.key}
+                  onClick={() => claim(q.key)}>
             {q.claimed ? '✓' : `${fmt(q.progress)}/${fmt(q.goal)}`}
           </button>
         </div>

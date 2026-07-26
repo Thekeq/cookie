@@ -14,7 +14,25 @@ from bot.handlers import start, payments
 from bot.notifier import run_notifier
 from server.routers import game, meta, admin, farm
 
-logging.basicConfig(level=logging.WARNING)
+# Логи: раньше был только basicConfig(WARNING) в stdout, то есть про поломку
+# владелец узнавал от игроков. Теперь INFO с ротацией в файл — журнал платежей,
+# ролловеров и бэкапов сохраняется между рестартами.
+LOG_FILE = os.getenv("LOG_FILE", "cookie.log")
+_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    from logging.handlers import RotatingFileHandler
+    _handlers.append(RotatingFileHandler(LOG_FILE, maxBytes=5_000_000,
+                                         backupCount=3, encoding="utf-8"))
+except OSError:
+    pass  # нет прав на запись — работаем только в stdout, но не падаем
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=_handlers,
+)
+# aiogram/uvicorn на INFO слишком болтливы — оставляем им WARNING
+for noisy in ("aiogram.event", "aiogram.dispatcher", "uvicorn.access", "httpx"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # В проде docs/openapi не нужны: схема выдаёт наружу все ручки, включая
 # /api/admin/*, вместе с формой тел запросов — удобная карта для перебора

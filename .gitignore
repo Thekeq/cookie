@@ -25,3 +25,5 @@ webapp/dist/
 
 # служебное: локальные скрипты аудита/дампов базы
 temp_*.py
+cookie.log*
+backups/

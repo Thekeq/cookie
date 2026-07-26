@@ -82,6 +82,23 @@ def _prune_events():
             (time.time() - cfg.EVENTS_TTL_DAYS * 86400,))
 
 
+_last_backup = 0.0
+
+
+def _backup_db():
+    """Ежедневный горячий снимок базы. Бэкапов не было вообще: единственная
+    копия создавалась один раз перед dedup-миграцией, и любое повреждение
+    файла означало потерю всего прогресса всех игроков."""
+    global _last_backup
+    now = time.time()
+    if now - _last_backup < cfg.BACKUP_INTERVAL_H * 3600:
+        return
+    path = db.snapshot(keep=cfg.BACKUP_KEEP)
+    _last_backup = now
+    if path:
+        log.info("бэкап базы: %s", path)
+
+
 def _prune_boosts():
     """Истёкшие бусты не удалялись никогда, а строка добавляется на каждую
     золотую печеньку. active_boosts читается из click_multiplier на КАЖДЫЙ
@@ -112,7 +129,8 @@ async def run_notifier(bot):
         # уведомлению и увидит несброшенный сезонный прогресс
         for name, job in (("season rollover", _rollover_seasons),
                           ("events prune", _prune_events),
-                          ("boosts prune", _prune_boosts)):
+                          ("boosts prune", _prune_boosts),
+                          ("db backup", _backup_db)):
             try:
                 job()
             except Exception:

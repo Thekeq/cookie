@@ -8,6 +8,7 @@ class DataBase:
     def __init__(self, db_file=None):
         # путь можно переопределить (тесты используют временную БД)
         db_file = db_file or os.environ.get("DATABASE_PATH", "data.db")
+        self.db_file = db_file
         # timeout=10 говорит базе: если занято, подожди 10 сек, а не падай сразу
         self.connection = sqlite3.connect(db_file, check_same_thread=False, timeout=10)
         # автокоммит на каждый statement; многошаговые операции — явно через tx()
@@ -288,6 +289,32 @@ class DataBase:
             print(f"[*] Миграция: найдены дубли, бэкап сохранён в {path}")
         finally:
             dest.close()
+
+    def snapshot(self, keep: int = 7) -> str | None:
+        """Горячий бэкап базы через sqlite backup API.
+
+        Никаких бэкапов не было вообще — единственная копия делалась один раз
+        перед dedup-миграцией. sqlite3.backup корректно работает на живой базе
+        в WAL-режиме, поэтому останавливать сервис не нужно.
+        Старые снимки чистим, оставляя последние `keep`."""
+        if self.db_file == ":memory:":
+            return None
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.db_file)), "backups")
+        os.makedirs(folder, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        path = os.path.join(folder, f"{os.path.basename(self.db_file)}.{stamp}.bak")
+        dest = sqlite3.connect(path)
+        try:
+            self.connection.backup(dest)
+        finally:
+            dest.close()
+        old = sorted(f for f in os.listdir(folder) if f.endswith(".bak"))
+        for name in old[:-keep]:
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+        return path
 
     def _dedupe_and_unique(self, db_file: str):
         """Схлопывает дубли С УЧЁТОМ ДАННЫХ (ферма — суммируем количество,

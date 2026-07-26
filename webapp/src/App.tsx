@@ -73,13 +73,19 @@ function Game() {
   const [offlineIncome, setOfflineIncome] = useState(0)
   // живой баланс: тикает каждую секунду со скоростью фермы + пассивки мерджа
   const [liveCookies, setLiveCookies] = useState(0)
+  // энергия тикает так же — иначе шапка стоит мёртвой до ответа сервера
+  const [liveEnergy, setLiveEnergy] = useState(0)
   // предикт кликов: тапы падают сюда мгновенно, сервер подтверждает батчем
   const [clickDelta, setClickDelta] = useState(0)
 
+  // таймер тоста живёт в ref: без этого второй тост гасился таймером первого
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const toast = useCallback((text: string, err = false) => {
     setToastMsg({ text, err })
-    setTimeout(() => setToastMsg(null), 2500)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToastMsg(null), 2500)
   }, [])
+  useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
 
   const refresh = useCallback(async () => {
     const s = await api.get('/api/state')
@@ -170,12 +176,38 @@ function Game() {
     return () => clearInterval(timer)
   }, [state?.farm?.cps, state?.passive_per_hour])
 
+  // энергия тоже восстанавливается на глазах: раньше число в шапке стояло
+  // мёртвым до ответа сервера, и «подожди, пока накопится» выглядело как баг
+  useEffect(() => {
+    if (!state) return
+    const regen = state.user.energy_regen || 0
+    if (regen <= 0) return
+    const timer = setInterval(() => setLiveEnergy((v) => v + regen), 1000)
+    return () => clearInterval(timer)
+  }, [state?.user.energy_regen])
+  useEffect(() => setLiveEnergy(0), [state?.user.energy])
+
   // сервер знает правду: раз в 30 сек синкаем накопленное (collect в /api/state)
   useEffect(() => {
     if (!state || showOnboarding) return
     const timer = setInterval(() => refresh().catch(() => {}), 30_000)
     return () => clearInterval(timer)
   }, [state !== null, showOnboarding, refresh])
+
+  // Возврат в приложение. Свёрнутый вебвью душит таймеры, поэтому 30-секундный
+  // синк не срабатывает, и игрок возвращался к устаревшему экрану: баланс,
+  // энергия и заказы показывали состояние на момент сворачивания.
+  useEffect(() => {
+    if (!state || showOnboarding) return
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        flushClicks().catch(() => {})
+        refresh().catch(() => {})
+      }
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [state !== null, showOnboarding, refresh, flushClicks])
 
   // при любом обновлении стейта с сервера локальная прибавка обнуляется:
   // серверный баланс уже включает и пассивку, и подтверждённые клики
@@ -184,8 +216,9 @@ function Game() {
     setClickDelta(0)
   }, [state?.user.cookies])
 
-  useEffect(() => {
-    api
+  const bootstrap = useCallback(() => {
+    setError('')
+    return api
       .post('/api/auth')
       .then((s: GameState) => {
         setState(s)
@@ -195,6 +228,10 @@ function Game() {
         api.get('/api/admin/stats').then(() => setIsAdmin(true)).catch(() => {})
       })
       .catch((e) => setError(e instanceof ApiError ? te(e.detail) : t('open_in_tg')))
+  }, [toast, t, te])
+
+  useEffect(() => {
+    bootstrap()
   }, [])
 
   // браузер разрешает звук только после первого жеста — ловим его один раз
@@ -207,11 +244,17 @@ function Game() {
     return () => window.removeEventListener('pointerdown', unlock)
   }, [])
 
+  // Экран ошибки с выходом: раньше обрыв сети на старте оставлял игрока
+  // наедине с грустным смайликом, и единственным способом продолжить было
+  // закрыть и открыть приложение заново
   if (error)
     return (
       <div className="loading-screen">
-        <span>😕</span>
-        <div style={{ fontSize: 15, padding: '0 30px', textAlign: 'center' }}>{error}</div>
+        <span className="error-emoji">🥠</span>
+        <div className="error-text">{error}</div>
+        <button className="btn" style={{ maxWidth: 220 }} onClick={() => bootstrap()}>
+          {t('retry')}
+        </button>
       </div>
     )
   if (!state)
@@ -243,6 +286,8 @@ function Game() {
 
   // единая правда для всех вкладок: шапка и кликер показывают одно число
   const liveBalance = state.user.cookies + liveCookies + clickDelta
+  // энергия не может перелиться через потолок — сервер её всё равно срежет
+  const liveEnergyShown = Math.min(state.user.max_energy, state.user.energy + liveEnergy)
 
   return (
     <GameCtx.Provider
@@ -253,7 +298,7 @@ function Game() {
         <div className="header">
           <div className="balance">🍪 {fmt(liveBalance)}</div>
           <div className="lvl">
-            ⚡ {Math.floor(state.user.energy)}/{state.user.max_energy} · {t('level')}{' '}
+            ⚡ {Math.floor(liveEnergyShown)}/{state.user.max_energy} · {t('level')}{' '}
             {state.user.level}
           </div>
         </div>

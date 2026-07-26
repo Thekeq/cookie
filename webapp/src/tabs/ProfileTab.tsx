@@ -6,6 +6,7 @@ import {
   isMusicOn, isSfxOn, sfxBuy, sfxError, sfxFanfare, toggleMusic, toggleSfx,
 } from '../sound'
 import type { Achievement, RefMilestone } from '../types'
+import { useBusy } from '../useBusy'
 
 // username бота для реф-ссылок; при деплое поменяй на своего
 const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
@@ -36,7 +37,9 @@ export default function ProfileTab() {
     load()
   }, [lang])
 
-  const claimAch = async (key: string) => {
+  const { busy, run } = useBusy()
+
+  const claimAch = (key: string) => run(key, async () => {
     try {
       const r = await api.post('/api/achievements/claim', { key })
       hapticSuccess()
@@ -48,7 +51,7 @@ export default function ProfileTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const claimMilestone = async (key: string) => {
     try {
@@ -290,7 +293,8 @@ export default function ProfileTab() {
               {t('share_ach')}
             </button>
           ) : (
-            <button className="claim-chip" disabled={!a.done} onClick={() => claimAch(a.key)}>
+            <button className="claim-chip" disabled={!a.done || busy === a.key}
+                    onClick={() => claimAch(a.key)}>
               {`🍪 ${fmt(a.reward)}`}
             </button>
           )}

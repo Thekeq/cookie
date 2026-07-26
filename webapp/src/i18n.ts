@@ -26,6 +26,8 @@ const dict = {
   offline_text: { en: 'The bakery kept working and baked cookies for you', uk: 'Пекарня працювала й напекла тобі печива', ru: 'Пекарня работала и напекла тебе печенек' },
   offline_ok: { en: 'Nice! 🍪', uk: 'Чудово! 🍪', ru: 'Отлично! 🍪' },
   open_in_tg: { en: 'Open the app from Telegram', uk: 'Відкрий застосунок з Telegram', ru: 'Открой приложение из Telegram' },
+  retry: { en: 'Try again', uk: 'Спробувати ще раз', ru: 'Попробовать снова' },
+  waiting_purchase: { en: 'Delivering your purchase…', uk: 'Видаємо покупку…', ru: 'Выдаём покупку…' },
   level: { en: 'Level', uk: 'Рівень', ru: 'Уровень' },
 
   // кликер

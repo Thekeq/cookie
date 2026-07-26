@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import { api, openInvoice } from '../api'
 import { fmt, useGame } from '../App'
 import { LangCtx, useT, useTErr } from '../i18n'
@@ -22,23 +22,43 @@ export default function ShopTab() {
   const te = useTErr()
   const { lang } = useContext(LangCtx)
   const [items, setItems] = useState<ShopItem[]>([])
+  const [busy, setBusy] = useState<string | null>(null)
+  const timers = useRef<ReturnType<typeof setTimeout>[]>([])
+
+  const loadItems = () => api.get('/api/shop').then((r) => setItems(r.items)).catch(() => {})
 
   // товары локализует сервер — при смене языка перезапрашиваем
   useEffect(() => {
-    api.get('/api/shop').then((r) => setItems(r.items))
+    loadItems()
   }, [lang])
+  useEffect(() => () => timers.current.forEach(clearTimeout), [])
 
   const buy = async (item: ShopItem) => {
+    if (busy) return          // второй тап не должен плодить инвойсы
+    setBusy(item.key)
     try {
       const r = await api.post('/api/shop/invoice', { item_key: item.key })
       openInvoice(r.invoice_link, () => {
         sfxBuy()
         toast(t('purchase_ok', { n: item.title }))
-        setTimeout(refresh, 1500)
+        // Выдачу делает бот по successful_payment, и она вполне может прийти
+        // позже одного refresh: раньше стоял единственный setTimeout(1500),
+        // после которого игрок видел тост «куплено», но не видел покупку.
+        // Опрашиваем несколько раз с нарастающей паузой.
+        let tries = 0
+        const poll = () => {
+          tries += 1
+          refresh().catch(() => {})
+          loadItems()
+          if (tries < 5) timers.current.push(setTimeout(poll, 1200 * tries))
+        }
+        timers.current.push(setTimeout(poll, 900))
       })
     } catch (e: any) {
       sfxError()
       toast(te(e.detail), true)
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -65,6 +85,7 @@ export default function ShopTab() {
             <button
               className="claim-chip"
               style={{ background: 'var(--accent)', color: '#2a1c05', whiteSpace: 'nowrap' }}
+              disabled={busy !== null}
               onClick={() => buy(it)}
             >
               ⭐ {it.stars}
