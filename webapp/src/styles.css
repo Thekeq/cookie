@@ -313,14 +313,16 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   fill: none; stroke: rgba(255, 224, 168, 0.14);
   stroke-width: 2; stroke-dasharray: 2 8; stroke-linecap: round;
 }
-/* полив: льётся сверху вниз при открытии вкладки */
+/* Полив: льётся сверху вниз при открытии вкладки.
+   Штрихи для анимации выставляет JS по реальной длине пути (getTotalLength).
+   Через pathLength={1} это не работает: нормализованная длина конфликтует с
+   vector-effect="non-scaling-stroke", браузер считает штрихи в экранных
+   пикселях, и полив обрывался, не доходя до текущего уровня. */
 .path-pour {
   fill: none; stroke: url(#glaze-pour);
   stroke-width: 7; stroke-linecap: round; stroke-linejoin: round;
   filter: drop-shadow(0 0 5px rgba(240, 166, 59, 0.4));
-  stroke-dasharray: 1; animation: pourGlaze 1.1s ease-out backwards;
 }
-@keyframes pourGlaze { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
 /* капля на острие полива — «ты здесь» */
 .path-drip {
   position: absolute; z-index: 1; width: 13px; height: 13px; border-radius: 50%;
@@ -837,11 +839,14 @@ input.field:focus { border-color: var(--accent); }
   animation: pulse 1.4s infinite;
 }
 .recipe-badge.burnt { color: var(--bad); border-color: rgba(232, 122, 109, 0.4); }
-.recipe-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; }
+/* Одна колонка: в двух названия на русском и украинском не помещались и
+   распирали карточку за края экрана. min-width:0 обязателен — без него
+   flex-элемент отказывается сжиматься ниже длины своего текста. */
+.recipe-list { display: flex; flex-direction: column; gap: 7px; }
 .recipe-opt {
-  display: grid; grid-template-columns: auto 1fr auto; gap: 2px 7px;
-  align-items: center; text-align: left; cursor: pointer;
-  padding: 9px 10px; border-radius: 13px;
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; text-align: left; cursor: pointer;
+  padding: 9px 11px; border-radius: 13px;
   background: var(--card); border: 1px solid var(--card-edge);
   color: var(--text); font-family: var(--font-body); font-size: 13px;
   transition: border-color 0.15s, background 0.15s;
@@ -849,12 +854,14 @@ input.field:focus { border-color: var(--accent); }
 .recipe-opt:disabled { opacity: 0.42; cursor: default; }
 .recipe-opt.active { border-color: var(--accent); background: rgba(240, 166, 59, 0.12); }
 .recipe-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.recipe-ico { font-size: 20px; grid-row: span 2; }
-.recipe-name { font-weight: 600; }
+.recipe-ico { font-size: 21px; flex: none; }
+.recipe-text { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+.recipe-name { font-weight: 600; overflow-wrap: anywhere; }
+.recipe-time { font-size: 11px; color: var(--hint); overflow-wrap: anywhere; }
 .recipe-mult {
-  font-family: var(--font-display); font-weight: 800; color: var(--accent); font-size: 13px;
+  flex: none; white-space: nowrap;
+  font-family: var(--font-display); font-weight: 800; color: var(--accent); font-size: 14px;
 }
-.recipe-time { grid-column: 2 / span 2; font-size: 10.5px; color: var(--hint); }
 
 /* ---------- экран ошибки: тупик должен иметь выход ---------- */
 .error-emoji { font-size: 54px; animation: errorWobble 2.4s ease-in-out infinite; }

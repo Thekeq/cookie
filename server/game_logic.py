@@ -753,7 +753,9 @@ def recipes_available(user: dict) -> list[dict]:
     for key, r in cfg.RECIPES.items():
         need = cfg.RECIPE_REQ_LEVEL.get(key, 1)
         out.append({"key": key, "hours": r["hours"], "mult": r["mult"],
-                    "window_h": r["hours"] * r["window"],
+                    # округляем: 6.0 * 1.6 в double даёт 9.600000000000001,
+                    # и это число уходило прямо в интерфейс
+                    "window_h": round(r["hours"] * r["window"], 1),
                     "req_level": need, "unlocked": user["level"] >= need})
     return out
 

@@ -13,6 +13,7 @@ export default function LevelsTab() {
   const [path, setPath] = useState<LevelNode[] | null>(null)
   const [claimable, setClaimable] = useState<number | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
+  const clipRef = useRef<SVGRectElement>(null)
 
   const load = () =>
     api.get('/api/levels').then((r) => {
@@ -31,6 +32,25 @@ export default function LevelsTab() {
       el?.scrollIntoView({ block: 'center' })
     }
   }, [path])
+
+  // Анимация «глазурь льётся» сделана ОБРЕЗКОЙ, а не штрихами.
+  //
+  // Через stroke-dasharray она ломалась: при vector-effect="non-scaling-stroke"
+  // браузер считает штрихи в экранных пикселях, а длина пути живёт в
+  // координатах viewBox, который растянут по горизонтали и не растянут по
+  // вертикали. Числа не сходились, и полив обрывался, не доходя до текущего
+  // уровня. Прямоугольник обрезки живёт в тех же user-координатах, что и
+  // тропинка, поэтому от растяжения не зависит вовсе.
+  useEffect(() => {
+    const el = clipRef.current
+    if (!el) return
+    const h = trailHeight(path?.length || 0)
+    el.style.transition = 'none'
+    el.style.transform = `translateY(${-h}px)`
+    void el.getBoundingClientRect()   // форсируем layout между состояниями
+    el.style.transition = 'transform 1.1s ease-out'
+    el.style.transform = 'translateY(0)'
+  }, [path, state.user.level, state.user.xp])
 
   const claim = async () => {
     try {
@@ -55,10 +75,20 @@ export default function LevelsTab() {
     )
 
   const nextXp = state.user.xp_next
-  // докуда дотёк полив: индекс текущего уровня + доля набранного XP
+  // Докуда дотёк полив: индекс текущего уровня + доля XP ВНУТРИ этого уровня.
+  // Раньше здесь стояло xp / xp_next, но xp_for_level кумулятивен: у игрока,
+  // только что взявшего 8-й уровень, эта дробь равна 0.76, а не 0 — полив
+  // уезжал почти к следующему узлу, не отражая реальный прогресс.
   const curIdx = Math.max(0, path.findIndex((n) => n.level === state.user.level))
-  const xpFrac = nextXp ? Math.min(1, state.user.xp / nextXp) : 1
+  const curXp = path[curIdx]?.xp_required ?? 0
+  const nextNodeXp = path[curIdx + 1]?.xp_required
+  const xpFrac = nextNodeXp && nextNodeXp > curXp
+    ? Math.min(1, Math.max(0, (state.user.xp - curXp) / (nextNodeXp - curXp)))
+    : 1
   const trail = buildTrail(path.length, curIdx + xpFrac)
+  // прогресс внутри уровня — тот же расчёт, что и у полива, чтобы полоска
+  // в карточке и тропинка не показывали разные числа
+  const xpPct = Math.round(xpFrac * 100)
 
   return (
     <div>
@@ -72,7 +102,7 @@ export default function LevelsTab() {
         </div>
         {nextXp && (
           <div className="progress-bar">
-            <div style={{ width: `${Math.min(100, (state.user.xp / nextXp) * 100)}%` }} />
+            <div style={{ width: `${xpPct}%` }} />
           </div>
         )}
         {claimable && (
@@ -98,10 +128,15 @@ export default function LevelsTab() {
               <stop offset="0" style={{ stopColor: 'var(--accent2)' }} />
               <stop offset="1" style={{ stopColor: 'var(--glaze)' }} />
             </linearGradient>
+            {/* окно обрезки едет сверху вниз — глазурь как будто наливается */}
+            <clipPath id="glaze-clip" clipPathUnits="userSpaceOnUse">
+              <rect ref={clipRef} x={-20} y={0} width={140}
+                    height={trailHeight(path.length)} />
+            </clipPath>
           </defs>
           <path className="path-trail" d={trail.full} vectorEffect="non-scaling-stroke" />
-          <path className="path-pour" d={trail.poured} vectorEffect="non-scaling-stroke"
-                pathLength={1} />
+          <path className="path-pour" d={trail.poured} clipPath="url(#glaze-clip)"
+                vectorEffect="non-scaling-stroke" />
         </svg>
         {/* капля на острие полива — «ты здесь» */}
         <span className="path-drip"

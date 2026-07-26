@@ -103,6 +103,9 @@ export default function RecipePanel() {
         <div className="hint" style={{ marginBottom: 8 }}>{t('recipe_hint')}</div>
       )}
 
+      {/* Список в одну колонку. В две названия рецептов на русском и
+          украинском («Классический хлеб», «Святковий торт») не помещались
+          и распирали карточку за края экрана. */}
       <div className="recipe-list">
         {recipes.map((r) => (
           <button
@@ -112,12 +115,14 @@ export default function RecipePanel() {
             onClick={() => choose(r.key)}
           >
             <span className="recipe-ico">{ICON[r.key] || '🍪'}</span>
-            <span className="recipe-name">{t(`recipe_${r.key}` as any)}</span>
-            <span className="recipe-mult">x{r.mult.toFixed(2)}</span>
-            <span className="recipe-time">
-              {r.unlocked ? t('recipe_window', { a: r.hours, b: r.window_h })
-                          : t('req_level', { n: r.req_level })}
+            <span className="recipe-text">
+              <span className="recipe-name">{t(`recipe_${r.key}` as any)}</span>
+              <span className="recipe-time">
+                {r.unlocked ? t('recipe_window', { a: r.hours, b: r.window_h })
+                            : t('req_level', { n: r.req_level })}
+              </span>
             </span>
+            <span className="recipe-mult">x{r.mult.toFixed(2)}</span>
           </button>
         ))}
       </div>
