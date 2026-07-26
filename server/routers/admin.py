@@ -151,6 +151,27 @@ async def broadcast_status():
     return dict(_bc)
 
 
+# ---------- проблемные платежи ----------
+
+@router.get("/payments")
+async def problem_payments():
+    """Платежи, требующие ручного разбора: деньги получены, товар не выдан.
+
+    'unmatched' — платёж не сошёлся с конфигом (переименовали товар, поменяли
+    цену между pre_checkout и оплатой); 'void' — выдать нечего (товар исчез
+    или уже куплен навсегда); 'paid' старше часа — выдача не прошла."""
+    stuck = db.q(
+        "SELECT p.id, p.user_id, p.item_key, p.stars_amount, p.tg_payment_id, "
+        "       p.status, p.created_at, u.username, u.first_name "
+        "FROM purchases p LEFT JOIN users u ON u.user_id = p.user_id "
+        "WHERE p.status IN ('unmatched', 'void') "
+        "   OR (p.status = 'paid' AND p.created_at < ?) "
+        "ORDER BY p.created_at DESC LIMIT 100", (time.time() - 3600,))
+    return {"problems": stuck, "count": len(stuck),
+            "refunded": db.q1("SELECT COUNT(*) c FROM purchases "
+                              "WHERE status = 'refunded'")["c"]}
+
+
 # ---------- статистика ----------
 
 @router.get("/stats")

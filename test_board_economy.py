@@ -408,6 +408,97 @@ check("claimed quests do not advance",
                "AND quest_key IN (%s)" % ", ".join("?" * len(hit)),
                (UID, day, *[r["quest_key"] for r in hit]))))
 
+
+# ================= платежи Stars: денежные пути =================
+
+# --- премиум, купленный ПОСЛЕ смены сезона, переживает пакетный ролловер ---
+# Сброс идёт порциями по 500, и строка игрока может ещё не быть обработана.
+# Раньше безусловное bp_premium = bp_premium_next стирало свежую покупку.
+db.update_user(UID, season_id=gl.current_season() - 1, bp_premium=0, bp_premium_next=0)
+gl.grant_bp_premium(UID)
+check("premium bought mid-rollover flags carry-over",
+      db.get_user(UID)["bp_premium_next"] == 1)
+gl.finalize_seasons()
+check("premium survives the rollover",
+      db.get_user(UID)["bp_premium"] == 1 and
+      db.get_user(UID)["season_id"] == gl.current_season())
+# а премиум ПРОШЛОГО сезона без флага переноса обязан сгореть
+db.update_user(UID, season_id=gl.current_season() - 1, bp_premium=1, bp_premium_next=0)
+gl.finalize_seasons()
+check("old-season premium still expires", db.get_user(UID)["bp_premium"] == 0)
+
+# --- повторная покупка постоянного товара блокируется на сервере ---
+db.update_user(UID, bp_premium=1)
+check("repeat bp_premium blocked", gl.purchase_blocked(UID, "bp_premium") == "err_owned")
+db.update_user(UID, bp_premium=0)
+check("first bp_premium allowed", gl.purchase_blocked(UID, "bp_premium") is None)
+
+# --- оффлайн-кап: апгрейд по цене разницы ---
+db.update_user(UID, offline_bonus_hours=0)
+check("upgrade tier hidden without base",
+      gl.purchase_blocked(UID, "offline_cap_12h_up") == "err_needs_base")
+check("base tier sellable", gl.purchase_blocked(UID, "offline_cap_6h") is None)
+db.update_user(UID, offline_bonus_hours=3)
+check("upgrade tier sellable to 6h owner",
+      gl.purchase_blocked(UID, "offline_cap_12h_up") is None)
+check("base tier not sold twice",
+      gl.purchase_blocked(UID, "offline_cap_6h") == "err_owned")
+db.update_user(UID, offline_bonus_hours=9)
+check("nothing sold at top tier",
+      gl.purchase_blocked(UID, "offline_cap_12h_up") == "err_owned"
+      and gl.purchase_blocked(UID, "offline_cap_12h") == "err_owned")
+db.update_user(UID, offline_bonus_hours=0)
+
+# --- платёж, не сошедшийся с конфигом, оставляет след ---
+db.exec("DELETE FROM purchases WHERE user_id = ?", (UID,))
+gl.record_unmatched_payment(UID, "ghost_item", 250, "charge-unmatched-1", "x:ghost_item")
+row = db.q1("SELECT status, stars_amount FROM purchases WHERE tg_payment_id = ?",
+            ("charge-unmatched-1",))
+check("unmatched payment recorded",
+      row and row["status"] == "unmatched" and row["stars_amount"] == 250, str(row))
+
+# --- товар исчез из конфига: покупка помечается void, а не висит в paid ---
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'removed_item', 100, 'charge-void-1', 'paid', ?)",
+        (UID, time.time()))
+check("gone item is not fulfilled", gl.fulfill_charge("charge-void-1") is False)
+check("gone item marked void",
+      db.q1("SELECT status FROM purchases WHERE tg_payment_id = 'charge-void-1'"
+            )["status"] == "void")
+
+# --- возврат звёзд снимает выданное ---
+db.update_user(UID, bp_premium=0, bp_premium_next=0)
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'bp_premium', 100, 'charge-ref-1', 'paid', ?)",
+        (UID, time.time()))
+check("premium fulfilled", gl.fulfill_charge("charge-ref-1") is True
+      and db.get_user(UID)["bp_premium"] == 1)
+check("refund processed", gl.revoke_charge("charge-ref-1") is True)
+check("premium revoked on refund", db.get_user(UID)["bp_premium"] == 0)
+check("refund is idempotent", gl.revoke_charge("charge-ref-1") is False)
+db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'boost_x2_1h', 50, 'charge-ref-2', 'paid', ?)",
+        (UID, time.time()))
+gl.fulfill_charge("charge-ref-2")
+check("boost granted by purchase", "click_x2" in gl.active_boosts(UID))
+gl.revoke_charge("charge-ref-2")
+check("boost revoked on refund", "click_x2" not in gl.active_boosts(UID))
+
+# --- клейм заказа не платит дважды ---
+db.exec("DELETE FROM orders WHERE user_id = ?", (UID,))
+db.update_user(UID, orders_day=None, orders_day_count=0, cookies=0)
+db.exec("INSERT INTO orders (user_id, slot, template, metric, goal, progress, "
+        "status, created_at) VALUES (?, 1, 'warmup', 'clicks', 10, 10, 'active', ?)",
+        (UID, time.time()))
+gl.claim_order(db.get_user(UID))
+_paid_once = db.get_user(UID)["cookies"]
+try:
+    gl.claim_order(db.get_user(UID))
+    check("order not claimable twice", False, "второй клейм прошёл")
+except ValueError:
+    check("order not claimable twice", db.get_user(UID)["cookies"] == _paid_once)
+
 print(f"\n{ok} passed, {fail} failed")
 if fail:
     raise SystemExit(1)

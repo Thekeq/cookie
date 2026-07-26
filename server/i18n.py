@@ -39,6 +39,19 @@ T: dict[str, dict[str, str]] = {
         "uk": "✅ Покупку <b>{title}</b> активовано! Дякуємо 🍪",
         "ru": "✅ Покупка <b>{title}</b> активирована! Спасибо 🍪",
     },
+    "pay_problem": {
+        "en": "⚠️ We received your payment but could not deliver the item.\n"
+              "It is recorded — write to support and it will be refunded.",
+        "uk": "⚠️ Оплату отримано, але видати товар не вдалося.\n"
+              "Платіж записано — напиши в підтримку, зробимо повернення.",
+        "ru": "⚠️ Оплата получена, но выдать товар не удалось.\n"
+              "Платёж записан — напиши в поддержку, сделаем возврат.",
+    },
+    "pay_refunded": {
+        "en": "↩️ Stars refunded — the purchased bonus has been removed.",
+        "uk": "↩️ Зірки повернуто — куплений бонус знято.",
+        "ru": "↩️ Звёзды возвращены — купленный бонус снят.",
+    },
     # ---------- пуши ----------
     "notif_streak": {
         "en": "🔥 Your {days}-day streak burns out in a couple of hours!\n"
@@ -109,6 +122,13 @@ T: dict[str, dict[str, str]] = {
         "en": "Offline income accumulates for 12 hours instead of 3. Forever!",
         "uk": "Офлайн-дохід накопичується 12 годин замість 3. Назавжди!",
         "ru": "Оффлайн-доход копится 12 часов вместо 3. Навсегда!",
+    },
+    "shop_offline_cap_12h_up_t": {
+        "en": "Offline 12 hours", "uk": "Офлайн 12 годин", "ru": "Оффлайн 12 часов"},
+    "shop_offline_cap_12h_up_d": {
+        "en": "Extend your 6 hours to 12. You only pay the difference.",
+        "uk": "Розширити твої 6 годин до 12. Платиш лише різницю.",
+        "ru": "Расширить твои 6 часов до 12. Платишь только разницу.",
     },
     # ---------- достижения ----------
     "ach_clicks_100_t": {"en": "Warm-up", "uk": "Розминка", "ru": "Разминка"},

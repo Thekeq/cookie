@@ -12,6 +12,39 @@ from server import game_config as cfg
 db = DataBase(os.environ.get("DATABASE_PATH", "data.db"))
 
 
+# ---------- лимитер запросов ----------
+# Живёт в памяти процесса: игра работает одним процессом (бот + API + notifier
+# в общем event loop), внешнего Redis нет и заводить его ради этого не стоит.
+# Смысл — не пустить перебор промокодов и не дать одному игроку выжечь тяжёлые
+# ручки: /api/state делает под сотню SQL-запросов, а SQLite синхронный и
+# блокирует весь процесс, включая поллинг бота.
+_rate_buckets: dict[tuple[int, str], list[float]] = {}
+_RATE_GC_EVERY = 500
+_rate_calls = 0
+
+
+def check_rate_limit(user_id: int, bucket: str, limit: int, window: float):
+    """Кидает HTTP 429, если за window секунд было больше limit обращений."""
+    global _rate_calls
+    from fastapi import HTTPException
+    now = time.time()
+    key = (user_id, bucket)
+    hits = [t for t in _rate_buckets.get(key, ()) if now - t < window]
+    if len(hits) >= limit:
+        hits.append(now)
+        _rate_buckets[key] = hits
+        raise HTTPException(429, "err_too_fast")
+    hits.append(now)
+    _rate_buckets[key] = hits
+
+    # периодическая уборка: без неё словарь растёт по одному ключу на игрока
+    _rate_calls += 1
+    if _rate_calls % _RATE_GC_EVERY == 0:
+        for k, ts in list(_rate_buckets.items()):
+            if not ts or now - ts[-1] > 3600:
+                _rate_buckets.pop(k, None)
+
+
 # ---------- аналитика ----------
 
 def track(user_id: int, event: str, value: float = 0):
@@ -72,8 +105,10 @@ def finalize_seasons():
                         (season, uid, rank, earned, reward, now))
                     if reward:
                         add_cookies(uid, reward, count_earned=False)
-        # сброс сезонного прогресса порциями; премиум, купленный на стыке
-        # сезонов, переезжает в новый (bp_premium_next)
+        # Сброс сезонного прогресса порциями; премиум переезжает в новый
+        # сезон только через bp_premium_next (см. grant_bp_premium — он ставит
+        # флаг и для покупок, совершённых уже ПОСЛЕ смены сезона, пока сброс
+        # не дошёл до этой строки).
         with db.tx():
             db.exec(
                 "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
@@ -103,12 +138,21 @@ def _season_winners(season: int) -> list[tuple[int, int, float]]:
 
 
 def grant_bp_premium(user_id: int, now: float | None = None):
-    """Выдаёт premium-пасс. Если до конца сезона осталось меньше
-    BP_PREMIUM_GRACE_DAYS — премиум переносится и на следующий сезон, иначе
-    покупка за 100⭐ накануне ролловера сгорала бы почти сразу."""
+    """Выдаёт premium-пасс за 100⭐. Флаг переноса на следующий сезон ставится
+    в двух случаях, и оба — про то, чтобы покупка не сгорела:
+
+    1) до конца сезона осталось меньше BP_PREMIUM_GRACE_DAYS — иначе покупка
+       накануне ролловера обнулялась бы через несколько часов;
+    2) сезон УЖЕ сменился, но пакетный сброс (порциями по 500) ещё не дошёл
+       до этой строки — без флага ближайший чужой запрос прогнал бы её чанк
+       и стёр только что оплаченный товар. Довыдачи в этом случае не будет:
+       покупка уже помечена 'fulfilled'."""
     now = now or time.time()
     fields = {"bp_premium": 1}
-    if season_end_ts(current_season()) - now <= cfg.BP_PREMIUM_GRACE_DAYS * 86400:
+    user = db.get_user(user_id)
+    rollover_pending = bool(user) and user["season_id"] < current_season()
+    if (season_end_ts(current_season()) - now <= cfg.BP_PREMIUM_GRACE_DAYS * 86400
+            or rollover_pending):
         fields["bp_premium_next"] = 1
     db.update_user(user_id, **fields)
 
@@ -213,7 +257,11 @@ def _ensure_quest_rows(user_id: int, day: str, keys: list[str]):
                 "VALUES (?, ?, ?)", (user_id, day, key))
     if len(_quest_rows_ready) > 20_000:
         _quest_rows_ready.clear()
-    _quest_rows_ready.add((user_id, day))
+    # Кеш ставим ТОЛЬКО если вставка уже зафиксирована. Внутри чужой открытой
+    # транзакции откат удалил бы строки, а кеш продолжал бы врать, что они
+    # есть, и quest_progress молча обновлял бы ноль строк.
+    if not db._tx_depth:
+        _quest_rows_ready.add((user_id, day))
 
 
 def quest_reward_cookies(user_id: int, quest_key: str,
@@ -373,8 +421,12 @@ def claim_ref_milestone(user: dict, key: str) -> dict:
     if state["claimed"]:
         raise ValueError("err_claimed")
     with db.tx():  # отметка и награда — одним куском
-        db.exec("INSERT INTO ref_claims (user_id, milestone_key, claimed_at) VALUES (?, ?, ?)",
-                (user["user_id"], key, time.time()))
+        # INSERT OR IGNORE + rowcount: проверка claimed выше живёт вне
+        # транзакции, и два параллельных клейма прошли бы её оба
+        db.exec("INSERT OR IGNORE INTO ref_claims (user_id, milestone_key, claimed_at) "
+                "VALUES (?, ?, ?)", (user["user_id"], key, time.time()))
+        if db.cursor.rowcount == 0:
+            raise ValueError("err_claimed")
         if ms["type"] == "boost":
             db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
                     (user["user_id"], "click_x2", time.time() + ms["hours"] * 3600))
@@ -844,9 +896,13 @@ def claim_achievement(user: dict, key: str) -> float:
             if a["claimed"]:
                 raise ValueError("err_claimed")
             with db.tx():  # отметка и награда — одним куском
+                # DO UPDATE ... WHERE claimed = 0 + rowcount: без условия два
+                # параллельных клейма выдали бы награду дважды
                 db.exec("INSERT INTO achievements (user_id, key, claimed) VALUES (?, ?, 1) "
-                        "ON CONFLICT(user_id, key) DO UPDATE SET claimed = 1",
-                        (user["user_id"], key))
+                        "ON CONFLICT(user_id, key) DO UPDATE SET claimed = 1 "
+                        "WHERE claimed = 0", (user["user_id"], key))
+                if db.cursor.rowcount == 0:
+                    raise ValueError("err_claimed")
                 add_cookies(user["user_id"], a["reward"], count_earned=False)
             return a["reward"]
     raise ValueError("err_no_item")
@@ -1048,8 +1104,12 @@ def claim_order(user: dict) -> dict:
     # платим по ТЕКУЩЕМУ доходу: хранимая сумма могла быть выписана до престижа
     reward, bp_xp = order_reward(row["template"], hourly_income(uid))
     with db.tx():
+        # WHERE status = 'active' + rowcount: два параллельных клейма одного
+        # заказа иначе оба прошли бы проверку выше и заплатили дважды
         db.exec("UPDATE orders SET status = 'done', reward_cookies = ?, reward_bp_xp = ? "
-                "WHERE id = ?", (reward, bp_xp, row["id"]))
+                "WHERE id = ? AND status = 'active'", (reward, bp_xp, row["id"]))
+        if db.cursor.rowcount == 0:
+            raise ValueError("err_claimed")
         add_cookies(uid, reward, count_earned=False)
         db.update_user(uid,
                        bp_xp=db.get_user(uid)["bp_xp"] + bp_xp,
@@ -1158,6 +1218,94 @@ def claim_tutorial(user: dict) -> dict:
 
 # ---------- выдача Stars-покупок ----------
 
+def purchase_blocked(user_id: int | None, item_key: str) -> str | None:
+    """Код причины, по которой товар нельзя продать этому игроку, иначе None.
+
+    Проверяется в pre_checkout, а не после оплаты: invoice-ссылка многоразовая
+    и живёт в чате вечно, поэтому «спрятать кнопку на фронте» ничего не решает.
+    """
+    item = cfg.SHOP_ITEMS.get(item_key)
+    if not item:
+        return "err_no_item"
+    if user_id is None:
+        return None
+    effect = item[3]
+    user = db.get_user(user_id)
+    if not user:
+        return None
+    if effect["type"] == "bp_premium" and user["bp_premium"]:
+        return "err_owned"
+    if effect["type"] == "offline_cap":
+        have = offline_bonus_hours(user)
+        # младший тир поверх старшего бесполезен: эффект применяется как max()
+        if have >= effect["hours"]:
+            return "err_owned"
+        # апгрейд по цене разницы продаётся только владельцу младшего тира
+        if have < effect.get("requires_hours", 0):
+            return "err_needs_base"
+    return None
+
+
+def purchase_already_owned(user_id: int | None, item_key: str) -> bool:
+    """Товар нельзя выдать этому игроку (используется при выдаче и в магазине)."""
+    return purchase_blocked(user_id, item_key) is not None
+
+
+def record_unmatched_payment(user_id: int, item_key: str, amount: int,
+                             charge_id: str, payload: str):
+    """Оплата, которая не сходится с конфигом, всё равно должна оставить след.
+
+    Раньше такой платёж молча уходил в `return`: деньги списаны, товара нет,
+    сверить и вернуть невозможно. Строка с 'unmatched' попадает в
+    /api/admin/payments, где её видит владелец."""
+    db.exec(
+        "INSERT OR IGNORE INTO purchases (user_id, item_key, stars_amount, "
+        "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'unmatched', ?)",
+        (user_id, (item_key or payload or "")[:64], amount,
+         charge_id or None, time.time()))
+
+
+def _revoke_purchase_effect(user_id: int, item_key: str):
+    """Откат эффекта при возврате звёзд. Вызывается внутри db.tx()."""
+    effect = cfg.SHOP_ITEMS.get(item_key, {})[3] \
+        if item_key in cfg.SHOP_ITEMS else None
+    if not effect:
+        return
+    user = db.get_user(user_id)
+    if not user:
+        return
+    if effect["type"] == "cookies":
+        # снимаем ровно столько, сколько выдали бы сейчас; в минус не уводим
+        amount = max(effect.get("min_amount", 0),
+                     hourly_income(user_id) * effect.get("income_hours", 0)) \
+            if "income_hours" in effect else effect["amount"]
+        db.update_user(user_id, cookies=max(0.0, user["cookies"] - amount))
+    elif effect["type"] == "boost":
+        db.exec("DELETE FROM boosts WHERE user_id = ? AND boost_key = ?",
+                (user_id, effect["key"]))
+    elif effect["type"] == "bp_premium":
+        db.update_user(user_id, bp_premium=0, bp_premium_next=0)
+    elif effect["type"] == "offline_cap":
+        db.update_user(user_id, offline_bonus_hours=max(
+            0.0, offline_bonus_hours(user) - effect["hours"]))
+    # energy_full откатывать нечего — энергия и так расходуется
+
+
+def revoke_charge(charge_id: str) -> bool:
+    """Возврат звёзд: снимаем выданное и помечаем покупку 'refunded'.
+    Идемпотентно — повторный refund ничего не меняет."""
+    with db.tx():
+        row = db.q1("SELECT user_id, item_key, status FROM purchases "
+                    "WHERE tg_payment_id = ?", (charge_id,))
+        if not row or row["status"] == "refunded":
+            return False
+        if row["status"] == "fulfilled":
+            _revoke_purchase_effect(row["user_id"], row["item_key"])
+        db.exec("UPDATE purchases SET status = 'refunded' WHERE tg_payment_id = ?",
+                (charge_id,))
+        return True
+
+
 def _apply_purchase_effect(user_id: int, item_key: str):
     """Применяет эффект купленного товара. Вызывается внутри db.tx()."""
     effect = cfg.SHOP_ITEMS[item_key][3]
@@ -1190,11 +1338,20 @@ def fulfill_charge(charge_id: str) -> bool:
     """Выдаёт оплаченную покупку по charge_id. Статус перечитывается УЖЕ
     внутри BEGIN IMMEDIATE: два worker'а не выдадут одно и то же дважды.
     Возвращает True, если выдали сейчас; False — уже было выдано/нет записи."""
+    if not charge_id:
+        return False
     with db.tx():
         row = db.q1("SELECT user_id, item_key, status FROM purchases "
                     "WHERE tg_payment_id = ?", (charge_id,))
-        if not row or row["status"] == "fulfilled" \
-                or row["item_key"] not in cfg.SHOP_ITEMS:
+        if not row or row["status"] != "paid":
+            return False
+        # Товар исчез из конфига или уже куплен навсегда — выдать нечего.
+        # Раньше такая строка вечно висела в 'paid': fulfill_pending перебирал
+        # её на каждом /auth, каждый раз возвращал False, и никто не узнавал.
+        if row["item_key"] not in cfg.SHOP_ITEMS \
+                or purchase_already_owned(row["user_id"], row["item_key"]):
+            db.exec("UPDATE purchases SET status = 'void' WHERE tg_payment_id = ?",
+                    (charge_id,))
             return False
         _apply_purchase_effect(row["user_id"], row["item_key"])
         db.exec("UPDATE purchases SET status = 'fulfilled' WHERE tg_payment_id = ?",

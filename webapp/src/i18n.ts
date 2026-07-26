@@ -218,9 +218,10 @@ const dict = {
   err_no_item: { en: 'Not found', uk: 'Не знайдено', ru: 'Не найдено' },
   err_golden_gone: { en: 'The golden cookie is gone', uk: 'Золоте печиво вже зникло', ru: 'Золотая печенька уже исчезла' },
   err_prestige_early: { en: 'Too early: earn more cookies first', uk: 'Зарано: спершу зароби більше печива', ru: 'Ещё рано: нужно больше заработанных печенек' },
-  err_promo_not_found: { en: 'Promo code not found', uk: 'Промокод не знайдено', ru: 'Промокод не найден' },
-  err_promo_used_up: { en: 'Promo code is used up', uk: 'Промокод вичерпано', ru: 'Промокод исчерпан' },
-  err_promo_already: { en: 'You already used this code', uk: 'Ти вже активував цей промокод', ru: 'Ты уже активировал этот промокод' },
+  // один код на все неудачи: разные тексты работали оракулом для перебора
+  err_promo_invalid: { en: 'This promo code is not valid for you', uk: 'Цей промокод не діє для тебе', ru: 'Этот промокод для тебя не действует' },
+  err_too_fast: { en: 'Too many attempts — try again later', uk: 'Занадто багато спроб — спробуй пізніше', ru: 'Слишком много попыток — попробуй позже' },
+  err_needs_base: { en: 'Buy the basic tier first', uk: 'Спочатку придбай базовий тариф', ru: 'Сначала купи базовый тариф' },
   err_bp_locked: { en: 'Level not reached yet', uk: 'Рівень ще не досягнуто', ru: 'Уровень ещё не достигнут' },
   err_need_premium: { en: 'Premium Pass required', uk: 'Потрібен Premium Пас', ru: 'Нужен Premium Пасс' },
   err_no_channel: { en: 'Channel is not set up', uk: 'Канал не налаштовано', ru: 'Канал не настроен' },

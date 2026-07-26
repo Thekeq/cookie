@@ -266,18 +266,19 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
     # сбор дохода + все проверки + списание — одна транзакция
     with db.tx():
         user = gl.collect_all(tg["id"])
-        board = _board_map(tg["id"])
-        # спавн только в ОТКРЫТЫЕ клетки; печеньки в закрытых (legacy) не мешают
+        # спавн только в ОТКРЫТЫЕ клетки; печеньки в закрытых (legacy) не мешают.
+        # ВАЖНО: карту доски читаем ПОСЛЕ merge_cells_unlocked_for — внутри него
+        # compact_board может перенумеровать клетки легаси-доски, и по старой
+        # карте свободная клетка оказывалась занятой (IntegrityError -> 500)
         cells_open = gl.merge_cells_unlocked_for(user)
+        board = _board_map(tg["id"])
         free_cells = [c for c in range(cells_open) if c not in board]
         if not free_cells:
             raise HTTPException(400, "err_board_full")
 
         level = max(1, body.level)
         # прямой спавн ограничен: топ-тиры только слиянием
-        max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
-                            if cfg.item_unlock_level(l) <= user["level"]), default=1)
-        max_direct = max(1, max_unlocked - cfg.SPAWN_DIRECT_GAP)
+        max_direct = gl._direct_max_level(user)
         if level > max_direct:
             raise HTTPException(400, f"err_direct_cap|{max_direct}")
 

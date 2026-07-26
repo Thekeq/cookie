@@ -114,24 +114,37 @@ class PromoIn(BaseModel):
 
 @router.post("/promo/redeem")
 async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
+    """Активация промокода.
+
+    Все неудачи отдают ОДИН код ошибки: раньше «кода нет», «код исчерпан» и
+    «уже активирован» различались, и это работало оракулом — перебор словаря
+    сразу показывал, какие коды существуют.
+    """
     code = body.code.strip().upper()
+    gl.check_rate_limit(tg["id"], "promo", cfg.PROMO_ATTEMPTS_PER_HOUR, 3600)
     promo = db.q1("SELECT * FROM promo_codes WHERE code = ? AND active = 1", (code,))
     if not promo:
-        raise HTTPException(400, "err_promo_not_found")
-    if promo["max_uses"] and promo["uses"] >= promo["max_uses"]:
-        raise HTTPException(400, "err_promo_used_up")
-    if db.q1("SELECT id FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, tg["id"])):
-        raise HTTPException(400, "err_promo_already")
+        raise HTTPException(400, "err_promo_invalid")
 
     with db.tx():  # отметка активации + счётчик + награды — одним куском
-        db.exec("INSERT INTO promo_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)",
-                (code, tg["id"], time.time()))
-        db.exec("UPDATE promo_codes SET uses = uses + 1 WHERE code = ?", (code,))
+        # оба UPDATE/INSERT условные: проверки «уже активировал» и «лимит
+        # исчерпан» вне транзакции пробиваются параллельными запросами
+        db.exec("INSERT OR IGNORE INTO promo_redemptions (code, user_id, redeemed_at) "
+                "VALUES (?, ?, ?)", (code, tg["id"], time.time()))
+        if db.cursor.rowcount == 0:
+            raise HTTPException(400, "err_promo_invalid")
+        db.exec("UPDATE promo_codes SET uses = uses + 1 "
+                "WHERE code = ? AND (max_uses = 0 OR uses < max_uses)", (code,))
+        if db.cursor.rowcount == 0:
+            raise HTTPException(400, "err_promo_invalid")
         if promo["reward_cookies"]:
             gl.add_cookies(tg["id"], promo["reward_cookies"], count_earned=False)
         if promo["reward_energy"]:
             user = gl.refresh_energy(db.get_user(tg["id"]))
-            db.update_user(tg["id"], energy=user["energy"] + promo["reward_energy"])
+            # клэмп по потолку: излишек всё равно срезался бы первым
+            # refresh_energy, и игрок молча терял выданное
+            db.update_user(tg["id"], energy=min(gl.energy_cap(user),
+                                                user["energy"] + promo["reward_energy"]))
     return {"reward_cookies": promo["reward_cookies"], "reward_energy": promo["reward_energy"],
             "cookies": db.get_user(tg["id"])["cookies"]}
 
@@ -181,25 +194,34 @@ class BPClaim(BaseModel):
 @router.post("/battlepass/claim")
 async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
     user = db.get_user(tg["id"])
+    if not user:                      # единственная ручка без этой проверки:
+        raise HTTPException(404, "err_no_user")   # раньше падала в 500
+    if body.track not in ("free", "premium"):
+        raise HTTPException(400, "err_no_item")
     bp_level = cfg.bp_level_for_xp(user["bp_xp"])
     if body.level < 1 or body.level > bp_level:
         raise HTTPException(400, "err_bp_locked")
     if body.track == "premium" and not user["bp_premium"]:
         raise HTTPException(400, "err_need_premium")
     col = "bp_claimed_free" if body.track == "free" else "bp_claimed_premium"
-    claimed = json.loads(user[col] or "[]")
-    if body.level in claimed:
-        raise HTTPException(400, "err_claimed")
-    claimed.append(body.level)
     reward = cfg.bp_reward(body.level, body.track == "premium",
                            gl.hourly_income(tg["id"]))
     with db.tx():  # отметка о клейме и награда — одним куском
+        # список перечитывается УЖЕ внутри транзакции: чтение снаружи и запись
+        # целиком внутри теряли уровень при гонке, и его можно было забрать
+        # повторно
+        claimed = json.loads(db.get_user(tg["id"])[col] or "[]")
+        if body.level in claimed:
+            raise HTTPException(400, "err_claimed")
+        claimed.append(body.level)
         db.update_user(tg["id"], **{col: json.dumps(claimed)})
         if reward["cookies"]:
             gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
         if reward.get("energy"):
             fresh = gl.refresh_energy(db.get_user(tg["id"]))
-            db.update_user(tg["id"], energy=fresh["energy"] + reward["energy"])
+            # клэмп по потолку: излишек срезал бы первый же refresh_energy
+            db.update_user(tg["id"], energy=min(gl.energy_cap(fresh),
+                                                fresh["energy"] + reward["energy"]))
     return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}
 
 
@@ -212,20 +234,25 @@ async def shop(tg: dict = Depends(tg_user)):
     from server.i18n import tr
     income = gl.hourly_income(tg["id"])
     user = db.get_user(tg["id"])
-    offline_bonus = gl.offline_bonus_hours(user) if user else 0
     items = []
     for k, (_t, _d, s, effect) in cfg.SHOP_ITEMS.items():
+        blocked = gl.purchase_blocked(tg["id"], k)
+        # товар, который этому игроку ещё рано покупать (апгрейд тира без
+        # базового), просто не показываем — вместо него виден базовый
+        if blocked == "err_needs_base":
+            continue
         item = {"key": k, "title": tr(tg["lang"], f"shop_{k}_t"),
-                "desc": tr(tg["lang"], f"shop_{k}_d"), "stars": s}
+                "desc": tr(tg["lang"], f"shop_{k}_d"), "stars": s,
+                "owned": blocked == "err_owned"}
         if effect.get("type") == "cookies" and "income_hours" in effect:
             item["amount"] = max(effect["min_amount"],
                                  income * effect["income_hours"])
-        # постоянные апгрейды не продаём повторно — фронт рисует «куплено»
-        if effect.get("type") == "offline_cap":
-            item["owned"] = offline_bonus >= effect["hours"]
-        if effect.get("type") == "bp_premium" and user:
-            item["owned"] = bool(user["bp_premium"])
         items.append(item)
+    # владелец младшего тира оффлайн-капа видит апгрейд по цене разницы,
+    # а не полный тир, за который он переплатил бы 400⭐
+    keys = {i["key"] for i in items if not i["owned"]}
+    if "offline_cap_12h_up" in keys:
+        items = [i for i in items if i["key"] != "offline_cap_12h"]
     return {"items": items}
 
 
@@ -238,12 +265,12 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
     """Создаёт invoice-ссылку на оплату Stars через бота."""
     if body.item_key not in cfg.SHOP_ITEMS:
         raise HTTPException(400, "err_no_item")
-    # постоянный апгрейд уже куплен — не даём заплатить второй раз впустую
-    effect = cfg.SHOP_ITEMS[body.item_key][3]
-    if effect.get("type") == "offline_cap":
-        user = db.get_user(tg["id"])
-        if user and gl.offline_bonus_hours(user) >= effect["hours"]:
-            raise HTTPException(400, "err_owned")
+    # постоянный апгрейд уже куплен (или тир ещё рано) — не даём заплатить
+    # впустую. Дубль этой же проверки стоит в pre_checkout: invoice-ссылка
+    # многоразовая, и старую можно оплатить в обход магазина
+    blocked = gl.purchase_blocked(tg["id"], body.item_key)
+    if blocked:
+        raise HTTPException(400, blocked)
     from server.i18n import tr
     _t, _d, stars, _effect = cfg.SHOP_ITEMS[body.item_key]
     title = tr(tg["lang"], f"shop_{body.item_key}_t")
