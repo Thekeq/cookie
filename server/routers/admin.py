@@ -160,7 +160,11 @@ async def problem_payments():
 
     'unmatched' — платёж не сошёлся с конфигом (переименовали товар, поменяли
     цену между pre_checkout и оплатой); 'void' — выдать нечего (товар исчез
-    или уже куплен навсегда); 'paid' старше часа — выдача не прошла."""
+    или уже куплен навсегда); 'paid' старше часа — выдача не прошла.
+
+    Возвраты идут отдельным списком с prior_status: по нему видно, сняли ли с
+    игрока выданное или снимать было нечего, — сам статус 'refunded' об этом
+    не говорит, а разбирать спор без этого нечем."""
     stuck = db.q(
         "SELECT p.id, p.user_id, p.item_key, p.stars_amount, p.tg_payment_id, "
         "       p.status, p.created_at, u.username, u.first_name "
@@ -170,7 +174,17 @@ async def problem_payments():
         "ORDER BY p.created_at DESC LIMIT 100", (time.time() - 3600,))
     return {"problems": stuck, "count": len(stuck),
             "refunded": db.q1("SELECT COUNT(*) c FROM purchases "
-                              "WHERE status = 'refunded'")["c"]}
+                              "WHERE status = 'refunded'")["c"],
+            "refunds": db.q(
+                "SELECT p.id, p.user_id, p.item_key, p.stars_amount, "
+                "       p.tg_payment_id, p.prior_status, p.refunded_at, "
+                "       p.refund_stars, p.granted_payload, u.username "
+                "FROM purchases p LEFT JOIN users u ON u.user_id = p.user_id "
+                "WHERE p.status = 'refunded' "
+                "ORDER BY p.refunded_at DESC LIMIT 100"),
+            "debtors": db.q(
+                "SELECT user_id, username, cookie_debt FROM users "
+                "WHERE cookie_debt > 0 ORDER BY cookie_debt DESC LIMIT 100")}
 
 
 # ---------- статистика ----------

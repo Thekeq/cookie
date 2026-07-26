@@ -221,12 +221,43 @@ class DataBase:
                 'tg_payment_id': 'TEXT',
                 'status': 'TEXT DEFAULT "pending"',
                 'created_at': 'REAL DEFAULT 0',
+                # ЧТО ИМЕННО выдали за этот платёж, json (см. _apply_purchase_effect).
+                # Возврат снимает по этой записи, а не пересчитывает: «2 часа
+                # дохода» на момент покупки и сегодня — разные числа, и пересчёт
+                # забирал в разы больше выданного.
+                # БЕЗ DEFAULT намеренно: NULL = покупка до миграции, для неё
+                # остаётся старый путь с пересчётом. DEFAULT '{}' превратил бы
+                # каждый старый возврат в тихий no-op, то есть в бесплатный товар
+                'granted_payload': 'TEXT',
+                'granted_at': 'REAL DEFAULT 0',
+                # ярлык конкретной выдачи: буст этой покупки, а не любой буст с
+                # тем же ключом (boost_x2_1h и boost_x2_24h делят ключ click_x2,
+                # и его же выдаёт награда за рефералов)
+                'effect_instance_id': 'TEXT',
+                # из какого состояния платёж уехал в 'refunded' и когда. Слепая
+                # перезапись статуса стирала единственное, по чему видно, был ли
+                # товар выдан вообще, — а это именно те строки, которые человек
+                # разбирает руками в /api/admin/payments
+                'prior_status': 'TEXT',
+                'refunded_at': 'REAL DEFAULT 0',
+                'refund_stars': 'INTEGER',
             },
             'boosts': {
                 'id': 'INTEGER PRIMARY KEY',
                 'user_id': 'INTEGER',
                 'boost_key': 'TEXT',
                 'expires_at': 'REAL DEFAULT 0',
+                'effect_instance_id': 'TEXT',   # какая выдача создала строку
+                'source': 'TEXT',               # purchase | ref_milestone | golden
+            },
+            'entitlements': {  # право, выданное источником: чтобы возврат снимал СВОЁ
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER',
+                'kind': 'TEXT',                # пока только 'bp_premium'
+                'source': 'TEXT',              # purchase | ref_milestone | legacy
+                'source_ref': 'TEXT',          # charge_id платежа (или '')
+                'season_id': 'INTEGER',        # сезон, к которому относится право
+                'created_at': 'REAL DEFAULT 0',
             },
             'daily_quests': {  # прогресс ежедневных заданий: строка = юзер+день+задание
                 'id': 'INTEGER PRIMARY KEY',
@@ -407,6 +438,11 @@ class DataBase:
         "purchases": {"cols": ("tg_payment_id",),
                       "where": "tg_payment_id IS NOT NULL",
                       "index": "uq_purchases_charge"},
+        # право от одного источника выдаётся один раз на сезон: повторная
+        # выдача не должна плодить строки, иначе возврат снимет одну, а флаг
+        # останется поднятым второй
+        "entitlements": {"cols": ("user_id", "kind", "source", "source_ref",
+                                  "season_id")},
         # книга: повтор операции не создаёт второе движение
         "economy_ledger": {"cols": ("operation_id", "currency", "seq")},
         # токен операции: на PostgreSQL второй worker заблокируется на этом
@@ -599,7 +635,47 @@ class DataBase:
         if self._migration("backfill_bp_claims"):
             self._backfill_bp_claims()
             self._mark("backfill_bp_claims")
+        if self._migration("backfill_entitlements"):
+            self._backfill_entitlements()
+            self._mark("backfill_entitlements")
         self.connection.commit()
+
+    def _backfill_entitlements(self):
+        """Записывает уже поднятый premium-пасс как право источника 'legacy'.
+
+        Возврат Stars снимает своё право и пересчитывает флаг по остаткам. Без
+        переноса у старых игроков прав нет вовсе, и первый же возврат покупки
+        обнулил бы пасс, полученный за 25 рефералов или перенесённый с прошлого
+        сезона. 'legacy' снять нельзя ничем — это и есть цель: миграция может
+        только сохранить право, но не отобрать.
+
+        Отдельная строка на bp_premium_next: перенос на следующий сезон — такой
+        же флаг, и обнулять его чужим возвратом так же нельзя.
+
+        INSERT без ON CONFLICT: уникальный индекс на entitlements в этот момент
+        ещё не создан (_dedupe_and_unique зовётся после _auto_migrate), арбитра
+        конфликта не существует. Разовость даёт журнал миграций."""
+        cur = self.cursor
+        cur.execute("SELECT user_id, season_id, bp_premium, bp_premium_next "
+                    "FROM users WHERE bp_premium = 1 OR bp_premium_next = 1")
+        rows = cur.fetchall()
+        now = time.time()
+        moved = 0
+        for row in rows:
+            season = row["season_id"] or 0
+            for flag, target in ((row["bp_premium"], season),
+                                 (row["bp_premium_next"], season + 1)):
+                if not flag:
+                    continue
+                cur.execute(
+                    "INSERT INTO entitlements (user_id, kind, source, source_ref, "
+                    "season_id, created_at) "
+                    "VALUES (?, 'bp_premium', 'legacy', '', ?, ?)",
+                    (row["user_id"], target, now))
+                moved += 1
+        if moved:
+            print(f"[*] Миграция: {moved} прав premium-пасса перенесено в "
+                  f"entitlements ({len(rows)} игроков)")
 
     def _backfill_best_item_level(self):
         """Проставляет рекорд тира старым аккаунтам ПО ФАКТУ их прогресса.

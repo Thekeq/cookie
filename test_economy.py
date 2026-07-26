@@ -6,8 +6,6 @@
   3. после обычной сессии сумма движений СХОДИТСЯ с колонкой — а если кто-то
      напишет мимо книги, сверка это покажет.
 
-Известные незакрытые дыры (сознательно, каждая — свой шаг плана): отзыв покупки
-за Stars списывает печеньки напрямую, мимо книги (S17).
 Реген и трата энергии не пишутся в книгу и не будут — энергия производная от
 времени, а не запас (см. LEDGERED_PARTIAL); в книгу идут только её выдачи.
 Поэтому drift сверяется по cookies, xp и total_earned — по тем валютам, которые
@@ -759,10 +757,11 @@ check("8h.9 строка в книге по-прежнему одна",
       len([r for r in ledger(PU, "cookies")
            if r["operation_id"] == f"purchase:{CID}"]) == 1)
 
-check("8h.10 возврат оформлен", gl.revoke_charge(CID) is True)
-check("8h.11 повторный возврат — no-op", gl.revoke_charge(CID) is False)
+check("8h.10 возврат оформлен", gl.revoke_charge(CID) == "revoked")
+check("8h.11 повторный возврат — no-op",
+      gl.revoke_charge(CID) == "already_refunded")
 check("8h.12 возврат по несуществующему платежу — no-op",
-      gl.revoke_charge("charge-nope") is False)
+      gl.revoke_charge("charge-nope") == "no_row")
 check("8h.13 выдача после возврата не проходит", gl.fulfill_charge(CID) is False)
 
 # compare-and-set: статус уехал между чтением и записью
@@ -771,9 +770,27 @@ gl.fulfill_charge(CID + "-b")
 db.exec("UPDATE purchases SET status = 'refunded' WHERE tg_payment_id = ?",
         (CID + "-b",))
 check("8h.14 уже возвращённое не возвращается второй раз",
-      gl.revoke_charge(CID + "-b") is False)
+      gl.revoke_charge(CID + "-b") == "already_refunded")
 
 check("8h.15 пустой charge_id не выдаёт ничего", gl.fulfill_charge("") is False)
+
+# возврат по платежу, который до выдачи не дошёл: оформить его надо (иначе
+# строка застрянет в 'paid' навсегда), но снимать нечего — и игроку об этом
+# говорят прямо, а не «бонус снят»
+paid_row(CID + "-c")
+check("8h.16 невыданный товар возвращается как «снимать нечего»",
+      gl.revoke_charge(CID + "-c", 75) == "nothing_to_revoke")
+_pu_row = db.q1("SELECT status, prior_status, refund_stars FROM purchases "
+                "WHERE tg_payment_id = ?", (CID + "-c",))
+check("8h.17 прежний статус сохранён для разбора",
+      _pu_row["status"] == "refunded" and _pu_row["prior_status"] == "paid"
+      and _pu_row["refund_stars"] == 75, str(dict(_pu_row)))
+check("8h.18 тупиковый 'void' тоже умеет стать возвратом",
+      (db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, "
+               "tg_payment_id, status, created_at) "
+               "VALUES (?, 'cookies_pack', 75, ?, 'void', ?)",
+               (PU, CID + "-d", time.time())) == 1)
+      and gl.revoke_charge(CID + "-d") == "nothing_to_revoke")
 
 # ==========================================================================
 # 8i. Престиж: обнуление и выдача очков — движения в книге, и ровно один раз
@@ -860,6 +877,152 @@ check("8j.6 оффлайн-доход считается заработком",
       all(r["counts_earned"] == 1 for r in _of_moves))
 check("8j.7 сверка сходится и после повтора",
       abs(ec.reconcile(OF)["cookies"]["drift"]) < 1e-6, ec.reconcile(OF)["cookies"])
+
+# ==========================================================================
+# 8k. возврат Stars: снимается ВЫДАННОЕ, нехватка уходит в долг, долг гасится
+#     из дохода — и обе колонки сходятся с книгой на каждом шаге
+# ==========================================================================
+RF = BASE + 19
+db.create_user(RF, "rf", "RF")
+
+
+def rf_paid(cid, item):
+    db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+            "status, created_at) VALUES (?, ?, 75, ?, 'paid', ?)",
+            (RF, item, cid, time.time()))
+
+
+def rf_clean(name):
+    check(name, not [k for k, v in ec.reconcile(RF).items()
+                     if abs(v["drift"]) > 1e-6], ec.reconcile(RF))
+
+
+# --- 1. возврат снимает ровно записанную сумму, а не пересчитанную «сейчас»
+_rf_c1 = f"charge-rf-{RF}-1"
+rf_paid(_rf_c1, "cookies_pack")
+_rf_before = db.get_user(RF)["cookies"]
+check("8k.1 покупка выдана", gl.fulfill_charge(_rf_c1) is True)
+_rf_granted = db.get_user(RF)["cookies"] - _rf_before
+_rf_row = db.q1("SELECT granted_payload, granted_at, effect_instance_id "
+                "FROM purchases WHERE tg_payment_id = ?", (_rf_c1,))
+_rf_pl = json.loads(_rf_row["granted_payload"] or "{}")
+check("8k.2 выданное записано в покупку",
+      abs(_rf_pl.get("amount", 0) - _rf_granted) < 1e-6
+      and _rf_pl.get("type") == "cookies" and _rf_row["granted_at"] > 0,
+      _rf_row["granted_payload"])
+check("8k.3 у выдачи есть ярлык",
+      _rf_row["effect_instance_id"] and _rf_pl.get("instance") == _rf_row["effect_instance_id"])
+
+# доход вырос в тысячи раз: пересчёт «сколько выдали бы сейчас» забрал бы
+# в разы больше выданного — и в пределе весь банк. Возврат обязан взять
+# записанную сумму
+db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'factory', 200)", (RF,))
+gl.invalidate_income(RF)
+check("8k.4 доход стал несоизмеримо больше выдачи",
+      gl.hourly_income(RF) * cfg.SHOP_ITEMS["cookies_pack"][3]["income_hours"]
+      > _rf_granted * 100, gl.hourly_income(RF))
+check("8k.5 возврат оформлен", gl.revoke_charge(_rf_c1) == "revoked")
+check("8k.6 снято ровно выданное",
+      abs(db.get_user(RF)["cookies"] - _rf_before) < 1e-6,
+      db.get_user(RF)["cookies"] - _rf_before)
+check("8k.7 долга не открылось", db.get_user(RF)["cookie_debt"] == 0)
+check("8k.8 списание помечено токеном возврата",
+      [r["reason"] for r in ledger(RF, "cookies")
+       if r["operation_id"] == f"refund:{_rf_c1}"] == ["stars_refund_clawback"])
+rf_clean("8k.9 сверка чистая после возврата")
+check("8k.10 повторный возврат ничего не снимает",
+      gl.revoke_charge(_rf_c1) == "already_refunded"
+      and abs(db.get_user(RF)["cookies"] - _rf_before) < 1e-6)
+
+# --- 2. игрок успел потратить: нехватка уходит в долг, а не прощается
+_rf_c2 = f"charge-rf-{RF}-2"
+rf_paid(_rf_c2, "cookies_pack")
+gl.fulfill_charge(_rf_c2)
+_rf_g2 = json.loads(db.q1("SELECT granted_payload FROM purchases "
+                          "WHERE tg_payment_id = ?", (_rf_c2,))["granted_payload"])["amount"]
+_rf_keep = _rf_g2 / 4
+gl.spend_cookies(RF, db.get_user(RF)["cookies"] - _rf_keep, "test_spend")
+check("8k.11 на балансе меньше выданного",
+      abs(db.get_user(RF)["cookies"] - _rf_keep) < 1e-6, db.get_user(RF)["cookies"])
+check("8k.12 возврат оформлен", gl.revoke_charge(_rf_c2) == "revoked")
+_rf_u = db.get_user(RF)
+check("8k.13 забрали всё, что было", abs(_rf_u["cookies"]) < 1e-6, _rf_u["cookies"])
+check("8k.14 остальное стало долгом",
+      abs(_rf_u["cookie_debt"] - (_rf_g2 - _rf_keep)) < 1e-6, _rf_u["cookie_debt"])
+_rf_moves = [r for r in ledger(RF) if r["operation_id"] == f"refund:{_rf_c2}"]
+check("8k.15 в книге два движения одной операцией",
+      sorted((r["currency"], r["reason"]) for r in _rf_moves)
+      == [("cookie_debt", "refund_debt_opened"), ("cookies", "stars_refund_clawback")],
+      [(r["currency"], r["reason"], r["amount"]) for r in _rf_moves])
+_rf_taken = -next(r["amount"] for r in _rf_moves if r["currency"] == "cookies")
+_rf_opened = next(r["amount"] for r in _rf_moves if r["currency"] == "cookie_debt")
+check("8k.16 снятое плюс долг = выданное (ни печеньки не прощено)",
+      abs(_rf_taken + _rf_opened - _rf_g2) < 1e-6,
+      (_rf_taken, _rf_opened, _rf_g2))
+rf_clean("8k.17 сверка чистая и по печенькам, и по долгу")
+
+# --- 3. долг съедает ближайший доход, частями и до конца
+_rf_debt = db.get_user(RF)["cookie_debt"]
+gl.add_cookies(RF, _rf_debt / 3, count_earned=False)
+_rf_u = db.get_user(RF)
+check("8k.18 частичный доход ушёл в долг целиком",
+      abs(_rf_u["cookies"]) < 1e-6
+      and abs(_rf_u["cookie_debt"] - _rf_debt * 2 / 3) < 1e-6,
+      (_rf_u["cookies"], _rf_u["cookie_debt"]))
+rf_clean("8k.19 сверка чистая после частичного погашения")
+_rf_left = db.get_user(RF)["cookie_debt"]
+_rf_bal = gl.add_cookies(RF, _rf_left + 1000.0, count_earned=False)
+_rf_u = db.get_user(RF)
+check("8k.20 доход больше долга гасит его и оставляет остаток",
+      _rf_u["cookie_debt"] == 0 and abs(_rf_u["cookies"] - 1000.0) < 1e-6,
+      (_rf_u["cookies"], _rf_u["cookie_debt"]))
+check("8k.21 add_cookies вернул баланс ПОСЛЕ погашения",
+      abs(_rf_bal - _rf_u["cookies"]) < 1e-6, (_rf_bal, _rf_u["cookies"]))
+rf_clean("8k.22 сверка чистая после полного погашения")
+gl.add_cookies(RF, 500.0, count_earned=False)
+check("8k.23 без долга доход приходит целиком",
+      abs(db.get_user(RF)["cookies"] - 1500.0) < 1e-6, db.get_user(RF)["cookies"])
+rf_clean("8k.24 сверка чистая и без долга")
+
+# --- 4. пустой баланс: возврат уходит в долг целиком, и повтор его не удваивает
+_rf_c4 = f"charge-rf-{RF}-4"
+rf_paid(_rf_c4, "cookies_pack")
+gl.fulfill_charge(_rf_c4)
+_rf_g4 = json.loads(db.q1("SELECT granted_payload FROM purchases "
+                          "WHERE tg_payment_id = ?", (_rf_c4,))["granted_payload"])["amount"]
+gl.spend_cookies(RF, db.get_user(RF)["cookies"], "test_spend")
+check("8k.25 баланс пуст перед возвратом", db.get_user(RF)["cookies"] == 0)
+gl.revoke_charge(_rf_c4)
+check("8k.26 весь возврат ушёл в долг",
+      abs(db.get_user(RF)["cookie_debt"] - _rf_g4) < 1e-6,
+      (db.get_user(RF)["cookie_debt"], _rf_g4))
+check("8k.27 движения по печенькам не появилось",
+      [r["currency"] for r in ledger(RF) if r["operation_id"] == f"refund:{_rf_c4}"]
+      == ["cookie_debt"])
+# охрана статуса сюда бы не пустила, но проверка идемпотентности живёт и в
+# самом списании: без строки по cookies повтор удвоил бы долг
+gl._claw_back_cookies(RF, _rf_g4, _rf_c4)
+check("8k.28 повтор списания долг не удвоил",
+      abs(db.get_user(RF)["cookie_debt"] - _rf_g4) < 1e-6,
+      db.get_user(RF)["cookie_debt"])
+rf_clean("8k.29 сверка чистая при долге на весь возврат")
+gl.add_cookies(RF, _rf_g4, count_earned=False)
+check("8k.30 долг погашен целиком", db.get_user(RF)["cookie_debt"] == 0)
+rf_clean("8k.31 сверка чистая после погашения полного долга")
+
+# --- 5. покупка до миграции: записи о выдаче нет, работает прежний путь
+_rf_c3 = f"charge-rf-{RF}-3"
+rf_paid(_rf_c3, "cookies_pack")
+gl.fulfill_charge(_rf_c3)
+db.exec("UPDATE purchases SET granted_payload = NULL, effect_instance_id = NULL "
+        "WHERE tg_payment_id = ?", (_rf_c3,))
+_rf_legacy_before = db.get_user(RF)["cookies"]
+check("8k.32 legacy-возврат проходит", gl.revoke_charge(_rf_c3) == "revoked")
+check("8k.33 legacy-возврат снял пересчитанное, но баланс не ушёл в минус",
+      db.get_user(RF)["cookies"] >= 0
+      and db.get_user(RF)["cookies"] < _rf_legacy_before,
+      db.get_user(RF)["cookies"])
+rf_clean("8k.34 сверка чистая даже после legacy-возврата")
 
 # ==========================================================================
 # 9. drift_report ловит запись мимо книги

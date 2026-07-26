@@ -3,6 +3,7 @@ import datetime
 import json
 import random
 import time
+import uuid
 
 from server import economy
 from server import game_config as cfg
@@ -178,7 +179,8 @@ def _season_winners(season: int) -> list[tuple[int, int, float]]:
     return winners
 
 
-def grant_bp_premium(user_id: int, now: float | None = None):
+def grant_bp_premium(user_id: int, now: float | None = None, *,
+                     source: str = "manual", source_ref: str = ""):
     """Выдаёт premium-пасс за 100⭐. Флаг переноса на следующий сезон ставится
     в двух случаях, и оба — про то, чтобы покупка не сгорела:
 
@@ -187,15 +189,55 @@ def grant_bp_premium(user_id: int, now: float | None = None):
     2) сезон УЖЕ сменился, но пакетный сброс (порциями по 500) ещё не дошёл
        до этой строки — без флага ближайший чужой запрос прогнал бы её чанк
        и стёр только что оплаченный товар. Довыдачи в этом случае не будет:
-       покупка уже помечена 'fulfilled'."""
+       покупка уже помечена 'fulfilled'.
+
+    Кроме флага пишется СТРОКА ПРАВА с источником. Флаг — один бит, по нему
+    нельзя сказать, чем он поднят, и возврат покупки гасил его целиком: игрок,
+    у которого пасс был ещё и за 25 рефералов, терял оба. Возврат снимает своё
+    право и пересобирает флаг по остаткам (см. _recompute_bp_premium)."""
     now = now or time.time()
-    fields = {"bp_premium": 1}
     user = db.get_user(user_id)
-    rollover_pending = bool(user) and user["season_id"] < current_season()
-    if (season_end_ts(current_season()) - now <= cfg.BP_PREMIUM_GRACE_DAYS * 86400
-            or rollover_pending):
-        fields["bp_premium_next"] = 1
-    db.update_user(user_id, **fields)
+    cur = current_season()
+    season = user["season_id"] if user else cur
+    rollover_pending = bool(user) and user["season_id"] < cur
+    carry = (season_end_ts(cur) - now <= cfg.BP_PREMIUM_GRACE_DAYS * 86400
+             or rollover_pending)
+    with db.tx():
+        # право привязано к сезону, потому что и флаг привязан: ролловер
+        # обнуляет bp_premium, и право прошлого сезона не должно его вернуть
+        seasons = [season]
+        if carry:
+            # куда уедет перенос: отставшей строке сброс поставит ТЕКУЩИЙ сезон,
+            # актуальной — следующий
+            seasons.append(cur if rollover_pending else cur + 1)
+        for s in seasons:
+            db.exec("INSERT INTO entitlements (user_id, kind, source, source_ref, "
+                    "season_id, created_at) VALUES (?, 'bp_premium', ?, ?, ?, ?) "
+                    "ON CONFLICT (user_id, kind, source, source_ref, season_id) "
+                    "DO NOTHING", (user_id, source, source_ref, s, now))
+        fields = {"bp_premium": 1}
+        if carry:
+            fields["bp_premium_next"] = 1
+        db.update_user(user_id, **fields)
+
+
+def _recompute_bp_premium(user_id: int):
+    """Пересобирает флаги пасса по оставшимся правам. Зовётся после отзыва.
+
+    Вычитать нельзя: флаг не считает источники, он один. Поэтому после снятия
+    своего права флаг выставляется заново по факту — есть ли у игрока хоть одно
+    право на этот сезон (и на тот, куда уедет перенос)."""
+    user = db.get_user(user_id)
+    if not user:
+        return
+    cur = current_season()
+    season = user["season_id"]
+    nxt = cur if season < cur else cur + 1
+    have = {r["season_id"] for r in db.q(
+        "SELECT DISTINCT season_id FROM entitlements "
+        "WHERE user_id = ? AND kind = 'bp_premium'", (user_id,))}
+    db.update_user(user_id, bp_premium=1 if season in have else 0,
+                   bp_premium_next=1 if nxt in have else 0)
 
 
 def my_last_season_result(user_id: int) -> dict | None:
@@ -519,7 +561,10 @@ def claim_ref_milestone(user: dict, key: str) -> dict:
                    (user["user_id"], key, time.time())) == 0:
             raise ValueError("err_claimed")
         if ms["type"] == "boost":
-            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
+            # source обязателен: ключ click_x2 выдаёт ещё и покупка за Stars, и
+            # её возврат не должен снять буст, заработанный рефералами
+            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at, source) "
+                    "VALUES (?, ?, ?, 'ref_milestone')",
                     (user["user_id"], "click_x2", time.time() + ms["hours"] * 3600))
         elif ms["type"] == "skin":
             db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?) "
@@ -785,7 +830,8 @@ def claim_golden(user: dict) -> dict:
         effect = row["golden_effect"] or "chain"
         if effect == "frenzy":
             e = cfg.GOLDEN_EFFECTS["frenzy"]
-            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
+            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at, source) "
+                    "VALUES (?, ?, ?, 'golden')",
                     (uid, "golden_frenzy", now + e["seconds"]))
             return {"effect": "frenzy", "mult": e["mult"], "seconds": e["seconds"]}
         e = cfg.GOLDEN_EFFECTS["chain"]
@@ -1219,18 +1265,24 @@ def add_cookies(user_id: int, amount: float, count_earned: bool = True,
         row = db.q1w(
             "UPDATE users SET cookies = cookies + ?, total_earned = total_earned + ?, "
             "season_earned = season_earned + ?, user_revision = user_revision + 1 "
-            "WHERE user_id = ? RETURNING cookies, season_id",
+            "WHERE user_id = ? RETURNING cookies, season_id, cookie_debt",
             (amount, earn, earn, user_id))
         if row is None:
             raise ValueError("err_no_user")
         economy.record(user_id, "cookies", amount, reason, row["cookies"], op,
                        ref_type=ref_type, ref_id=ref_id,
                        counts_earned=1 if earn else 0, season_id=row["season_id"])
+        # долг после возврата Stars гасится из ближайшего дохода. Лишний
+        # стейтмент выполняется только если долг реально есть: у игрока без
+        # возвратов RETURNING вернул ноль, и путь стоит одну проверку в питоне
+        balance = row["cookies"]
+        if row["cookie_debt"] > 0 and amount > 0:
+            balance = _settle_debt(user_id, op, balance)
         if earn:
             # честный заработок кормит дневное задание "заработай N" и заказ пекарни
             quest_progress(user_id, "earned", amount)
             order_progress(user_id, "earned", amount)
-    return row["cookies"]
+    return balance
 
 
 def spend_cookies(user_id: int, cost: float, reason: str, *,
@@ -1929,35 +1981,183 @@ def record_unmatched_payment(user_id: int, item_key: str, amount: int,
          charge_id or None, time.time()))
 
 
-def _revoke_purchase_effect(user_id: int, item_key: str):
-    """Откат эффекта при возврате звёзд. Вызывается внутри db.tx()."""
+def _claw_back_cookies(user_id: int, amount: float, charge_id: str = "") -> float:
+    """Снимает выданные печеньки при возврате Stars. Возвращает снятое.
+
+    Чего не хватило на балансе — уходит в долг, а не пропадает. Раньше списание
+    делалось через max(0, ...): игрок, успевший потратить полученное, отдавал
+    сколько было и оставался в плюсе на разницу — покупка за Stars превращалась
+    в бесплатные печеньки через возврат.
+
+    Долг — отдельная валюта книги: открытие и погашение сходятся с колонкой
+    cookie_debt так же, как остальные валюты. Записать нехватку строкой по
+    cookies было нельзя — движения баланса на эту сумму не было, и сверка по
+    печенькам разошлась бы навсегда.
+
+    Сумма списания фиксируется compare-and-set'ом по балансу: и снятое, и долг
+    считаются от того значения, которое мы действительно сдвинули, — иначе в
+    книгу ушло бы одно число, а с колонки списалось бы другое."""
+    amount = economy._sane(amount, "refund_clawback")
+    if amount <= 0:
+        return 0.0
+    op = f"refund:{charge_id}" if charge_id \
+        else economy.auto_op(user_id, "stars_refund_clawback")
+    with db.tx():
+        # обе валюты, а не только печеньки: у игрока с нулевым балансом возврат
+        # уходит в долг ЦЕЛИКОМ, строки по cookies не появляется вовсе — и
+        # проверка по одной валюте пропустила бы повтор, удвоив долг
+        if charge_id and (economy.already_recorded(op, "cookies")
+                          or economy.already_recorded(op, "cookie_debt", 1)):
+            return 0.0                       # возврат уже проведён
+        for _ in range(5):
+            row = db.q1("SELECT cookies FROM users WHERE user_id = ?", (user_id,))
+            if not row:
+                return 0.0
+            taken = min(amount, max(0.0, row["cookies"]))
+            debt = amount - taken
+            after = db.q1w(
+                "UPDATE users SET cookies = cookies - ?, "
+                "cookie_debt = cookie_debt + ?, "
+                "user_revision = user_revision + 1 "
+                "WHERE user_id = ? AND cookies = ? "
+                "RETURNING cookies, cookie_debt",
+                (taken, debt, user_id, row["cookies"]))
+            if after is not None:
+                break
+        else:
+            # баланс уезжал пять раз подряд: на SQLite невозможно (BEGIN
+            # IMMEDIATE выстраивает писателей), на PostgreSQL — только под
+            # шквалом параллельных начислений. Рвём транзакцию целиком: возврат
+            # останется неоформленным и будет виден в /api/admin/payments,
+            # а списать «примерно столько» нельзя
+            raise ValueError("err_refund_busy")
+        if taken:
+            economy.record(user_id, "cookies", -taken, "stars_refund_clawback",
+                           after["cookies"], op, ref_type="charge",
+                           ref_id=charge_id or None)
+        if debt:
+            economy.record(user_id, "cookie_debt", debt, "refund_debt_opened",
+                           after["cookie_debt"], op, seq=1, ref_type="charge",
+                           ref_id=charge_id or None)
+    return taken
+
+
+def _settle_debt(user_id: int, op: str, credited_balance: float) -> float:
+    """Гасит долг из первого же положительного начисления. Зовётся из add_cookies.
+    Возвращает баланс ПОСЛЕ погашения — его и должен вернуть вызывающий.
+
+    Возврат Stars может забрать больше, чем есть на балансе (игрок успел
+    потратить), и остаток висит долгом. Гасить его отдельной ручкой нельзя —
+    игрок просто не станет её звать; поэтому долг съедает ближайший доход.
+
+    Списываем LEAST(долг, баланс): доход меньше долга гасит его частично и
+    никогда не уводит баланс в минус."""
+    row = db.q1w(f"UPDATE users SET cookies = cookies - {db.LEAST}(cookie_debt, cookies), "
+                 f"cookie_debt = cookie_debt - {db.LEAST}(cookie_debt, cookies), "
+                 f"user_revision = user_revision + 1 "
+                 f"WHERE user_id = ? AND cookie_debt > 0 AND cookies > 0 "
+                 f"RETURNING cookies, cookie_debt", (user_id,))
+    if row is None:
+        return credited_balance
+    paid = credited_balance - row["cookies"]
+    if paid <= 0:
+        return row["cookies"]
+    # два движения одной операцией: сколько ушло с баланса и на сколько
+    # уменьшился долг. Обе колонки после этого сходятся с книгой
+    economy.record(user_id, "cookies", -paid, "debt_settlement",
+                   row["cookies"], op, seq=2)
+    economy.record(user_id, "cookie_debt", -paid, "debt_settlement",
+                   row["cookie_debt"], op, seq=3)
+    return row["cookies"]
+
+
+def _revoke_purchase_effect(user_id: int, item_key: str,
+                            payload_json: str | None = None,
+                            instance_id: str | None = None,
+                            charge_id: str = ""):
+    """Откат эффекта при возврате звёзд. Вызывается внутри db.tx().
+
+    Работает по записи о выдаче (granted_payload), а не по пересчёту «сколько
+    выдали бы сейчас». Пересчёт был сломан без всякой конкуренции: ящик за 300⭐,
+    купленный при доходе 2 500/ч, выдавал 25 000 печенек, а при доходе 10 млн/ч
+    возврат пытался снять 100 000 000 и обнулял банк целиком.
+
+    payload_json = NULL — покупка сделана до появления записи. Для неё остаётся
+    прежний путь: пересчёт по конфигу и снятие одной строки буста. Гарантий
+    точности тут нет и быть не может, но окно закрытое — только платежи,
+    выданные до этого деплоя."""
     effect = cfg.SHOP_ITEMS.get(item_key, {})[3] \
         if item_key in cfg.SHOP_ITEMS else None
     if not effect:
         return
-    user = db.get_user(user_id)
-    if not user:
+    if not db.get_user(user_id):
         return
-    if effect["type"] == "cookies":
-        # снимаем ровно столько, сколько выдали бы сейчас; в минус не уводим
-        amount = max(effect.get("min_amount", 0),
-                     hourly_income(user_id) * effect.get("income_hours", 0)) \
-            if "income_hours" in effect else effect["amount"]
-        db.update_user(user_id, cookies=max(0.0, user["cookies"] - amount))
-    elif effect["type"] == "boost":
-        db.exec("DELETE FROM boosts WHERE user_id = ? AND boost_key = ?",
-                (user_id, effect["key"]))
-    elif effect["type"] == "bp_premium":
-        db.update_user(user_id, bp_premium=0, bp_premium_next=0)
-    elif effect["type"] == "offline_cap":
-        db.update_user(user_id, offline_bonus_hours=max(
-            0.0, offline_bonus_hours(user) - effect["hours"]))
+    try:
+        payload = json.loads(payload_json) if payload_json else None
+    except (ValueError, TypeError):
+        payload = None                      # битый json — как будто его нет
+    kind = (payload or {}).get("type") or effect["type"]
+
+    if kind == "cookies":
+        amount = (payload or {}).get("amount")
+        if amount is None:                  # покупка до миграции
+            amount = max(effect.get("min_amount", 0),
+                         hourly_income(user_id) * effect.get("income_hours", 0)) \
+                if "income_hours" in effect else effect["amount"]
+        _claw_back_cookies(user_id, amount, charge_id)
+    elif kind == "boost":
+        inst = instance_id or (payload or {}).get("instance")
+        if inst:
+            # именно по ярлыку выдачи: boost_x2_1h и boost_x2_24h делят ключ
+            # click_x2, и его же выдаёт награда за 3 рефералов. Удаление по
+            # ключу снимало чужие бусты вместе со своим
+            db.exec("DELETE FROM boosts WHERE user_id = ? AND effect_instance_id = ?",
+                    (user_id, inst))
+        else:
+            # без ярлыка снимаем РОВНО ОДНУ строку — самую долгую из живых
+            db.exec("DELETE FROM boosts WHERE id = (SELECT id FROM boosts "
+                    "WHERE user_id = ? AND boost_key = ? "
+                    "ORDER BY expires_at DESC LIMIT 1)",
+                    (user_id, effect.get("key")))
+    elif kind == "bp_premium":
+        # снимаем СВОЁ право и пересобираем флаг: у игрока пасс мог быть ещё и
+        # за 25 рефералов или перенесённый с прошлого сезона, а раньше возврат
+        # обнулял флаг целиком вместе с ними
+        db.exec("DELETE FROM entitlements WHERE user_id = ? AND kind = 'bp_premium' "
+                "AND source = 'purchase' AND source_ref = ?",
+                (user_id, charge_id or ""))
+        _recompute_bp_premium(user_id)
+    elif kind == "offline_cap":
+        # ПЕРЕСЧЁТ по оставшимся выданным покупкам, а не вычитание часов.
+        # Эффект применяется как max(), поэтому вычитание ломало владельца
+        # старшего тира: возврат базовых 6ч ронял его 12ч до 6ч. Считаем после
+        # смены статуса, так что возвращаемая строка в выборку уже не попадает
+        hours = max([0.0] + [
+            cfg.SHOP_ITEMS[r["item_key"]][3]["hours"]
+            for r in db.q("SELECT item_key FROM purchases WHERE user_id = ? "
+                          "AND status = 'fulfilled'", (user_id,))
+            if r["item_key"] in cfg.SHOP_ITEMS
+            and cfg.SHOP_ITEMS[r["item_key"]][3]["type"] == "offline_cap"])
+        db.exec("UPDATE users SET offline_bonus_hours = ?, "
+                "user_revision = user_revision + 1 WHERE user_id = ?",
+                (hours, user_id))
     # energy_full откатывать нечего — энергия и так расходуется
 
 
-def revoke_charge(charge_id: str) -> bool:
+def revoke_charge(charge_id: str, stars: int | None = None) -> str:
     """Возврат звёзд: снимаем выданное и помечаем покупку 'refunded'.
     Идемпотентно — повторный refund ничего не меняет.
+
+    Возвращает ИСХОД, а не «получилось/нет»:
+      'revoked'           — товар был выдан, эффект снят;
+      'nothing_to_revoke' — платёж не доходил до выдачи ('paid', 'void',
+                            'unmatched'): возврат оформлен, снимать нечего;
+      'already_refunded'  — по этому платежу возврат уже проведён;
+      'no_row'            — платежа нет в базе.
+    Различать это нужно игроку: на 'nothing_to_revoke' бот раньше писал «бонус
+    снят», и человек шёл искать, чего он лишился, — при том что не получал
+    ничего. И нужно человеку в /api/admin/payments: prior_status сохраняет, из
+    какого состояния уехал платёж, а сегодняшняя слепая перезапись это стирала.
 
     Переход статуса — compare-and-set по ТОМУ ЖЕ значению, которое мы прочитали
     и на котором приняли решение откатывать эффект. Раньше UPDATE стоял без
@@ -1966,33 +2166,62 @@ def revoke_charge(charge_id: str) -> bool:
     и решаем заново по актуальному статусу."""
     with db.tx():
         for _ in range(2):
-            row = db.q1("SELECT user_id, item_key, status FROM purchases "
+            row = db.q1("SELECT user_id, item_key, status, granted_payload, "
+                        "effect_instance_id FROM purchases "
                         "WHERE tg_payment_id = ?", (charge_id,))
-            if not row or row["status"] == "refunded":
-                return False
-            if db.exec("UPDATE purchases SET status = 'refunded' "
+            if not row:
+                return "no_row"
+            if row["status"] == "refunded":
+                return "already_refunded"
+            # предикат — «тот же статус», а не status IN ('paid','fulfilled'):
+            # 'void' и 'unmatched' тоже обязаны уметь стать 'refunded', иначе
+            # ровно те строки, которые человек и разбирает руками, застряли бы
+            # навсегда
+            if db.exec("UPDATE purchases SET status = 'refunded', prior_status = ?, "
+                       "refunded_at = ?, refund_stars = ? "
                        "WHERE tg_payment_id = ? AND status = ?",
-                       (charge_id, row["status"])) == 0:
+                       (row["status"], time.time(), stars,
+                        charge_id, row["status"])) == 0:
                 continue                     # статус уехал под нами
             if row["status"] == "fulfilled":
-                _revoke_purchase_effect(row["user_id"], row["item_key"])
-            return True
-        return False
+                # откатываем по записи о выдаче: что именно и сколько выдали
+                _revoke_purchase_effect(row["user_id"], row["item_key"],
+                                        row["granted_payload"],
+                                        row["effect_instance_id"], charge_id)
+                return "revoked"
+            return "nothing_to_revoke"
+        return "already_refunded"            # успел параллельный возврат
 
 
-def _apply_purchase_effect(user_id: int, item_key: str, charge_id: str = ""):
-    """Применяет эффект купленного товара. Вызывается внутри db.tx().
+def _apply_purchase_effect(user_id: int, item_key: str, charge_id: str = "") -> dict:
+    """Применяет эффект купленного товара и возвращает, ЧТО именно выдал.
+    Вызывается внутри db.tx().
 
     `charge_id` идёт в токен операции: один платёж — одно движение денег, даже
-    если выдачу когда-нибудь позовут в обход охраны статуса."""
+    если выдачу когда-нибудь позовут в обход охраны статуса. С ним же выданное
+    записывается в purchases.granted_payload — той же транзакцией, что и сама
+    выдача, иначе возврат мог бы прочитать пустоту после сбоя в середине.
+
+    Зачем хранить: возврат обязан снять ИМЕННО ВЫДАННОЕ. «10 часов твоего
+    дохода» на момент покупки и сегодня — разные числа, и пересчёт при возврате
+    забирал в разы больше выданного (в пределе — весь банк). Ярлык выдачи
+    (effect_instance_id) отличает буст этой покупки от буста с тем же ключом из
+    другой покупки или из награды за рефералов."""
     effect = cfg.SHOP_ITEMS[item_key][3]
     op = f"purchase:{charge_id}" if charge_id else None
+    instance = uuid.uuid4().hex
+    now = time.time()
+    payload = {"schema": 1, "type": effect["type"], "instance": instance}
     if effect["type"] == "cookies":
         if "income_hours" in effect:
-            amount = max(effect["min_amount"],
-                         hourly_income(user_id) * effect["income_hours"])
+            income = hourly_income(user_id)
+            amount = max(effect["min_amount"], income * effect["income_hours"])
+            payload.update(income_at_grant=income,
+                           income_hours=effect["income_hours"],
+                           min_amount=effect["min_amount"])
         else:
             amount = effect["amount"]
+        payload["amount"] = amount
         add_cookies(user_id, amount, count_earned=False, operation_id=op,
                     reason="purchase_cookies")
     elif effect["type"] == "energy_full":
@@ -2000,18 +2229,34 @@ def _apply_purchase_effect(user_id: int, item_key: str, charge_id: str = ""):
         # «полный бак» игнорировал апгрейды energy_cap_* и недоливал до 750.
         # Выдаём бак целиком: клэмп в grant_energy всё равно доведёт ровно до
         # потолка, а в книгу ляжет фактически влившееся
-        grant_energy(user_id, energy_cap(db.get_user(user_id)),
-                     "energy_stars_full", operation_id=op)
+        before = db.get_user(user_id)["energy"]
+        after = grant_energy(user_id, energy_cap(db.get_user(user_id)),
+                             "energy_stars_full", operation_id=op)
+        # откатывать нечего (энергия и так расходуется), но по записи видно,
+        # что игрок получил, — иначе спор по возврату разбирать нечем
+        payload.update(energy_before=before, energy_after=after)
     elif effect["type"] == "boost":
-        db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
-                (user_id, effect["key"], time.time() + effect["hours"] * 3600))
+        expires = now + effect["hours"] * 3600
+        db.exec("INSERT INTO boosts (user_id, boost_key, expires_at, "
+                "effect_instance_id, source) VALUES (?, ?, ?, ?, 'purchase')",
+                (user_id, effect["key"], expires, instance))
+        payload.update(boost_key=effect["key"], expires_at=expires)
     elif effect["type"] == "bp_premium":
-        grant_bp_premium(user_id)
+        grant_bp_premium(user_id, now, source="purchase",
+                         source_ref=charge_id or "")
+        payload["source_ref"] = charge_id or ""
     elif effect["type"] == "offline_cap":
         # постоянный бонус; max — покупка старшего тира поверх младшего апгрейдит
-        user = db.get_user(user_id)
-        db.update_user(user_id, offline_bonus_hours=max(
-            offline_bonus_hours(user), effect["hours"]))
+        before = offline_bonus_hours(db.get_user(user_id))
+        after = max(before, effect["hours"])
+        db.update_user(user_id, offline_bonus_hours=after)
+        payload.update(hours=effect["hours"], hours_before=before,
+                       hours_after=after)
+    if charge_id:
+        db.exec("UPDATE purchases SET granted_payload = ?, granted_at = ?, "
+                "effect_instance_id = ? WHERE tg_payment_id = ?",
+                (json.dumps(payload, ensure_ascii=False), now, instance, charge_id))
+    return payload
 
 
 def fulfill_charge(charge_id: str) -> bool:

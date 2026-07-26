@@ -8,7 +8,8 @@ worker'ы безопасны; зависшие 'paid' довыдаются на 
 Тупиковые статусы (их разбирает человек, см. /api/admin/payments):
   'unmatched' — деньги пришли, но платёж не сходится с конфигом;
   'void'      — товар выдать нельзя (исчез из магазина / уже куплен навсегда);
-  'refunded'  — Telegram вернул звёзды, эффект откачен.
+  'refunded'  — Telegram вернул звёзды; prior_status хранит, из какого
+                состояния платёж туда уехал, то есть было ли что откатывать.
 """
 import logging
 import time
@@ -115,8 +116,15 @@ async def on_refunded(message: Message):
     charge_id = getattr(rp, "telegram_payment_charge_id", "") or ""
     if not charge_id:
         return
-    if gl.revoke_charge(charge_id):
-        log.warning("Stars refund processed: charge=%s user=%s",
-                    charge_id, message.from_user.id)
-        lang = (db.get_user(message.from_user.id) or {}).get("lang") or "en"
-        await message.answer(tr(lang, "pay_refunded"))
+    outcome = gl.revoke_charge(charge_id, getattr(rp, "total_amount", None))
+    if outcome in ("already_refunded", "no_row"):
+        log.warning("Stars refund ignored (%s): charge=%s user=%s",
+                    outcome, charge_id, message.from_user.id)
+        return
+    log.warning("Stars refund processed (%s): charge=%s user=%s",
+                outcome, charge_id, message.from_user.id)
+    lang = (db.get_user(message.from_user.id) or {}).get("lang") or "en"
+    # «бонус снят» — только если он и правда был выдан. По платежу, застрявшему
+    # в 'paid'/'void', снимать нечего, и об этом надо сказать прямо
+    await message.answer(tr(lang, "pay_refunded" if outcome == "revoked"
+                            else "pay_refunded_only"))

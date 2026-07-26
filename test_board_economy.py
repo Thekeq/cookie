@@ -526,15 +526,21 @@ check("gone item marked void",
             )["status"] == "void")
 
 # --- возврат звёзд снимает выданное ---
+# права чистим вместе с флагами: выше этот же игрок получал пасс вручную (тесты
+# переноса), и это ЗАКОННОЕ право — возврат покупки его не снимает и флаг
+# останется поднятым. Здесь проверяется другое: что покупка была единственным
+# основанием и после возврата не осталось ничего
+db.exec("DELETE FROM entitlements WHERE user_id = ?", (UID,))
 db.update_user(UID, bp_premium=0, bp_premium_next=0)
 db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
         "status, created_at) VALUES (?, 'bp_premium', 100, 'charge-ref-1', 'paid', ?)",
         (UID, time.time()))
 check("premium fulfilled", gl.fulfill_charge("charge-ref-1") is True
       and db.get_user(UID)["bp_premium"] == 1)
-check("refund processed", gl.revoke_charge("charge-ref-1") is True)
+check("refund processed", gl.revoke_charge("charge-ref-1") == "revoked")
 check("premium revoked on refund", db.get_user(UID)["bp_premium"] == 0)
-check("refund is idempotent", gl.revoke_charge("charge-ref-1") is False)
+check("refund is idempotent",
+      gl.revoke_charge("charge-ref-1") == "already_refunded")
 db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
 db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
         "status, created_at) VALUES (?, 'boost_x2_1h', 50, 'charge-ref-2', 'paid', ?)",
@@ -543,6 +549,84 @@ gl.fulfill_charge("charge-ref-2")
 check("boost granted by purchase", "click_x2" in gl.active_boosts(UID))
 gl.revoke_charge("charge-ref-2")
 check("boost revoked on refund", "click_x2" not in gl.active_boosts(UID))
+
+# --- возврат снимает СВОЙ буст, а не чужой с тем же ключом ---
+# click_x2 выдают три источника: boost_x2_1h, boost_x2_24h и награда за 3
+# рефералов. Удаление по boost_key снимало их все вместе со своим
+db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO boosts (user_id, boost_key, expires_at, source) "
+        "VALUES (?, 'click_x2', ?, 'ref_milestone')", (UID, time.time() + 86400))
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'boost_x2_1h', 50, 'charge-ref-3', 'paid', ?)",
+        (UID, time.time()))
+gl.fulfill_charge("charge-ref-3")
+check("two click_x2 sources coexist",
+      db.q1("SELECT COUNT(*) c FROM boosts WHERE user_id = ? AND boost_key = 'click_x2'",
+            (UID,))["c"] == 2)
+gl.revoke_charge("charge-ref-3")
+_left = db.q("SELECT source FROM boosts WHERE user_id = ? AND boost_key = 'click_x2'",
+             (UID,))
+check("refund took only the purchased boost",
+      [r["source"] for r in _left] == ["ref_milestone"], [r["source"] for r in _left])
+check("referral boost still active", "click_x2" in gl.active_boosts(UID))
+
+# покупка до миграции: ярлыка выдачи нет, и снять нужно РОВНО ОДНУ строку
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'boost_x2_24h', 90, 'charge-ref-4', 'paid', ?)",
+        (UID, time.time()))
+gl.fulfill_charge("charge-ref-4")
+db.exec("UPDATE purchases SET granted_payload = NULL, effect_instance_id = NULL "
+        "WHERE tg_payment_id = ?", ("charge-ref-4",))
+gl.revoke_charge("charge-ref-4")
+_left = db.q("SELECT source FROM boosts WHERE user_id = ? AND boost_key = 'click_x2'",
+             (UID,))
+check("legacy refund took exactly one boost row",
+      [r["source"] for r in _left] == ["ref_milestone"], [r["source"] for r in _left])
+db.exec("DELETE FROM boosts WHERE user_id = ?", (UID,))
+
+# --- возврат младшего тира оффлайн-капа не роняет владельца старшего ---
+# эффект применяется как max(), поэтому вычитание часов ломало владельца 12ч:
+# возврат базовых 6ч ронял его до 6ч. Считается пересчётом по остаткам
+db.exec("DELETE FROM purchases WHERE user_id = ?", (UID,))
+db.update_user(UID, offline_bonus_hours=0)
+for _cid, _item in (("charge-cap-1", "offline_cap_6h"),
+                    ("charge-cap-2", "offline_cap_12h_up")):
+    db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+            "status, created_at) VALUES (?, ?, 100, ?, 'paid', ?)",
+            (UID, _item, _cid, time.time()))
+    gl.fulfill_charge(_cid)
+check("cap upgraded to top tier", db.get_user(UID)["offline_bonus_hours"] == 9,
+      db.get_user(UID)["offline_bonus_hours"])
+gl.revoke_charge("charge-cap-1")
+check("base tier refund keeps the top tier",
+      db.get_user(UID)["offline_bonus_hours"] == 9,
+      db.get_user(UID)["offline_bonus_hours"])
+gl.revoke_charge("charge-cap-2")
+check("last tier refund drops the cap to zero",
+      db.get_user(UID)["offline_bonus_hours"] == 0,
+      db.get_user(UID)["offline_bonus_hours"])
+
+# --- возврат покупки не снимает пасс, выданный другим источником ---
+db.exec("DELETE FROM entitlements WHERE user_id = ?", (UID,))
+db.update_user(UID, bp_premium=0, bp_premium_next=0)
+gl.grant_bp_premium(UID, source="ref_milestone", source_ref="refs_premium")
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'bp_premium', 100, 'charge-ref-5', 'paid', ?)",
+        (UID, time.time()))
+db.update_user(UID, bp_premium=0)   # иначе выдача уедет в void как «уже есть»
+gl.fulfill_charge("charge-ref-5")
+check("purchase right recorded",
+      db.q1("SELECT COUNT(*) c FROM entitlements WHERE user_id = ? AND kind = 'bp_premium'",
+            (UID,))["c"] >= 2)
+gl.revoke_charge("charge-ref-5")
+check("referral premium survives the refund", db.get_user(UID)["bp_premium"] == 1,
+      str([dict(r) for r in db.q("SELECT source, source_ref, season_id FROM entitlements "
+                                 "WHERE user_id = ?", (UID,))]))
+check("only the purchased right was taken",
+      db.q1("SELECT COUNT(*) c FROM entitlements WHERE user_id = ? "
+            "AND source = 'purchase'", (UID,))["c"] == 0)
+db.exec("DELETE FROM entitlements WHERE user_id = ?", (UID,))
+db.update_user(UID, bp_premium=0, bp_premium_next=0)
 
 # --- клейм заказа не платит дважды ---
 db.exec("DELETE FROM orders WHERE user_id = ?", (UID,))
