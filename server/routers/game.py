@@ -153,7 +153,7 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
                     "energy": user["energy"], "cookies": user["cookies"]}
 
         combo = gl.update_combo(user, clicks, now)
-        earned = (clicks * cfg.click_power(user["click_level"])
+        earned = (clicks * cfg.click_power(user["click_level"], gl.income_base(tg["id"]))
                   * gl.click_multiplier(tg["id"]) * combo)
 
         # дневной счётчик кликов: после мягкого капа XP за клик режется вчетверо
@@ -191,7 +191,7 @@ async def upgrade_click(tg: dict = Depends(tg_user)):
         # одних денег мало, иначе ветка клика разгоняет инфляцию без предела
         if user["click_level"] >= cfg.click_max_level(user["level"]):
             raise HTTPException(400, "err_click_max")
-        cost = cfg.click_upgrade_cost(user["click_level"])
+        cost = cfg.click_upgrade_cost(user["click_level"], gl.income_base(tg["id"]))
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
         db.update_user(tg["id"], cookies=user["cookies"] - cost,
@@ -300,7 +300,12 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
                 (tg["id"], cell, level, cost))
         gl.quest_progress(tg["id"], "spawns", 1)
         gl.order_progress(tg["id"], "spawns", 1)
-    return gl.full_state(tg["id"])
+        # прямая покупка тоже бьёт рекорд: иначе игрок, купивший тир напрямую,
+        # получал бы за него XP только после того, как соберёт его слиянием
+        record = gl.claim_item_record(db.get_user(tg["id"]), level)
+    state = gl.full_state(tg["id"])
+    state["record"] = record
+    return state
 
 
 @router.post("/merge/move")
@@ -357,6 +362,8 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
         gl.quest_progress(tg["id"], "merges", 1)
         gl.order_progress(tg["id"], "merges", 1)
         gl.order_progress(tg["id"], "make_item", new_level)
+        # рекорд тира — основной XP игры, начисляется один раз за тир
+        record = gl.claim_item_record(db.get_user(tg["id"]), new_level)
         shiny_level = gl.roll_shiny(db.get_user(tg["id"]), new_level)
     if user["total_merges"] == 0:
         gl.track(tg["id"], "first_merge")
@@ -365,6 +372,7 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
     state["merged_level"] = new_level
     state["shiny"] = shiny_level is not None
     state["shiny_level"] = shiny_level
+    state["record"] = record
     return state
 
 

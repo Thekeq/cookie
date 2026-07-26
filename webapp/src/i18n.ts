@@ -50,6 +50,7 @@ const dict = {
   buy_cookie: { en: 'Buy cookie', uk: 'Купити печиво', ru: 'Купить печеньку' },
   merge_hint: { en: 'Drag a cookie onto the same one to merge. Max unlocked:', uk: 'Перетягни печиво на таке саме — вони зіллються. Максимум відкрито:', ru: 'Перетащи печеньку на такую же — они сольются. Максимум открыт:' },
   merged_lvl: { en: 'Created a level {n} cookie!', uk: 'Створено печиво {n} рівня!', ru: 'Создана печенька {n} уровня!' },
+  record_lvl: { en: '🏆 New record: tier {n}! +{xp} XP', uk: '🏆 Новий рекорд: тір {n}! +{xp} XP', ru: '🏆 Новый рекорд: тир {n}! +{xp} XP' },
   cells_count: { en: 'Cells: {a}/{b}', uk: 'Клітинки: {a}/{b}', ru: 'Клетки: {a}/{b}' },
   cell_next_lvl: { en: '+1 at level {n}', uk: '+1 на {n} рівні', ru: '+1 на {n} уровне' },
   cell_next_ref: { en: '+1 for {n} friends', uk: '+1 за {n} друзів', ru: '+1 за {n} друзей' },

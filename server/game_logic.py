@@ -980,6 +980,14 @@ def invalidate_income(user_id: int | None = None):
         _income_memo.pop(user_id, None)
 
 
+def income_base(user_id: int) -> float:
+    """Доход в час БЕЗ учёта кликов: ферма + пассивка доски.
+
+    От него считается сила клика (cfg.click_power). Брать полный hourly_income
+    нельзя — тот сам включает оценку кликов, и получилась бы рекурсия."""
+    return farm_cps(user_id) * 3600 + passive_per_hour(user_id)
+
+
 def hourly_income(user_id: int) -> float:
     """Оценка часового дохода игрока для масштабируемых наград и цен:
     ферма + пассивка доски + скромная оценка кликов (5 мин активного тапа).
@@ -992,9 +1000,10 @@ def hourly_income(user_id: int) -> float:
     user = db.get_user(user_id)
     if not user:
         return 0.0
-    clicks_estimate = (cfg.click_power(user["click_level"])
+    base = income_base(user_id)
+    clicks_estimate = (cfg.click_power(user["click_level"], base)
                        * permanent_click_multiplier(user_id) * 5 * 60)
-    value = farm_cps(user_id) * 3600 + passive_per_hour(user_id) + clicks_estimate
+    value = base + clicks_estimate
     if len(_income_memo) > 10_000:
         _income_memo.clear()
     _income_memo[user_id] = (now, value)
@@ -1283,6 +1292,31 @@ def claim_order(user: dict) -> dict:
 
 # ---------- коллекция блестящих печенек ----------
 
+def claim_item_record(user: dict, item_level: int) -> dict | None:
+    """Награда за ЛИЧНЫЙ РЕКОРД тира — основной источник XP уровня.
+
+    Платим за КАЖДЫЙ тир от старого рекорда до нового, а не только за
+    достигнутый: прямая покупка тира (spawn_direct) позволяет перепрыгнуть
+    несколько ступеней, и иначе их XP пропадал бы молча.
+
+    Возвращает описание награды для ответа ручки или None, если рекорд не
+    побит (подавляющее большинство мерджей)."""
+    uid = user["user_id"]
+    best = user["best_item_level"] or 0
+    if item_level <= best:
+        return None
+    levels = range(max(best + 1, 2), item_level + 1)
+    xp = sum(cfg.first_item_xp(l) for l in levels)
+    bp_xp = sum(cfg.first_item_bp_xp(l) for l in levels)
+    cookies = cfg.scaled_reward(0, "item_record", hourly_income(uid))
+    db.update_user(uid, best_item_level=item_level)
+    if cookies:
+        add_cookies(uid, cookies)
+    add_xp(db.get_user(uid), xp, bp_xp)
+    track(uid, "item_record", item_level)
+    return {"level": item_level, "xp": xp, "cookies": cookies}
+
+
 def roll_shiny(user: dict, item_level: int) -> int | None:
     """Бросок на блестяшку при мердже; pity гарантирует дроп раз в SHINY_PITY.
     Возвращает уровень попавший в альбом или None.
@@ -1551,6 +1585,7 @@ def full_state(user_id: int) -> dict:
     items_count = len(board)
     income = hourly_income(user_id)          # награды масштабируются от дохода
     board_income = board_base_income(user_id)  # цены спавна — только от доски
+    base_income = income_base(user_id)        # сила клика — от фермы и доски
     nxt = user["level"] + 1
     eff = upgrade_effects(user_id)
     owned_skins = {r["skin_key"] for r in
@@ -1570,12 +1605,13 @@ def full_state(user_id: int) -> dict:
             # фактическая скорость регена (с апгрейдами) — клиент рисует такой же тик
             "energy_regen": cfg.ENERGY_REGEN_PER_SEC + eff["energy_regen"],
             "click_level": user["click_level"],
-            "click_power": cfg.click_power(user["click_level"]) * click_multiplier(user_id),
-            # сила СЛЕДУЮЩЕГО уровня приходит с сервера: она растёт
-            # экспоненциально, и клиентское «+1 за уровень» дезинформировало
-            "click_power_next": (cfg.click_power(user["click_level"] + 1)
+            "click_power": (cfg.click_power(user["click_level"], base_income)
+                            * click_multiplier(user_id)),
+            # сила СЛЕДУЮЩЕГО уровня приходит с сервера: она считается от
+            # дохода, и клиентское «+1 за уровень» дезинформировало
+            "click_power_next": (cfg.click_power(user["click_level"] + 1, base_income)
                                  * click_multiplier(user_id)),
-            "click_upgrade_cost": cfg.click_upgrade_cost(user["click_level"]),
+            "click_upgrade_cost": cfg.click_upgrade_cost(user["click_level"], base_income),
             "total_clicks": user["total_clicks"],
             "total_merges": user["total_merges"],
             "bp_xp": user["bp_xp"],

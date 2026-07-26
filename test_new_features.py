@@ -256,11 +256,16 @@ r = c.post("/api/promo/redeem", json={"code": "NOPE123"}, headers=H(UID))
 check("errors are err_ codes", r.json()["detail"].startswith("err_"), r.text[:100])
 
 # --- покупка при «натикавшем» доходе фермы (баг «деньги есть, купить не даёт») ---
-db.update_user(UID, cookies=50, click_level=1,
-               farm_collected_at=time.time() - 60, passive_collected_at=time.time())
 db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'cursor', 10) "
         "ON CONFLICT(user_id, building_key) DO UPDATE SET count = 10", (UID,))
-# на счету 50, апгрейд стоит 100, но за 60с ферма натикала 10*0.5*60 = 300
+# цену берём из конфига, а не константой: она считается в часах дохода
+# (click_upgrade_cost), и 10 курсоров делают её тысячами, а не сотней
+_cps = gl.farm_cps(UID)
+_cost = cfg.click_upgrade_cost(1, _cps * 3600 + gl.passive_per_hour(UID))
+# на счету не хватает, но за 60с ферма натикала ровно столько, чтобы хватило
+_pending = _cps * 60
+db.update_user(UID, cookies=_cost - _pending + 1, click_level=1,
+               farm_collected_at=time.time() - 60, passive_collected_at=time.time())
 r = c.post("/api/click/upgrade", headers=H(UID))
 check("buy with pending farm income", r.status_code == 200, r.text[:150])
 check("balance collected before charge", db.get_user(UID)["cookies"] > 0)

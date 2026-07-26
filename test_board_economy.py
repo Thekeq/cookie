@@ -108,29 +108,79 @@ for _lvl, _cells in ((6, 8), (10, 12), (16, 20)):
     _gaps.append(_direct / _merge)
     check(f"merge cheaper than direct at lvl{_lvl}", _direct > _merge,
           f"{_direct:.0f} vs {_merge:.0f}")
-check("direct premium grows with tier", _gaps == sorted(_gaps), str(_gaps))
+# при нейтральном мердже (PASSIVE_GROWTH = 2.0) наценка прямой покупки одна и
+# та же на всех тирах — раньше она росла, потому что доход обгонял ветвление
+check("direct premium is the same at every tier",
+      max(_gaps) - min(_gaps) < 0.01, str(_gaps))
 # прямая покупка окупается за разумное время, а не за миллионы часов
 for _lvl, _cells in ((6, 8), (16, 20)):
     _h = cfg.direct_spawn_cost(_lvl, _cells) / cfg.passive_income_per_hour(_lvl)
     check(f"direct lvl{_lvl} pays back in {_h:.0f}h", _h <= 60, f"{_h:.1f}h")
 
-# --- слияние ОБЯЗАНО увеличивать доход, а не уменьшать ---
-# при базе 1.7 каждый мердж выше 12 уровня давал -15%: две печеньки давали
-# больше, чем одна следующего уровня, и основной цикл работал против игрока
+# --- слияние обязано быть НЕЙТРАЛЬНЫМ по доходу ---
+# Обе крайности ломали игру, и обе уже случались:
+#   база 1.7  — мердж выше 12 тира давал -15%, цикл работал против игрока;
+#   база 2.15 — мердж давал +7.5%, каждый следующий тир окупался БЫСТРЕЕ
+#               предыдущего, и максимальный тир брался за пару часов.
+# Ровно 2.0: две печеньки дают столько же, сколько одна следующего тира, а
+# прибыль игрок получает из освободившейся клетки.
 for _l in range(3, cfg.MAX_ITEM_LEVEL):
     _two = 2 * cfg.passive_income_per_hour(_l)
     _one = cfg.passive_income_per_hour(_l + 1)
-    check(f"merge L{_l} raises income", _one > _two,
+    check(f"merge L{_l} is income-neutral", abs(_one - _two) < 1e-6,
           f"{_two:.0f} -> {_one:.0f}")
 
-# --- клик обязан оставаться живым ---
-# Окупаемость мягко растёт (сила 1.55 против цены 1.8), но остаётся в часах,
-# а не в годах: при линейной силе апгрейд с 30 уровня окупался 52 000 часов.
+# Главное следствие нейтральности: окупаемость тира ОДИНАКОВА на всём
+# диапазоне и равна ITEM_PAYBACK_HOURS. Раньше она падала с 4.80ч до 1.05ч —
+# игра прямо вознаграждала забег в топ-тир.
+_paybacks = []
+for _l in range(4, cfg.MAX_ITEM_LEVEL + 1):
+    _paybacks.append(cfg.item_base_price(_l) / cfg.passive_income_per_hour(_l))
+check("payback is flat across tiers",
+      max(_paybacks) - min(_paybacks) < 0.01, f"{min(_paybacks):.2f}..{max(_paybacks):.2f}h")
+check("payback equals ITEM_PAYBACK_HOURS",
+      abs(_paybacks[0] - cfg.ITEM_PAYBACK_HOURS) < 0.01, f"{_paybacks[0]:.2f}h")
+
+# --- XP уровня нельзя купить печеньками ---
+# Дерево слияний до тира L стоит 2^(L-1) спавнов, поэтому ЛЮБОЙ XP «за мердж»
+# пропорционален числу спавнов. Раньше это давало ~53 XP за спавн: 30-й
+# уровень стоил ~5 500 спавнов ~ 1.4M печенек, то есть минуты дохода доски.
+def _tree_xp(L):
+    return sum(2 ** (L - k) * cfg.merge_reward_xp(k) for k in range(2, L + 1))
+for _l in (10, 16, 22):
+    _per_spawn = _tree_xp(_l) / 2 ** (_l - 1)
+    check(f"volume xp at L{_l} stays a trickle", _per_spawn <= 10,
+          f"{_per_spawn:.1f} XP/спавн")
+# объёмный XP не должен один закрывать ветку уровней
+_by_volume = cfg.xp_for_level(cfg.MAX_LEVEL) / (_tree_xp(16) / 2 ** 15)
+check("level 30 needs a lot of spawns by volume alone", _by_volume > 40_000,
+      f"{_by_volume:,.0f} спавнов")
+# рекорды тиров закрывают ровно свою долю — сумма телескопируется по лестнице
+_records = sum(cfg.first_item_xp(_l) for _l in range(2, cfg.MAX_ITEM_LEVEL + 1))
+_share = _records / cfg.xp_for_level(cfg.MAX_LEVEL)
+check("records cover their designed share of the ladder",
+      abs(_share - cfg.FIRST_ITEM_XP_SHARE) < 0.06, f"{_share:.2f}")
+# верхний тир — главное достижение игры, он не может награждаться флором
+check("top tier record is not a floor",
+      cfg.first_item_xp(cfg.MAX_ITEM_LEVEL) > 1000,
+      f"{cfg.first_item_xp(cfg.MAX_ITEM_LEVEL):.0f} XP")
+
+# --- клик обязан оставаться живым, но не абсурдным ---
+# Абсолютная экспонента 1.55^(L-1) при потолке click_max_level(30) = 64 давала
+# 9.8e11 за клик. Теперь сила — доля дохода, поэтому проверяем именно её.
 for _cl in (1, 10, 20, 30):
-    _inc = cfg.ENERGY_REGEN_PER_SEC * 3600 * cfg.click_power(_cl)
-    _pay = cfg.click_upgrade_cost(_cl) / _inc
-    check(f"click upgrade at lvl{_cl} pays back in {_pay:.2f}h", _pay <= 8.0,
+    _inc = cfg.ENERGY_REGEN_PER_SEC * 3600 * cfg.click_power(_cl, 1e6)
+    _pay = cfg.click_upgrade_cost(_cl, 1e6) / _inc
+    check(f"click upgrade at lvl{_cl} pays back in {_pay:.2f}h", _pay <= 12.0,
           f"{_pay:.2f}h")
+# тапать без остановки не должно обгонять всю остальную экономику
+_top = cfg.click_max_level(cfg.MAX_LEVEL)
+_share_top = cfg.click_power(_top, 1e6) * cfg.ENERGY_REGEN_PER_SEC * 3600 / 1e6
+check("full-time tapping stays comparable to income", 0.3 <= _share_top <= 2.0,
+      f"x{_share_top:.2f} дохода")
+# и сила клика обязана масштабироваться вместе с доходом, а не отставать
+check("click scales with income",
+      cfg.click_power(20, 1e9) > cfg.click_power(20, 1e6) * 100)
 # потолок по уровню игрока не даёт ветке клика разгонять инфляцию
 check("click level gated by player level",
       cfg.click_max_level(1) < cfg.click_max_level(30) <= 70,
@@ -281,7 +331,13 @@ check("merge sums paid",
           - 1000) < 1)
 
 # --- BP XP за мердж ограничен капом ---
-check("merge bp xp capped", cfg.merge_reward_bp_xp(24) == cfg.MERGE_BP_XP_CAP)
+# Рядовой мердж режется объёмным капом (он ниже, чем MERGE_BP_XP_CAP), а сам
+# MERGE_BP_XP_CAP теперь охраняет рекорды тира — единственную крупную выплату.
+check("merge bp xp capped", cfg.merge_reward_bp_xp(24) == cfg.MERGE_VOLUME_XP_CAP)
+check("record bp xp capped", cfg.first_item_bp_xp(cfg.MAX_ITEM_LEVEL) <= cfg.MERGE_BP_XP_CAP)
+check("top record is a small slice of the pass",
+      cfg.first_item_bp_xp(cfg.MAX_ITEM_LEVEL) / cfg.bp_total_xp(cfg.BP_MAX_LEVEL) < 0.05,
+      str(cfg.first_item_bp_xp(cfg.MAX_ITEM_LEVEL) / cfg.bp_total_xp(cfg.BP_MAX_LEVEL)))
 check("top merge is a small slice of the pass",
       cfg.merge_reward_bp_xp(24) / cfg.bp_total_xp(cfg.BP_MAX_LEVEL) < 0.05,
       str(cfg.merge_reward_bp_xp(24) / cfg.bp_total_xp(cfg.BP_MAX_LEVEL)))

@@ -33,6 +33,10 @@ class DataBase:
                 'total_earned': 'REAL DEFAULT 0',     # всего заработано (для ачивок/уровней)
                 'total_clicks': 'INTEGER DEFAULT 0',
                 'total_merges': 'INTEGER DEFAULT 0',
+                # рекорд тира: с него платится first_item_xp — основной XP игры.
+                # 0 у старых аккаунтов, поднимается до факта при первом мердже
+                # (см. game_logic.claim_item_record)
+                'best_item_level': 'INTEGER DEFAULT 0',
                 'click_level': 'INTEGER DEFAULT 1',   # прокачка силы клика
                 'energy': 'REAL DEFAULT 500',
                 'energy_updated_at': 'REAL DEFAULT 0',
@@ -398,7 +402,31 @@ class DataBase:
                     print(f"[*] Миграция: Добавлен новый столбец {col_name} в {table_name}")
                     self.cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
 
+        self._backfill_best_item_level()
         self.connection.commit()
+
+    def _backfill_best_item_level(self):
+        """Проставляет рекорд тира старым аккаунтам ПО ФАКТУ их прогресса.
+
+        Без этого миграция дарит уровни: first_item_xp платится за каждый тир
+        от best_item_level+1 до нового, а у всех существующих игроков колонка
+        приезжает нулём. Ветеран с доской 20 тира получил бы за первый же мердж
+        рекорды за тиры 1..20 — это вся ветка уровней разом.
+
+        Берём максимум из доски и альбома коллекции. Обновляем только нули,
+        поэтому повторный запуск ничего не портит."""
+        self.cursor.execute("SELECT COUNT(*) c FROM users WHERE best_item_level = 0")
+        if not self.cursor.fetchone()["c"]:
+            return
+        self.cursor.execute("""
+            UPDATE users SET best_item_level = MAX(
+                COALESCE((SELECT MAX(item_level) FROM board b
+                          WHERE b.user_id = users.user_id), 0),
+                COALESCE((SELECT MAX(item_level) FROM collection c
+                          WHERE c.user_id = users.user_id), 0))
+            WHERE best_item_level = 0""")
+        if self.cursor.rowcount:
+            print(f"[*] Миграция: рекорд тира проставлен {self.cursor.rowcount} игрокам")
 
     # ---------- универсальные хелперы ----------
 

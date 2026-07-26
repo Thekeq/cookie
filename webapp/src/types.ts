@@ -144,6 +144,8 @@ export interface GameState {
   shiny?: boolean
   /** уровень, попавший в альбом (не всегда равен merged_level) */
   shiny_level?: number | null
+  /** личный рекорд тира взят впервые — основная награда XP за мердж */
+  record?: { level: number; xp: number; cookies: number } | null
   prestige: {
     points: number
     count: number

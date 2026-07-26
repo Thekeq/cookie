@@ -112,12 +112,22 @@ export default function MergeTab() {
           // на недостающий уровень, чтобы бросок не уходил в пустоту
           setShinyCell(to)
           setTimeout(() => setShinyCell(null), 1800)
+        }
+        const shinyMsg = s.shiny
+          ? s.shiny_level
+            ? `${t('shiny_drop')} ${COOKIE_SKINS[s.shiny_level]} ${s.shiny_level}`
+            : t('shiny_drop')
+          : null
+        // Рекорд тира — главная награда за мердж, XP за рядовое слияние рядом с
+        // ним ничто. Слот тоста один, поэтому рекорд его и занимает, а блестяшку
+        // не теряем: дописываем в ту же строку
+        if (s.record)
           toast(
-            s.shiny_level
-              ? `${t('shiny_drop')} ${COOKIE_SKINS[s.shiny_level]} ${s.shiny_level}`
-              : t('shiny_drop'),
+            t('record_lvl', { n: s.record.level, xp: fmt(s.record.xp) }) +
+              (shinyMsg ? ` · ${shinyMsg}` : ''),
           )
-        } else if (s.merged_level >= 5)
+        else if (shinyMsg) toast(shinyMsg)
+        else if (s.merged_level >= 5)
           toast(`${t('merged_lvl', { n: s.merged_level })} ${COOKIE_SKINS[s.merged_level]}`)
       } else {
         haptic('light')
@@ -221,6 +231,8 @@ export default function MergeTab() {
       setState(s)
       haptic('medium')
       sfxBuy()
+      // покупка тира выше личного рекорда — тоже рекорд, и платит так же
+      if (s.record) toast(t('record_lvl', { n: s.record.level, xp: fmt(s.record.xp) }))
     } catch (e: any) {
       sfxError()
       toast(te(e.detail), true)
