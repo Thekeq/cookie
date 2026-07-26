@@ -170,7 +170,7 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
             cps_ts=now, cps_allowance=allowance - clicks,
         )
         gl.add_cookies(tg["id"], earned)
-        gl.add_xp(db.get_user(tg["id"]), xp)
+        gl.add_xp(tg["id"], xp)
         gl.quest_progress(tg["id"], "clicks", clicks)
         gl.order_progress(tg["id"], "clicks", clicks)
 
@@ -362,8 +362,9 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
         db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
         db.exec("UPDATE board SET item_level = ?, paid = ? WHERE user_id = ? AND cell = ?",
                 (new_level, paid, tg["id"], mv.to_cell))
-        db.update_user(tg["id"], total_merges=user["total_merges"] + 1)
-        gl.add_xp(db.get_user(tg["id"]), cfg.merge_reward_xp(new_level),
+        db.exec("UPDATE users SET total_merges = total_merges + 1 "
+                "WHERE user_id = ?", (tg["id"],))
+        gl.add_xp(tg["id"], cfg.merge_reward_xp(new_level),
                   cfg.merge_reward_bp_xp(new_level))
         gl.quest_progress(tg["id"], "merges", 1)
         gl.order_progress(tg["id"], "merges", 1)

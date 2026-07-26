@@ -415,6 +415,79 @@ check("8.5 balance_after последней строки равен колонк
       abs(ledger(P, "cookies")[-1]["balance_after"] - db.get_user(P)["cookies"]) < 1e-6)
 
 # ==========================================================================
+# 8b. XP и bp_xp
+# ==========================================================================
+X = BASE + 9
+db.create_user(X, "x", "X")
+gl.add_xp(X, 100.0)
+u = db.get_user(X)
+check("8b.1 xp и bp_xp начислены", u["xp"] == 100.0 and u["bp_xp"] == 100.0)
+check("8b.2 оба движения в книге под одним токеном",
+      len(ledger(X, "xp")) == 1 and len(ledger(X, "bp_xp")) == 1
+      and ledger(X, "xp")[0]["operation_id"] == ledger(X, "bp_xp")[0]["operation_id"])
+check("8b.3 второе движение операции под seq=1", ledger(X, "bp_xp")[0]["seq"] == 1)
+
+gl.add_xp(X, 50.0, 5.0)
+u = db.get_user(X)
+check("8b.4 отдельный bp_xp не равен xp", u["xp"] == 150.0 and u["bp_xp"] == 105.0)
+check("8b.5 xp сходится с книгой", abs(ec.reconcile(X)["xp"]["drift"]) < 1e-6,
+      ec.reconcile(X)["xp"])
+check("8b.6 bp_xp из сверки исключён — его обнуляет ролловер",
+      "bp_xp" not in ec.reconcile(X))
+
+gl.add_xp(X, 0, 30.0)
+check("8b.7 начисление только в пасс не трогает xp",
+      db.get_user(X)["xp"] == 150.0 and db.get_user(X)["bp_xp"] == 135.0)
+check("8b.8 и не пишет строку по xp", len(ledger(X, "xp")) == 2)
+
+n_xp = len(ledger(X, "xp"))
+gl.add_xp(X, 0, 0)
+check("8b.9 пустое начисление не пишет и не двигает",
+      len(ledger(X, "xp")) == n_xp and db.get_user(X)["xp"] == 150.0)
+
+raises("8b.10 NaN в xp ловится до SQL",
+       lambda: gl.add_xp(X, float("nan")), ValueError, "err_bad_amount")
+
+# потолок уровней: xp переливается в пасс
+db.update_user(X, level=cfg.MAX_LEVEL)
+xp_before, bp_before = db.get_user(X)["xp"], db.get_user(X)["bp_xp"]
+gl.add_xp(X, 1000.0)
+u = db.get_user(X)
+expect_bp = bp_before + 1000.0 + min(1000.0 * cfg.MAXLEVEL_XP_TO_BP, cfg.MERGE_BP_XP_CAP)
+check("8b.11 на потолке уровней xp не растёт", u["xp"] == xp_before, u["xp"])
+check("8b.12 ...а перелив уходит в пасс", u["bp_xp"] == expect_bp,
+      f"{u['bp_xp']} != {expect_bp}")
+check("8b.13 книга не написала строку по xp, которой не было",
+      len(ledger(X, "xp")) == n_xp)
+check("8b.14 xp по-прежнему сходится на потолке",
+      abs(ec.reconcile(X)["xp"]["drift"]) < 1e-6, ec.reconcile(X)["xp"])
+check("8b.15 перелив в книге равен тому, что записано в колонку",
+      ledger(X, "bp_xp")[-1]["amount"] == 1000.0 + min(
+          1000.0 * cfg.MAXLEVEL_XP_TO_BP, cfg.MERGE_BP_XP_CAP))
+
+raises("8b.16 начисление xp несуществующему игроку падает",
+       lambda: gl.add_xp(BASE + 999_998, 10.0), ValueError, "err_no_user")
+
+# ==========================================================================
+# 8c. Дневной счётчик заказов — относительный
+# ==========================================================================
+N = BASE + 10
+db.create_user(N, "n", "N")
+today = gl._utc_day(time.time())
+gl._bump_orders_day(N, today, completed=True)
+gl._bump_orders_day(N, today)
+u = db.get_user(N)
+check("8c.1 два прохода дают два, а не один",
+      u["orders_day_count"] == 2 and u["orders_day"] == today, dict(u)["orders_day_count"])
+check("8c.2 completed считается отдельно", u["orders_completed"] == 1)
+
+gl._bump_orders_day(N, "1970-01-01")
+u = db.get_user(N)
+check("8c.3 новый день сбрасывает счётчик в единицу",
+      u["orders_day_count"] == 1 and u["orders_day"] == "1970-01-01")
+check("8c.4 всего выполненных не сбрасывается днём", u["orders_completed"] == 1)
+
+# ==========================================================================
 # 9. drift_report ловит запись мимо книги
 # ==========================================================================
 D = BASE + 8

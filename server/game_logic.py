@@ -412,8 +412,7 @@ def claim_quest(user: dict, key: str) -> dict:
                    (row["id"],)) == 0:
             raise ValueError("err_claimed")
         add_cookies(user["user_id"], reward, count_earned=False)
-        db.update_user(user["user_id"],
-                       bp_xp=db.get_user(user["user_id"])["bp_xp"] + bp_xp)
+        add_xp(user["user_id"], 0, bp_xp)
     return {"reward_cookies": reward, "reward_bp_xp": bp_xp}
 
 
@@ -839,18 +838,49 @@ def collect_farm(user: dict) -> float:
 
 # ---------- XP и уровни ----------
 
-def add_xp(user: dict, xp: float, bp_xp: float | None = None) -> dict:
+def add_xp(user_id: int, xp: float, bp_xp: float | None = None) -> dict:
     """Начисляет XP; level-up происходит на вкладке уровней (claim), тут только
     копим. bp_xp можно задать отдельно: у мерджа он ограничен капом, иначе одно
-    топ-слияние закрывало бы весь сезонный пасс."""
-    bp_xp = xp if bp_xp is None else bp_xp
-    # на потолке уровней XP копился в пустоту (мердж 24 lvl давал 58 208 XP
-    # в никуда) — переливаем его в батл-пасс, там прогресс продолжается
-    if user["level"] >= cfg.MAX_LEVEL and xp > 0:
-        bp_xp += min(xp * cfg.MAXLEVEL_XP_TO_BP, cfg.MERGE_BP_XP_CAP)
-        xp = 0
-    db.update_user(user["user_id"], xp=user["xp"] + xp, bp_xp=user["bp_xp"] + bp_xp)
-    return dict(user, xp=user["xp"] + xp, bp_xp=user["bp_xp"] + bp_xp)
+    топ-слияние закрывало бы весь сезонный пасс.
+
+    И сложение, и развилка «лить XP или переливать в пасс» выполняются в базе.
+    Раньше обе считались из прочитанного заранее словаря: два мерджа подряд —
+    а на активной игре они идут пачками — читали одно и то же значение и второй
+    затирал первый. Пропадал не мусор, а основной XP игры."""
+    xp = economy._sane(xp, "add_xp.xp")
+    bp_xp = xp if bp_xp is None else economy._sane(bp_xp, "add_xp.bp_xp")
+    if not xp and not bp_xp:
+        return db.get_user(user_id)
+    op = economy.auto_op(user_id, "xp_gain")
+    with db.tx():
+        # на потолке уровней XP копился в пустоту (мердж 24 lvl давал 58 208 XP
+        # в никуда) — переливаем его в батл-пасс, там прогресс продолжается
+        row = db.q1w(
+            "UPDATE users SET "
+            "xp = xp + CASE WHEN level >= ? AND ? > 0 THEN 0 ELSE ? END, "
+            "bp_xp = bp_xp + ? + CASE WHEN level >= ? AND ? > 0 "
+            f"THEN {db.LEAST}(? * ?, ?) ELSE 0 END, "
+            "user_revision = user_revision + 1 "
+            "WHERE user_id = ? RETURNING xp, bp_xp, level, season_id",
+            (cfg.MAX_LEVEL, xp, xp, bp_xp, cfg.MAX_LEVEL, xp,
+             xp, cfg.MAXLEVEL_XP_TO_BP, cfg.MERGE_BP_XP_CAP, user_id))
+        if row is None:
+            raise ValueError("err_no_user")
+        # ту же развилку повторяем для книги — но не отдельным чтением, а по
+        # level из этого же RETURNING: сам statement его не трогает, значит это
+        # ровно то значение, на котором сработал CASE
+        if row["level"] >= cfg.MAX_LEVEL and xp > 0:
+            moved_xp = 0.0
+            moved_bp = bp_xp + min(xp * cfg.MAXLEVEL_XP_TO_BP, cfg.MERGE_BP_XP_CAP)
+        else:
+            moved_xp, moved_bp = xp, bp_xp
+        if moved_xp:
+            economy.record(user_id, "xp", moved_xp, "xp_gain", row["xp"], op,
+                           season_id=row["season_id"])
+        if moved_bp:
+            economy.record(user_id, "bp_xp", moved_bp, "xp_gain", row["bp_xp"], op,
+                           seq=1, season_id=row["season_id"])
+    return row
 
 
 def level_reward_scaled(level: int, income: float) -> dict:
@@ -1321,12 +1351,33 @@ def abandon_order(user: dict) -> dict:
     if not row:
         raise ValueError("err_no_item")
     day = _utc_day(time.time())
-    used = user["orders_day_count"] if user["orders_day"] == day else 0
     with db.tx():
         db.exec("DELETE FROM orders WHERE id = ?", (row["id"],))
-        db.update_user(uid, orders_day=day, orders_day_count=used + 1)
+        _bump_orders_day(uid, day)
     track(uid, "order_abandon")
     return orders_state(db.get_user(uid))
+
+
+def _bump_orders_day(user_id: int, day: str, completed: bool = False):
+    """Дневной счётчик заказов — одним относительным UPDATE.
+
+    Считался в питоне от заранее прочитанного словаря: сдать заказ и бросить
+    другой почти одновременно означало записать одно и то же `used + 1` дважды,
+    и один из двух заказов дневного лимита не стоил. Смена дня решается тем же
+    стейтментом (CASE по orders_day), поэтому отдельного чтения не нужно.
+
+    Лимит тут НЕ проверяется намеренно: заказ уже выполнен, отказать на этом
+    шаге значило бы забрать у игрока честную награду. Ворота стоят на взятии
+    заказа (take_order), а от двух одновременных взятий защищает уникальность
+    активного заказа."""
+    db.exec(
+        "UPDATE users SET "
+        "orders_day = ?, "
+        "orders_day_count = CASE WHEN orders_day = ? THEN orders_day_count + 1 "
+        "                        ELSE 1 END, "
+        + ("orders_completed = orders_completed + 1, " if completed else "") +
+        "user_revision = user_revision + 1 "
+        "WHERE user_id = ?", (day, day, user_id))
 
 
 def order_progress(user_id: int, metric: str, amount: float):
@@ -1351,7 +1402,6 @@ def claim_order(user: dict) -> dict:
     if row["progress"] < row["goal"]:
         raise ValueError("err_not_done")
     day = _utc_day(time.time())
-    used = user["orders_day_count"] if user["orders_day"] == day else 0
     first = user["orders_completed"] == 0
     # платим по ТЕКУЩЕМУ доходу: хранимая сумма могла быть выписана до престижа
     reward, bp_xp = order_reward(row["template"], hourly_income(uid))
@@ -1363,10 +1413,8 @@ def claim_order(user: dict) -> dict:
                    (reward, bp_xp, row["id"])) == 0:
             raise ValueError("err_claimed")
         add_cookies(uid, reward, count_earned=False)
-        db.update_user(uid,
-                       bp_xp=db.get_user(uid)["bp_xp"] + bp_xp,
-                       orders_completed=user["orders_completed"] + 1,
-                       orders_day=day, orders_day_count=used + 1)
+        add_xp(uid, 0, bp_xp)
+        _bump_orders_day(uid, day, completed=True)
     track(uid, "order_done")
     if first:
         track(uid, "first_order")
@@ -1395,7 +1443,7 @@ def claim_item_record(user: dict, item_level: int) -> dict | None:
     db.update_user(uid, best_item_level=item_level)
     if cookies:
         add_cookies(uid, cookies)
-    add_xp(db.get_user(uid), xp, bp_xp)
+    add_xp(uid, xp, bp_xp)
     track(uid, "item_record", item_level)
     return {"level": item_level, "xp": xp, "cookies": cookies}
 
