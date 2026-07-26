@@ -17,6 +17,10 @@
   --bad: #e87a6d;
   --card: rgba(255, 224, 168, 0.07);
   --card-edge: rgba(255, 224, 168, 0.12);
+  /* материал печенья: одинаковый в печи и на тропинке уровней */
+  --raw: #edd6ab;           /* сырое тесто */
+  --baked: #b0691f;         /* румяная корка */
+  --chip: #4a2a0c;          /* шоколад */
   --radius: 18px;
   --font-display: 'Baloo 2', -apple-system, sans-serif;
   --font-body: 'Rubik', -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -299,30 +303,91 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   font-size: 10px; font-family: var(--font-display); font-weight: 800; color: var(--accent);
 }
 
-/* ---------- тропинка уровней ---------- */
+/* ---------- тропинка уровней: печенья, политые глазурью ----------
+   Полив доходит ровно туда, где игрок сейчас: пройденные уровни —
+   пропечённые печенья, впереди — бледное тесто. */
 .path-wrap { position: relative; padding: 10px 0 30px; }
-.path-svg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; }
+.path-svg { position: absolute; top: 0; left: 0; z-index: 0; overflow: visible; }
+/* непройденный путь: едва различимый пунктир */
+.path-trail {
+  fill: none; stroke: rgba(255, 224, 168, 0.14);
+  stroke-width: 2; stroke-dasharray: 2 8; stroke-linecap: round;
+}
+/* полив: льётся сверху вниз при открытии вкладки */
+.path-pour {
+  fill: none; stroke: url(#glaze-pour);
+  stroke-width: 7; stroke-linecap: round; stroke-linejoin: round;
+  filter: drop-shadow(0 0 5px rgba(240, 166, 59, 0.4));
+  stroke-dasharray: 1; animation: pourGlaze 1.1s ease-out backwards;
+}
+@keyframes pourGlaze { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+/* капля на острие полива — «ты здесь» */
+.path-drip {
+  position: absolute; z-index: 1; width: 13px; height: 13px; border-radius: 50%;
+  transform: translate(-50%, -50%); pointer-events: none;
+  background: radial-gradient(60% 60% at 40% 32%, #fff2d2, var(--glaze) 60%, var(--accent));
+  box-shadow: 0 0 12px rgba(255, 217, 138, 0.75);
+  animation: dripPulse 2s ease-in-out infinite 1.1s backwards;
+}
+@keyframes dripPulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50% { transform: translate(-50%, -50%) scale(1.28); }
+}
+
 .level-node {
   position: relative; z-index: 1;
   width: 64px; height: 64px; border-radius: 50%;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  background: var(--dough); border: 3px solid var(--card-edge);
+  display: flex; align-items: center; justify-content: center;
   font-family: var(--font-display); font-weight: 800; margin-bottom: 46px;
-  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
+  /* впереди — бледное тесто: приглушено, чтобы не спорить с пройденным */
+  background: radial-gradient(70% 70% at 38% 28%, #f8e9ca, var(--raw) 74%, #cdb083);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.35), inset 0 -3px 7px rgba(0, 0, 0, 0.12);
+  opacity: 0.45; transition: opacity 0.2s;
 }
+.level-node .num { font-size: 20px; color: #6b4a1c; }
+/* пройдено: печенье пропеклось, номер остаётся читаемым */
 .level-node.reached {
-  border-color: var(--accent);
-  background: radial-gradient(circle at 50% 30%, rgba(255, 217, 138, 0.25), rgba(240, 166, 59, 0.12));
+  opacity: 1;
+  background:
+    radial-gradient(3px 3px at 30% 38%, var(--chip) 96%, transparent),
+    radial-gradient(2.5px 2.5px at 68% 32%, var(--chip) 96%, transparent),
+    radial-gradient(3px 3px at 60% 72%, var(--chip) 96%, transparent),
+    radial-gradient(2px 2px at 32% 66%, var(--chip) 96%, transparent),
+    radial-gradient(70% 70% at 38% 28%, #d68f3d, var(--baked) 68%, #85490f);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.45), inset 0 -4px 8px rgba(0, 0, 0, 0.3);
 }
+.level-node.reached .num { color: #fff3dd; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55); }
+/* текущий уровень: горячее, только из печи */
+.level-node.current {
+  opacity: 1; transform: scale(1.14);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45), 0 0 22px rgba(240, 166, 59, 0.55);
+  animation: nodeWarm 2.4s ease-in-out infinite;
+}
+@keyframes nodeWarm {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.14); }
+}
+/* награда ждёт: зелёный импульс — тот же язык, что у кнопок «забрать» */
 .level-node.claimable {
-  border-color: var(--good); animation: pulse 1.2s infinite;
+  opacity: 1; cursor: pointer;
+  outline: 3px solid var(--good); outline-offset: -3px;
+  animation: pulse 1.2s infinite;
 }
-.level-node .num { font-size: 20px; }
-.level-node .sub { font-size: 9px; font-family: var(--font-body); font-weight: 500; color: var(--hint); }
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(127, 217, 138, 0.5); }
   50% { box-shadow: 0 0 0 10px rgba(127, 217, 138, 0); }
 }
+/* бирка: что открывается на этом уровне */
+.level-node .sub {
+  position: absolute; right: -4px; bottom: -4px;
+  width: 24px; height: 24px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; font-size: 13px;
+  background: var(--bg2); border: 1px solid var(--card-edge);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.45);
+}
+.level-node.reached .sub { border-color: rgba(240, 166, 59, 0.55); }
+.level-node[role='button'] { cursor: pointer; }
+.level-node:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
 /* ---------- батл-пасс ---------- */
 .bp-track { display: flex; flex-direction: column; gap: 8px; }
@@ -505,9 +570,6 @@ input.field:focus { border-color: var(--accent); }
    стрелку термостата, цвет и размер печенья, пар над духовкой. */
 .oven-scene {
   --bake: 0;
-  --raw: #edd6ab;          /* сырое тесто */
-  --baked: #b0691f;        /* румяная корка */
-  --chip: #4a2a0c;         /* шоколад */
   position: relative; margin-bottom: 10px; padding: 16px 14px 12px;
   text-align: center;
   background:
