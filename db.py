@@ -215,6 +215,22 @@ class DataBase:
                 'milestone_key': 'TEXT',
                 'claimed_at': 'REAL DEFAULT 0',
             },
+            'duels': {  # асинхронная дуэль 1x1: кто больше напечёт за сутки
+                'id': 'INTEGER PRIMARY KEY',
+                'user_a': 'INTEGER',           # создатель, ждёт соперника
+                'user_b': 'INTEGER',           # присоединившийся
+                'league': 'TEXT',              # подбор внутри своей лиги
+                'a_start': 'REAL DEFAULT 0',   # total_earned на старте
+                'b_start': 'REAL DEFAULT 0',
+                'created_at': 'REAL DEFAULT 0',
+                'started_at': 'REAL DEFAULT 0',
+                'ends_at': 'REAL DEFAULT 0',
+                'status': 'TEXT DEFAULT "waiting"',   # waiting | active | done
+                'winner_id': 'INTEGER',
+                'claimed_a': 'INTEGER DEFAULT 0',
+                'claimed_b': 'INTEGER DEFAULT 0',
+                'reward': 'REAL DEFAULT 0',
+            },
             'season_results': {  # снапшот топа прошедших сезонов + выданные награды
                 'id': 'INTEGER PRIMARY KEY',
                 'season_id': 'INTEGER',

@@ -544,3 +544,37 @@ async def recipe_set(body: RecipeIn, tg: dict = Depends(tg_user)):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"active": active, "recipes": gl.recipes_available(db.get_user(tg["id"]))}
+
+
+# ---------- дуэли ----------
+
+@router.get("/duel")
+async def duel_state(tg: dict = Depends(tg_user)):
+    """Асинхронный забег 1x1 на сутки: конкретный соперник вместо витрины."""
+    from server import duels
+    return duels.state(_ensure_user(tg))
+
+
+@router.post("/duel/find")
+async def duel_find(tg: dict = Depends(tg_user)):
+    from server import duels
+    gl.check_rate_limit(tg["id"], "duel", cfg.DUEL_PER_MINUTE, 60)
+    try:
+        return duels.find(_ensure_user(tg))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/duel/cancel")
+async def duel_cancel(tg: dict = Depends(tg_user)):
+    from server import duels
+    return duels.cancel(_ensure_user(tg))
+
+
+@router.post("/duel/claim")
+async def duel_claim(tg: dict = Depends(tg_user)):
+    from server import duels
+    try:
+        return duels.claim(_ensure_user(tg))
+    except ValueError as e:
+        raise HTTPException(400, str(e))

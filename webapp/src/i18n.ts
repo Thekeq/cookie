@@ -248,6 +248,22 @@ const dict = {
   wn_event: { en: 'Weekend events multiply everything you bake', uk: 'Івенти вихідних множать усе, що ти печеш', ru: 'Ивенты выходных множат всё, что ты печёшь' },
   wn_rewards: { en: 'Daily, achievement and level rewards scale with your income instead of going stale', uk: 'Щоденні нагороди, ачівки та рівні масштабуються з доходом', ru: 'Дейлики, ачивки и награды за уровни масштабируются с доходом и больше не обесцениваются' },
 
+  // дуэль пекарей
+  duel_title: { en: 'Baker duel', uk: 'Дуель пекарів', ru: 'Дуэль пекарей' },
+  duel_hint: { en: 'Find an opponent from your league and see who bakes more in {n} hours. You both play on your own schedule.', uk: 'Знайди суперника зі своєї ліги — хто напече більше за {n} годин. Обидва граєте у власному ритмі.', ru: 'Найди соперника из своей лиги — кто напечёт больше за {n} часов. Оба играете в своём ритме.' },
+  duel_find: { en: 'Find an opponent', uk: 'Знайти суперника', ru: 'Найти соперника' },
+  duel_searching: { en: 'Looking for an opponent', uk: 'Шукаємо суперника', ru: 'Ищем соперника' },
+  duel_searching_hint: { en: 'The duel starts as soon as someone from your league joins. You can close the app.', uk: 'Дуель почнеться, щойно приєднається хтось із твоєї ліги. Застосунок можна закрити.', ru: 'Дуэль начнётся, как только присоединится кто-то из твоей лиги. Приложение можно закрыть.' },
+  duel_cancel: { en: 'Cancel search', uk: 'Скасувати пошук', ru: 'Отменить поиск' },
+  duel_you: { en: 'You', uk: 'Ти', ru: 'Ты' },
+  duel_ends: { en: '{n}h left', uk: 'лишилось {n} год', ru: 'осталось {n} ч' },
+  duel_claim: { en: 'Take the prize · 🍪 {n}', uk: 'Забрати приз · 🍪 {n}', ru: 'Забрать приз · 🍪 {n}' },
+  duel_close: { en: 'Close the duel', uk: 'Закрити дуель', ru: 'Закрыть дуэль' },
+  duel_won_toast: { en: 'You won the duel! +{n} 🍪', uk: 'Ти виграв дуель! +{n} 🍪', ru: 'Ты выиграл дуэль! +{n} 🍪' },
+  duel_lost_toast: { en: 'Lost this one. Rematch?', uk: 'Цього разу програв. Реванш?', ru: 'В этот раз мимо. Реванш?' },
+  err_duel_active: { en: 'You already have a duel', uk: 'У тебе вже є дуель', ru: 'У тебя уже есть дуэль' },
+  err_duel_taken: { en: 'Someone was faster — try again', uk: 'Хтось був швидшим — спробуй ще', ru: 'Кто-то успел раньше — попробуй ещё' },
+
   // серверные ошибки (коды err_* из API, параметр после |)
   err_no_user: { en: 'Open the app via the bot (/start)', uk: 'Відкрий застосунок через бота (/start)', ru: 'Открой приложение через бота (/start)' },
   err_board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },

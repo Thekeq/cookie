@@ -7,7 +7,8 @@ const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieB
 
 interface LBRow {
   rank: number
-  user_id: number
+  // user_id сервер намеренно не отдаёт: is_me считается на его стороне,
+  // а список telegram-id топ-100 — готовая база для фишинга
   name: string
   level: number
   season_earned: number
@@ -98,7 +99,7 @@ export default function LeaderboardTab() {
       {data.top.map((r) => (
         <div
           className="card ach"
-          key={r.user_id}
+          key={r.rank}
           style={{
             padding: '10px 14px',
             marginBottom: 6,

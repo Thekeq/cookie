@@ -7,6 +7,7 @@ import LevelsTab from './LevelsTab'
 import QuestsTab from './QuestsTab'
 import BattlePassTab from './BattlePassTab'
 import LeaderboardTab from './LeaderboardTab'
+import DuelTab from './DuelTab'
 
 export default function ProgressTab() {
   const t = useT()
@@ -29,7 +30,7 @@ export default function ProgressTab() {
       {seg === 'path' && <LevelsTab />}
       {seg === 'quests' && <QuestsTab />}
       {seg === 'bp' && <BattlePassTab />}
-      {seg === 'top' && <LeaderboardTab />}
+      {seg === 'top' && <><DuelTab /><LeaderboardTab /></>}
     </div>
   )
 }

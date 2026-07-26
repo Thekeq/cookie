@@ -563,6 +563,78 @@ check("event is stable for the same weekend",
 check("event window covers the weekend",
       _ev["started_at"] <= _sat <= _ev["ends_at"])
 
+
+# ================= дуэли =================
+from server import duels as _duels
+
+_DA, _DB = UID + 5000, UID + 5001
+for _u in (_DA, _DB):
+    db.create_user(_u, f"d{_u}", f"D{_u}")
+    db.update_user(_u, level=5, total_earned=1000, cookies=0)
+
+# уровень ниже порога не пускает
+db.update_user(_DA, level=1)
+try:
+    _duels.find(db.get_user(_DA))
+    check("duel gated by level", False, "пустило на 1 уровне")
+except ValueError:
+    check("duel gated by level", True)
+db.update_user(_DA, level=5)
+
+# первый встаёт в очередь, второй подхватывает
+check("first player queues",
+      _duels.find(db.get_user(_DA))["duel"]["status"] == "waiting")
+try:
+    _duels.find(db.get_user(_DA))
+    check("no second duel at once", False, "вторая дуэль прошла")
+except ValueError:
+    check("no second duel at once", True)
+_st = _duels.find(db.get_user(_DB))
+check("second player starts the duel", _st["duel"]["status"] == "active", str(_st))
+check("opponent is visible", _st["duel"]["foe_name"] is not None)
+check("duel never leaks user_id", "foe_id" not in _st["duel"])
+
+# счёт считается ОТ старта дуэли, а не от накопленного за всю жизнь
+db.update_user(_DA, total_earned=1000 + 7000)
+db.update_user(_DB, total_earned=1000 + 3000)
+_st = _duels.state(db.get_user(_DA))
+check("score counts only duel earnings",
+      abs(_st["duel"]["my_score"] - 7000) < 1 and abs(_st["duel"]["foe_score"] - 3000) < 1,
+      str(_st["duel"]))
+
+# дедлайн закрывает дуэль и назначает победителя
+_row = db.q1("SELECT id FROM duels ORDER BY id DESC LIMIT 1")
+db.exec("UPDATE duels SET ends_at = ? WHERE id = ?", (time.time() - 1, _row["id"]))
+_st = _duels.state(db.get_user(_DA))
+check("duel closes on deadline", _st["duel"]["status"] == "done")
+check("leader wins", _st["duel"]["won"] is True)
+check("loser sees the loss", _duels.state(db.get_user(_DB))["duel"]["won"] is False)
+
+# приз получает только победитель и только один раз
+_before = db.get_user(_DA)["cookies"]
+_r = _duels.claim(db.get_user(_DA))
+check("winner is paid", db.get_user(_DA)["cookies"] > _before and _r["reward"] > 0)
+try:
+    _duels.claim(db.get_user(_DA))
+    check("prize not paid twice", False, "второй клейм прошёл")
+except ValueError:
+    check("prize not paid twice", True)
+_before_b = db.get_user(_DB)["cookies"]
+_r = _duels.claim(db.get_user(_DB))
+check("loser gets nothing",
+      _r["reward"] == 0 and db.get_user(_DB)["cookies"] == _before_b)
+check("duel clears after claim", _duels.state(db.get_user(_DA))["duel"] is None)
+
+# заявку можно снять
+_duels.find(db.get_user(_DA))
+_duels.cancel(db.get_user(_DA))
+check("search can be cancelled", _duels.state(db.get_user(_DA))["duel"] is None)
+
+for _u in (_DA, _DB):
+    db.exec("DELETE FROM users WHERE user_id = ?", (_u,))
+db.exec("DELETE FROM duels WHERE user_a IN (?, ?) OR user_b IN (?, ?)",
+        (_DA, _DB, _DA, _DB))
+
 print(f"\n{ok} passed, {fail} failed")
 if fail:
     raise SystemExit(1)
