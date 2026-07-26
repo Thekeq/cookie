@@ -130,7 +130,8 @@ check("farm wiped", gl.farm_counts(UID) == {})
 check("skins kept", db.q1("SELECT id FROM skins WHERE user_id = ? AND skin_key = 'donut'",
                           (UID,)) is not None)
 check("points saved", u["prestige_points"] == 5 and u["prestige_count"] == 1)
-_expect_mult = 1 + 5 * cfg.PRESTIGE_MULT_PER_POINT
+# ивент выходных тоже множит клик — учитываем, иначе тест падает по субботам
+_expect_mult = (1 + 5 * cfg.PRESTIGE_MULT_PER_POINT) * gl.event_multiplier()
 check("multiplier applied", abs(s["user"]["click_power"] - _expect_mult) < 0.001,
       str(s["user"]["click_power"]))
 check("total_earned kept", u["total_earned"] == 25_000_000)

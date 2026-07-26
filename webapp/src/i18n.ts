@@ -202,6 +202,29 @@ const dict = {
   share_rank_text: { en: "I'm #{n} in Cookie Merge this season! Join and beat me 🍪", uk: 'Я #{n} у Cookie Merge цього сезону! Заходь і обійди мене 🍪', ru: 'Я #{n} в Cookie Merge в этом сезоне! Заходи и обгони меня 🍪' },
   share_prestige_text: { en: 'I just prestiged in Cookie Merge — x{m} income now! 🍪✨', uk: 'Я щойно зробив престиж у Cookie Merge — тепер x{m} доходу! 🍪✨', ru: 'Я сделал престиж в Cookie Merge — теперь x{m} дохода! 🍪✨' },
 
+  // закваска (оффлайн-рецепты)
+  recipe_title: { en: 'Set the dough', uk: 'Постав опару', ru: 'Поставь закваску' },
+  recipe_hint: { en: 'Pick what bakes while you are away. Longer recipe — bigger bonus, tighter window.', uk: 'Обери, що пектиметься за твоєї відсутності. Довший рецепт — більший бонус, вужче вікно.', ru: 'Выбери, что печётся без тебя. Дольше рецепт — больше бонус, но уже окно возврата.' },
+  recipe_rising: { en: 'rising', uk: 'підходить', ru: 'подходит' },
+  recipe_ready: { en: 'ready!', uk: 'готово!', ru: 'готово!' },
+  recipe_burnt: { en: 'burnt', uk: 'згоріло', ru: 'подгорело' },
+  recipe_wait: { en: 'Ready in {n}', uk: 'Готово через {n}', ru: 'Будет готово через {n}' },
+  recipe_collect: { en: 'x{m} to offline income — collect within {n}', uk: 'x{m} до офлайн-доходу — забери протягом {n}', ru: 'x{m} к оффлайн-доходу — забери в течение {n}' },
+  recipe_window: { en: '{a}h, window to {b}h', uk: '{a} год, вікно до {b} год', ru: '{a} ч, окно до {b} ч' },
+  recipe_quick: { en: 'Croissant', uk: 'Круасан', ru: 'Круассан' },
+  recipe_classic: { en: 'Classic loaf', uk: 'Класичний хліб', ru: 'Классический хлеб' },
+  recipe_sourdough: { en: 'Sourdough', uk: 'Закваска', ru: 'На закваске' },
+  recipe_festive: { en: 'Festive cake', uk: 'Святковий торт', ru: 'Праздничный торт' },
+  time_hm: { en: '{h}h {m}m', uk: '{h} год {m} хв', ru: '{h} ч {m} мин' },
+  time_m: { en: '{m}m', uk: '{m} хв', ru: '{m} мин' },
+
+  // ивенты выходных
+  event_sugar_rush: { en: 'Sugar Rush', uk: 'Цукровий шторм', ru: 'Сахарный шторм' },
+  event_golden_hour: { en: 'Golden Hour', uk: 'Золота година', ru: 'Золотой час' },
+  event_night_shift: { en: 'Night Shift', uk: 'Нічна зміна', ru: 'Ночная смена' },
+  event_banner: { en: 'x{m} to everything you bake', uk: 'x{m} до всього, що печеш', ru: 'x{m} ко всему, что печёшь' },
+  event_ends: { en: 'ends in {n}', uk: 'лишилось {n}', ru: 'осталось {n}' },
+
   // серверные ошибки (коды err_* из API, параметр после |)
   err_no_user: { en: 'Open the app via the bot (/start)', uk: 'Відкрий застосунок через бота (/start)', ru: 'Открой приложение через бота (/start)' },
   err_board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },

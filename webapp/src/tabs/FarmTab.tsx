@@ -4,6 +4,7 @@ import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { FarmState } from '../types'
+import RecipePanel from './RecipePanel'
 
 const B_ICONS: Record<string, string> = {
   cursor: '👆', granny: '👵', bakery: '🏠', factory: '🏭',
@@ -74,6 +75,9 @@ export default function FarmTab() {
           </div>
         </div>
       </div>
+
+      {/* закваска стоит рядом с оффлайн-доходом: это про одно и то же время */}
+      <RecipePanel />
 
       <div className="row" style={{ marginBottom: 10, gap: 6 }}>
         {(['buildings', 'upgrades', 'skins'] as const).map((s) => (

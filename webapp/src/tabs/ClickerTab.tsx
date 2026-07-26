@@ -123,8 +123,29 @@ export default function ClickerTab() {
   const frenzy = state.boosts.find((b) => b.key === 'golden_frenzy')
   const tut = state.tutorial
 
+  const ev = state.event
+  const evLeft = ev ? Math.max(0, ev.ends_at - Date.now() / 1000) : 0
+
   return (
     <div className="clicker" ref={wrapRef} style={{ position: 'relative' }}>
+      {/* Ивент выходных: повод зайти в конкретный день, а не «когда-нибудь».
+          Расписание детерминировано календарём — ни таблицы, ни джобы. */}
+      {ev && (
+        <div className="event-banner">
+          <span className="event-spark">✨</span>
+          <div className="grow">
+            <b>{t(ev.title_key as any)}</b>
+            <div className="hint">{t('event_banner', { m: ev.mult.toFixed(1) })}</div>
+          </div>
+          <span className="event-left">
+            {t('event_ends', {
+              n: evLeft >= 3600
+                ? t('time_hm', { h: Math.floor(evLeft / 3600), m: Math.floor((evLeft % 3600) / 60) })
+                : t('time_m', { m: Math.floor(evLeft / 60) }),
+            })}
+          </span>
+        </div>
+      )}
       <div className="energy-wrap">
         <div className="row" style={{ marginBottom: 4 }}>
           <span className="hint">⚡ {t('energy')}</span>

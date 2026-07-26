@@ -520,3 +520,27 @@ async def tutorial_claim(tg: dict = Depends(tg_user)):
 @router.get("/collection")
 async def collection(tg: dict = Depends(tg_user)):
     return gl.collection_state(_ensure_user(tg))
+
+
+# ---------- оффлайн-рецепты ----------
+
+class RecipeIn(BaseModel):
+    key: str = Field(max_length=32)
+
+
+@router.get("/recipes")
+async def recipes(tg: dict = Depends(tg_user)):
+    """Закваска перед выходом: оффлайн-кап превращается из штрафа в механику."""
+    user = _ensure_user(tg)
+    return {"recipes": gl.recipes_available(user),
+            "active": gl.recipe_status(user)}
+
+
+@router.post("/recipes/set")
+async def recipe_set(body: RecipeIn, tg: dict = Depends(tg_user)):
+    user = _ensure_user(tg)
+    try:
+        active = gl.set_recipe(user, body.key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"active": active, "recipes": gl.recipes_available(db.get_user(tg["id"]))}

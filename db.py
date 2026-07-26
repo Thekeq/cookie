@@ -85,6 +85,9 @@ class DataBase:
                 'shiny_pity': 'INTEGER DEFAULT 0',      # мерджей без блестяшки (гарант при пороге)
                 # --- Stars: постоянное расширение оффлайн-капа (часы сверх базовых) ---
                 'offline_bonus_hours': 'REAL DEFAULT 0',
+                # --- оффлайн-рецепт (закваска перед выходом из игры) ---
+                'recipe_key': 'TEXT',
+                'recipe_started_at': 'REAL DEFAULT 0',
                 # --- стартовый чеклист / заказы ---
                 'tutorial_done': 'INTEGER DEFAULT 0',
                 'orders_completed': 'INTEGER DEFAULT 0',

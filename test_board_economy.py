@@ -502,6 +502,67 @@ try:
 except ValueError:
     check("order not claimable twice", db.get_user(UID)["cookies"] == _paid_once)
 
+
+# ================= закваска и ивенты =================
+
+# --- рецепт: рано / в окне / подгорело ---
+db.update_user(UID, level=10, recipe_key=None, recipe_started_at=0)
+check("no recipe by default", gl.recipe_status(db.get_user(UID))["state"] == "none")
+gl.set_recipe(db.get_user(UID), "classic")
+check("recipe starts rising", gl.recipe_status(db.get_user(UID))["state"] == "rising")
+_r = cfg.RECIPES["classic"]
+db.update_user(UID, recipe_started_at=time.time() - _r["hours"] * 3600 - 60)
+_st = gl.recipe_status(db.get_user(UID))
+check("recipe ready inside window",
+      _st["state"] == "ready" and _st["mult"] == _r["mult"], str(_st))
+db.update_user(UID, recipe_started_at=time.time()
+               - _r["hours"] * _r["window"] * 3600 - 60)
+check("recipe burns past the window",
+      gl.recipe_status(db.get_user(UID))["state"] == "burnt")
+
+# --- множитель применяется к оффлайн-доходу фермы ровно один раз ---
+db.exec("DELETE FROM farm WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'cursor', 10)", (UID,))
+db.update_user(UID, cookies=0, recipe_key="classic",
+               recipe_started_at=time.time() - _r["hours"] * 3600 - 60,
+               farm_collected_at=time.time() - 3600)
+_got = gl.collect_farm(db.get_user(UID))
+_plain = gl.farm_cps(UID) * 3600
+check("ready recipe multiplies offline farm income",
+      abs(_got - _plain * _r["mult"]) < _plain * 0.02, f"{_got:.0f} vs {_plain:.0f}")
+check("recipe is consumed after collect",
+      gl.recipe_status(db.get_user(UID))["state"] == "none")
+# рано вернулся — множителя нет и закваска НЕ тратится
+db.update_user(UID, recipe_key="classic", recipe_started_at=time.time() - 60,
+               farm_collected_at=time.time() - 3600)
+_got = gl.collect_farm(db.get_user(UID))
+check("early return gives no bonus", abs(_got - _plain) < _plain * 0.02, f"{_got:.0f}")
+check("early return keeps the dough",
+      gl.recipe_status(db.get_user(UID))["state"] == "rising")
+db.update_user(UID, recipe_key=None, recipe_started_at=0)
+
+# --- рецепт по уровню ---
+db.update_user(UID, level=1)
+try:
+    gl.set_recipe(db.get_user(UID), "festive")
+    check("locked recipe rejected", False, "прошло без уровня")
+except ValueError:
+    check("locked recipe rejected", True)
+db.update_user(UID, level=10)
+
+# --- ивент детерминирован календарём ---
+import datetime as _dt
+_sat = _dt.datetime(2026, 7, 25, 12, tzinfo=_dt.timezone.utc).timestamp()
+_wed = _dt.datetime(2026, 7, 22, 12, tzinfo=_dt.timezone.utc).timestamp()
+check("event on weekend", gl.active_event(_sat) is not None)
+check("no event midweek", gl.active_event(_wed) is None)
+check("event multiplier follows", gl.event_multiplier(_wed) == 1.0)
+_ev = gl.active_event(_sat)
+check("event is stable for the same weekend",
+      gl.active_event(_sat + 3600)["key"] == _ev["key"])
+check("event window covers the weekend",
+      _ev["started_at"] <= _sat <= _ev["ends_at"])
+
 print(f"\n{ok} passed, {fail} failed")
 if fail:
     raise SystemExit(1)

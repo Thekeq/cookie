@@ -545,7 +545,11 @@ def click_multiplier(user_id: int) -> float:
         mult *= cfg.BOOST_CLICK_X2_MULT
     if "golden_frenzy" in boosts:
         mult *= cfg.GOLDEN_EFFECTS["frenzy"]["mult"]
-    return mult
+    # Ивент выходных умножает активный доход. Сознательно НЕ попадает в
+    # permanent_click_multiplier: тот кормит hourly_income, а через него —
+    # награды заказов и цены доски. Ровно так золотая печенька когда-то
+    # раздувала стоимость сундуков в семь раз.
+    return mult * event_multiplier()
 
 
 # ---------- золотая печенька ----------
@@ -718,6 +722,91 @@ def offline_bonus_hours(user: dict) -> float:
     return user.get("offline_bonus_hours") or 0
 
 
+# ---------- оффлайн-рецепты ----------
+
+def recipe_status(user: dict, now: float | None = None) -> dict:
+    """Состояние поставленной закваски: сколько прошло, готово ли, множитель.
+
+    Оффлайн-кап был чистым штрафом за то, что игрок не в игре. Рецепт делает
+    из возвращения событие: у теста есть своё время готовности и окно, в
+    которое надо успеть."""
+    key = user.get("recipe_key") or ""
+    if key not in cfg.RECIPES:
+        return {"key": None, "state": "none", "mult": 1.0}
+    now = now or time.time()
+    started = user.get("recipe_started_at") or now
+    elapsed_h = max(0.0, (now - started) / 3600)
+    state, mult = cfg.recipe_state(key, elapsed_h)
+    r = cfg.RECIPES[key]
+    return {
+        "key": key,
+        "state": state,
+        "mult": mult,
+        "elapsed_h": elapsed_h,
+        "ready_at": started + r["hours"] * 3600,
+        "spoils_at": started + r["hours"] * r["window"] * 3600,
+    }
+
+
+def recipes_available(user: dict) -> list[dict]:
+    out = []
+    for key, r in cfg.RECIPES.items():
+        need = cfg.RECIPE_REQ_LEVEL.get(key, 1)
+        out.append({"key": key, "hours": r["hours"], "mult": r["mult"],
+                    "window_h": r["hours"] * r["window"],
+                    "req_level": need, "unlocked": user["level"] >= need})
+    return out
+
+
+def set_recipe(user: dict, key: str) -> dict:
+    """Поставить закваску. Смена рецепта сбрасывает таймер — иначе можно было
+    бы дождаться готовности дешёвого и «переобуться» в дорогой."""
+    if key not in cfg.RECIPES:
+        raise ValueError("err_no_item")
+    if user["level"] < cfg.RECIPE_REQ_LEVEL.get(key, 1):
+        raise ValueError(f"err_req_level|{cfg.RECIPE_REQ_LEVEL[key]}")
+    db.update_user(user["user_id"], recipe_key=key, recipe_started_at=time.time())
+    return recipe_status(db.get_user(user["user_id"]))
+
+
+def _consume_recipe(user: dict) -> float:
+    """Забирает множитель закваски и снимает её (одноразовая).
+    Возвращает множитель: 1.0, если рано или подгорело."""
+    st = recipe_status(user)
+    if st["state"] == "none":
+        return 1.0
+    if st["state"] == "rising":
+        return 1.0          # рано вернулся — тесто ещё стоит, не тратим
+    db.update_user(user["user_id"], recipe_key=None, recipe_started_at=0)
+    return st["mult"]
+
+
+# ---------- выходные-ивенты ----------
+
+def active_event(now: float | None = None) -> dict | None:
+    """Ивент выходных. Детерминирован от календаря — как и номер сезона,
+    поэтому не нужны ни таблица, ни фоновая задача, ни ручное включение."""
+    now = now or time.time()
+    dt = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    if dt.weekday() not in cfg.EVENT_WEEKDAYS:
+        return None
+    keys = sorted(cfg.EVENTS)
+    # неделя года выбирает ивент: подряд идущие выходные не повторяются
+    key = keys[dt.isocalendar()[1] % len(keys)]
+    ev = cfg.EVENTS[key]
+    # окно = все дни EVENT_WEEKDAYS этой недели, до конца последнего
+    start = dt - datetime.timedelta(days=dt.weekday() - min(cfg.EVENT_WEEKDAYS))
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + datetime.timedelta(days=len(cfg.EVENT_WEEKDAYS))
+    return {"key": key, "mult": ev["mult"], "title_key": ev["title_key"],
+            "started_at": start.timestamp(), "ends_at": end.timestamp()}
+
+
+def event_multiplier(now: float | None = None) -> float:
+    ev = active_event(now)
+    return ev["mult"] if ev else 1.0
+
+
 def farm_offline_cap_hours(user: dict) -> float:
     return cfg.FARM_OFFLINE_CAP_HOURS + offline_bonus_hours(user)
 
@@ -737,6 +826,10 @@ def collect_farm(user: dict) -> float:
         db.update_user(user["user_id"], farm_collected_at=now)
         return 0
     income = farm_cps(user["user_id"]) * seconds
+    # закваска умножает ТОЛЬКО оффлайн-доход и только если игрок вернулся в
+    # окно готовности; съедается один раз — на ферме, а не на каждом сборе
+    if seconds > 60:
+        income *= _consume_recipe(user)
     with db.tx():
         db.update_user(user["user_id"], farm_collected_at=now)
         if income > 0:
@@ -1525,4 +1618,10 @@ def full_state(user_id: int) -> dict:
         ],
         "claimable_level": claimable_level(user),
         "max_item_unlocked": max_item_unlocked(user["level"]),
+        # потолок прокачки клика: кнопка апгрейда должна объяснять, почему
+        # она погасла, а не просто отдавать ошибку по тапу
+        "click_max_level": cfg.click_max_level(user["level"]),
+        # закваска и ивент выходных — оба видны на главном экране
+        "recipe": recipe_status(user),
+        "event": active_event(),
     }

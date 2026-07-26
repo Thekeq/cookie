@@ -112,6 +112,14 @@ export interface GameState {
   spawn_cost: number
   spawn_direct: { max_level: number; costs: Record<string, number> }
   orders_claimable: boolean
+  /** потолок прокачки клика по уровню игрока */
+  click_max_level?: number
+  /** закваска: что печётся, пока игрока нет */
+  recipe?: { key: string | null; state: string; mult: number
+             ready_at?: number; spoils_at?: number }
+  /** ивент выходных (детерминирован календарём, может быть null) */
+  event?: { key: string; mult: number; title_key: string
+            started_at: number; ends_at: number } | null
   passive_per_hour: number
   trash_refund?: number // ответ /api/merge/trash: сколько вернули
   passive_collected?: number
