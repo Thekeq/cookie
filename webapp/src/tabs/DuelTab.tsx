@@ -29,13 +29,23 @@ export default function DuelTab() {
   const { toast, refresh } = useGame()
   const [duel, setDuel] = useState<Duel | null>(null)
   const [hours, setHours] = useState(24)
+  // приз считает сервер той же функцией, что и выплату: показанное число и
+  // полученное не могут разойтись
+  const [prize, setPrize] = useState(0)
+  const [prizeHours, setPrizeHours] = useState(0)
   const [loaded, setLoaded] = useState(false)
   const { busy, run } = useBusy()
 
+  const apply = (r: any) => {
+    setDuel(r.duel)
+    if (r.hours) setHours(r.hours)
+    if (r.prize) setPrize(r.prize)
+    if (r.reward_hours) setPrizeHours(r.reward_hours)
+  }
+
   const load = () =>
     api.get('/api/duel').then((r) => {
-      setDuel(r.duel)
-      setHours(r.hours)
+      apply(r)
       setLoaded(true)
     }).catch(() => setLoaded(true))
 
@@ -50,7 +60,7 @@ export default function DuelTab() {
     run(key, async () => {
       try {
         const r = await api.post(path)
-        setDuel(r.duel)
+        apply(r)
         ok?.()
       } catch (e: any) {
         sfxError()
@@ -62,7 +72,7 @@ export default function DuelTab() {
     run('claim', async () => {
       try {
         const r = await api.post('/api/duel/claim')
-        setDuel(r.duel)
+        apply(r)
         if (r.won) {
           hapticSuccess()
           sfxFanfare()
@@ -79,6 +89,15 @@ export default function DuelTab() {
 
   if (!loaded) return null
 
+  // Приз видно ДО согласия на суточный забег. Раньше сумму показывала только
+  // кнопка «Забрать приз» — то есть уже после того, как всё кончилось.
+  const prizeLine = (
+    <div className="duel-prize">
+      <b>{t('duel_prize', { n: fmt(prize) })}</b>
+      <span className="hint">{t('duel_prize_hint', { h: prizeHours })}</span>
+    </div>
+  )
+
   // нет дуэли — приглашение начать
   if (!duel)
     return (
@@ -88,7 +107,8 @@ export default function DuelTab() {
         <div className="hint" style={{ margin: '6px 0 12px' }}>
           {t('duel_hint', { n: hours })}
         </div>
-        <button className="btn" disabled={busy !== null}
+        {prizeLine}
+        <button className="btn" style={{ marginTop: 12 }} disabled={busy !== null}
                 onClick={() => act('find', '/api/duel/find', sfxBuy)}>
           {t('duel_find')}
         </button>
@@ -101,7 +121,8 @@ export default function DuelTab() {
         <div className="duel-hero searching">🔍</div>
         <b>{t('duel_searching')}</b>
         <div className="hint" style={{ margin: '6px 0 12px' }}>{t('duel_searching_hint')}</div>
-        <button className="btn secondary" disabled={busy !== null}
+        {prizeLine}
+        <button className="btn secondary" style={{ marginTop: 12 }} disabled={busy !== null}
                 onClick={() => act('cancel', '/api/duel/cancel')}>
           {t('duel_cancel')}
         </button>
@@ -132,11 +153,14 @@ export default function DuelTab() {
       </div>
 
       {duel.status === 'active' && (
-        <div className="hint" style={{ textAlign: 'center', marginTop: 10 }}>
-          {t('duel_ends', {
-            n: Math.max(0, Math.round((duel.ends_at - Date.now() / 1000) / 3600)),
-          })}
-        </div>
+        <>
+          <div className="hint" style={{ textAlign: 'center', marginTop: 10 }}>
+            {t('duel_ends', {
+              n: Math.max(0, Math.round((duel.ends_at - Date.now() / 1000) / 3600)),
+            })}
+          </div>
+          {prizeLine}
+        </>
       )}
 
       {duel.status === 'done' && !duel.claimed && (

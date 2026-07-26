@@ -255,6 +255,8 @@ const dict = {
   duel_searching: { en: 'Looking for an opponent', uk: 'Шукаємо суперника', ru: 'Ищем соперника' },
   duel_searching_hint: { en: 'The duel starts as soon as someone from your league joins. You can close the app.', uk: 'Дуель почнеться, щойно приєднається хтось із твоєї ліги. Застосунок можна закрити.', ru: 'Дуэль начнётся, как только присоединится кто-то из твоей лиги. Приложение можно закрыть.' },
   duel_cancel: { en: 'Cancel search', uk: 'Скасувати пошук', ru: 'Отменить поиск' },
+  duel_prize: { en: 'Win and take 🍪 {n}', uk: 'Перемога — 🍪 {n}', ru: 'Победа — 🍪 {n}' },
+  duel_prize_hint: { en: '{h}h of your income, counted when the duel ends', uk: '{h} год твого доходу, рахуємо в кінці дуелі', ru: '{h} ч твоего дохода, считаем в конце дуэли' },
   duel_you: { en: 'You', uk: 'Ти', ru: 'Ты' },
   duel_ends: { en: '{n}h left', uk: 'лишилось {n} год', ru: 'осталось {n} ч' },
   duel_claim: { en: 'Take the prize · 🍪 {n}', uk: 'Забрати приз · 🍪 {n}', ru: 'Забрать приз · 🍪 {n}' },

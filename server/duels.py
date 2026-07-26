@@ -15,6 +15,17 @@ from server import game_logic as gl
 from server.game_logic import db
 
 
+def _prize(user_id: int) -> float:
+    """Приз победителю: часы ЕГО дохода.
+
+    Считаем от дохода победителя, а не проигравшего: иначе выиграть у богатого
+    соперника было бы выгоднее, чем играть, и появился бы смысл искать «жирную»
+    цель. Эта же функция показывает игроку приз ДО согласия на суточный забег —
+    так число на экране и число при выплате не могут разойтись."""
+    return max(cfg.DUEL_REWARD_MIN,
+               gl.hourly_income(user_id) * cfg.DUEL_REWARD_HOURS)
+
+
 def _finish_if_due(row: dict) -> dict:
     """Закрывает дуэль, если время вышло. Победитель и приз фиксируются один
     раз — условным UPDATE, чтобы два одновременных запроса не посчитали дважды."""
@@ -23,10 +34,7 @@ def _finish_if_due(row: dict) -> dict:
     a_score = _score(row["user_a"], row["a_start"])
     b_score = _score(row["user_b"], row["b_start"])
     winner = row["user_a"] if a_score >= b_score else row["user_b"]
-    # приз считаем от дохода ПОБЕДИТЕЛЯ: иначе выиграть у богатого соперника
-    # было бы выгоднее, чем играть, и появился бы смысл искать «жирную» цель
-    reward = max(cfg.DUEL_REWARD_MIN,
-                 gl.hourly_income(winner) * cfg.DUEL_REWARD_HOURS)
+    reward = _prize(winner)
     with db.tx():
         db.exec("UPDATE duels SET status = 'done', winner_id = ?, reward = ? "
                 "WHERE id = ? AND status = 'active'", (winner, reward, row["id"]))
@@ -53,9 +61,11 @@ def state(user: dict) -> dict:
     """Состояние дуэли для фронта: свой и чужой счёт, время, приз."""
     uid = user["user_id"]
     row = my_duel(uid)
+    # приз при победе прямо сейчас — чтобы соглашаться на сутки не вслепую
+    prize = _prize(uid)
     if not row:
         return {"duel": None, "reward_hours": cfg.DUEL_REWARD_HOURS,
-                "hours": cfg.DUEL_HOURS}
+                "prize": prize, "hours": cfg.DUEL_HOURS}
     is_a = row["user_a"] == uid
     foe_id = row["user_b"] if is_a else row["user_a"]
     foe = db.get_user(foe_id) if foe_id else None
@@ -75,6 +85,7 @@ def state(user: dict) -> dict:
             "claimed": bool(row["claimed_a"] if is_a else row["claimed_b"]),
         },
         "reward_hours": cfg.DUEL_REWARD_HOURS,
+        "prize": prize,
         "hours": cfg.DUEL_HOURS,
     }
 

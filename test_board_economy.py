@@ -610,10 +610,17 @@ check("duel closes on deadline", _st["duel"]["status"] == "done")
 check("leader wins", _st["duel"]["won"] is True)
 check("loser sees the loss", _duels.state(db.get_user(_DB))["duel"]["won"] is False)
 
+# приз видно ДО согласия на забег: сумму считает та же функция, что и выплату,
+# поэтому показанное число не может разойтись с полученным
+_shown = _duels.state(db.get_user(_DA))["prize"]
+check("prize is shown up front", _shown >= cfg.DUEL_REWARD_MIN, str(_shown))
+
 # приз получает только победитель и только один раз
 _before = db.get_user(_DA)["cookies"]
 _r = _duels.claim(db.get_user(_DA))
 check("winner is paid", db.get_user(_DA)["cookies"] > _before and _r["reward"] > 0)
+check("shown prize matches the payout", abs(_r["reward"] - _shown) < 1,
+      f"показали {_shown}, выплатили {_r['reward']}")
 try:
     _duels.claim(db.get_user(_DA))
     check("prize not paid twice", False, "второй клейм прошёл")
@@ -628,7 +635,10 @@ check("duel clears after claim", _duels.state(db.get_user(_DA))["duel"] is None)
 # заявку можно снять
 _duels.find(db.get_user(_DA))
 _duels.cancel(db.get_user(_DA))
-check("search can be cancelled", _duels.state(db.get_user(_DA))["duel"] is None)
+_st = _duels.state(db.get_user(_DA))
+check("search can be cancelled", _st["duel"] is None)
+# приз есть и на экране приглашения, где дуэли ещё нет
+check("prize is shown with no duel", _st.get("prize", 0) >= cfg.DUEL_REWARD_MIN, str(_st))
 
 for _u in (_DA, _DB):
     db.exec("DELETE FROM users WHERE user_id = ?", (_u,))
