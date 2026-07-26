@@ -108,7 +108,7 @@ r = c.get("/api/quests", headers=H(UID))
 qs = r.json()["quests"]
 check("3 quests today", len(qs) == cfg.DAILY_QUESTS_PER_DAY, str(len(qs)))
 db.update_user(UID, cookies=100000, energy=500)
-r = c.post("/api/click", json={"clicks": 10}, headers=H(UID))
+r = c.post("/api/click", json={"clicks": 10, "batch_id": "auto-new-1"}, headers=H(UID))
 check("click ok", r.status_code == 200 and r.json()["accepted"] > 0, r.text[:200])
 r = c.get("/api/quests", headers=H(UID))
 qs2 = {q["key"]: q for q in r.json()["quests"]}
@@ -166,23 +166,34 @@ if res and res["rank"] <= 10:
 # --- ref milestones ---
 r = c.post("/api/auth", headers=H(UID2, username="friend", start_param=f"ref_{UID}"))
 check("referral registered", r.status_code == 200)
+db.update_user(UID2, level=cfg.REF_QUALIFY_LEVEL)   # реферал дошёл до квалификации
 r = c.get("/api/referrals", headers=H(UID))
 ms = {m["key"]: m for m in r.json()["milestones"]}
 check("milestones present", len(ms) == 3, str(len(ms)))
 check("progress 1/3", ms["refs_boost"]["progress"] == 1)
 r = c.post("/api/referrals/milestone", json={"key": "refs_boost"}, headers=H(UID))
 check("milestone not-done blocked", r.status_code == 400)
-for i in range(2, 4):
+# майлстоуны считают только «живых» рефералов (уровень >= REF_QUALIFY_LEVEL):
+# иначе 25 пустых аккаунтов приносили Premium Пасс за 100 Stars
+def _make_ref(referrer, n, level=cfg.REF_QUALIFY_LEVEL):
+    rid = referrer + n * 100
+    db.create_user(rid, f"ref{n}", f"Ref{n}")
+    db.update_user(rid, level=level)
     db.exec("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at) "
-            "VALUES (?, ?, ?)", (UID, UID + i * 100, time.time()))
+            "VALUES (?, ?, ?)", (referrer, rid, time.time()))
+    return rid
+
+
+_ref_ids = [UID2]
+for i in range(2, 4):
+    _ref_ids.append(_make_ref(UID, i))
 r = c.post("/api/referrals/milestone", json={"key": "refs_boost"}, headers=H(UID))
 check("milestone boost claimed", r.status_code == 200, r.text[:200])
 check("boost active", "click_x2" in gl.active_boosts(UID))
 r = c.post("/api/referrals/milestone", json={"key": "refs_boost"}, headers=H(UID))
 check("milestone double-claim blocked", r.status_code == 400)
 for i in range(4, 11):
-    db.exec("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at) "
-            "VALUES (?, ?, ?)", (UID, UID + i * 100, time.time()))
+    _ref_ids.append(_make_ref(UID, i))
 r = c.post("/api/referrals/milestone", json={"key": "refs_skin"}, headers=H(UID))
 check("milestone skin claimed", r.status_code == 200, r.text[:200])
 r = c.get("/api/farm", headers=H(UID))
@@ -393,6 +404,58 @@ check("events tracked",
 evs = {r["event"] for r in db.q("SELECT DISTINCT event FROM events WHERE user_id = ?", (UID,))}
 check("key events present", {"session", "first_order", "tutorial_complete"} <= evs, str(evs))
 
+
+# ================= защита API =================
+
+# --- лидерборд не отдаёт чужие telegram-id ---
+r = c.get("/api/leaderboard", headers=H(UID))
+check("leaderboard hides user_id",
+      all("user_id" not in row for row in r.json()["top"]),
+      str(r.json()["top"][:1]))
+check("leaderboard still marks me", any(row["is_me"] for row in r.json()["top"]))
+
+# --- клик без batch_id не принимается: без него дедупликация отключалась ---
+r = c.post("/api/click", json={"clicks": 5}, headers=H(UID))
+check("click without batch_id rejected", r.status_code == 422, str(r.status_code))
+r = c.post("/api/click", json={"clicks": 5, "batch_id": "x" * 300}, headers=H(UID))
+check("oversized batch_id rejected", r.status_code == 422, str(r.status_code))
+r = c.post("/api/click", json={"clicks": -5, "batch_id": "negtest1"}, headers=H(UID))
+check("negative clicks rejected", r.status_code == 422, str(r.status_code))
+
+# --- клетки доски вне диапазона отбиваются схемой, а не логикой ---
+r = c.post("/api/merge/trash", json={"cell": 9999}, headers=H(UID))
+check("out-of-range cell rejected", r.status_code == 422, str(r.status_code))
+
+# --- битая initData не роняет сервер в 500 ---
+r = c.post("/api/auth", headers={"Authorization": "tma " + "z" * 5000})
+check("oversized initData -> 401", r.status_code == 401, str(r.status_code))
+r = c.post("/api/auth", headers={"Authorization": "tma hash=deadbeef&user=notjson"})
+check("garbage initData -> 401", r.status_code == 401, str(r.status_code))
+
+# --- промокоды: единый код ошибки и лимит попыток ---
+gl._rate_buckets.clear()
+r = c.post("/api/promo/redeem", json={"code": "NOSUCHCODE1"}, headers=H(UID))
+check("promo error is generic", r.json()["detail"] == "err_promo_invalid", r.text[:80])
+for _ in range(cfg.PROMO_ATTEMPTS_PER_HOUR + 2):
+    last = c.post("/api/promo/redeem", json={"code": "NOSUCHCODE2"}, headers=H(UID))
+check("promo brute force rate limited", last.status_code == 429, str(last.status_code))
+gl._rate_buckets.clear()
+
+# --- тяжёлая ручка ограничена по частоте ---
+for _ in range(cfg.STATE_PER_MINUTE + 2):
+    last = c.get("/api/state", headers=H(UID))
+check("state endpoint rate limited", last.status_code == 429, str(last.status_code))
+gl._rate_buckets.clear()
+
+# --- админские поля валидируются схемой ---
+from server.routers.admin import PromoCreate
+import pydantic
+try:
+    PromoCreate(code="SHORT", reward_cookies=-5)
+    check("admin promo validation", False, "короткий код и минус прошли")
+except pydantic.ValidationError:
+    check("admin promo validation", True)
+
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
           "ref_claims", "achievements", "boosts", "purchases", "orders",
@@ -400,6 +463,8 @@ for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
     db.exec(f"DELETE FROM {t} WHERE user_id IN (?, ?)", (UID, UID2))
 db.exec("DELETE FROM referrals WHERE referrer_id = ? OR referred_id IN (?, ?)",
         (UID, UID, UID2))
+for _rid in _ref_ids:
+    db.exec("DELETE FROM users WHERE user_id = ?", (_rid,))
 db.exec("DELETE FROM season_results WHERE user_id IN (?, ?)", (UID, UID2))
 
 print(f"\n{ok} passed, {fail} failed")

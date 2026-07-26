@@ -79,41 +79,68 @@ def league_brackets() -> list[tuple[str, int, int | None]]:
 SEASON_RESET_CHUNK = 500        # юзеров за один проход ролловера
 
 
+_SEASON_RESET_SQL = (
+    "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
+    "bp_premium = bp_premium_next, bp_premium_next = 0, "
+    "bp_claimed_free = '[]', bp_claimed_premium = '[]' ")
+
+
+def _ensure_season_snapshot(season: int):
+    """Снапшот топа сезона и выплата призов — ровно один раз.
+
+    Маркер — наличие строк season_results: без него после частичного сброса
+    победители пересчитались бы по остатку. add_cookies(count_earned=False)
+    не трогает season_earned, поэтому платить можно до сброса."""
+    if db.q1("SELECT 1 x FROM season_results WHERE season_id = ? LIMIT 1", (season,)):
+        return
+    with db.tx():
+        now = time.time()
+        for uid, rank, earned in _season_winners(season):
+            reward = cfg.season_reward(rank, earned)
+            db.exec(
+                "INSERT OR IGNORE INTO season_results (season_id, user_id, "
+                "rank, earned, reward_cookies, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (season, uid, rank, earned, reward, now))
+            if reward:
+                add_cookies(uid, reward, count_earned=False)
+
+
+def ensure_user_season(user_id: int) -> dict | None:
+    """Приводит сезонные поля ОДНОГО игрока к текущему сезону.
+
+    Это дешёвая замена finalize_seasons в горячем пути: тот делал
+    SELECT DISTINCT season_id по всей таблице users на каждый /api/state,
+    /api/auth, /api/battlepass и /api/leaderboard, а в момент смены сезона
+    ещё и запускал пакетный UPDATE на 500 строк с каждого запроса. Массовый
+    сброс теперь идёт по таймеру в notifier; здесь — только своя строка."""
+    cur = current_season()
+    user = db.get_user(user_id)
+    if not user or user["season_id"] >= cur:
+        return user
+    _ensure_season_snapshot(user["season_id"])
+    with db.tx():
+        db.exec(_SEASON_RESET_SQL + "WHERE user_id = ? AND season_id < ?",
+                (cur, user_id, cur))
+    return db.get_user(user_id)
+
+
 def finalize_seasons():
-    """Ленивый ролловер: снапшотим топ прошлого сезона, раздаём награды и
-    сбрасываем сезонный прогресс. Сброс идёт ПОРЦИЯМИ — на большой базе один
-    UPDATE на всех держал бы write-lock, а ручка вызывается из четырёх мест.
-    Снапшот делается ровно один раз (маркер — наличие строк season_results),
-    иначе после частичного сброса победители пересчитались бы по остатку."""
+    """Массовый ролловер: снапшот топа прошлого сезона, призы и сброс
+    сезонного прогресса порциями. Зовётся по таймеру из notifier — один
+    UPDATE на всех держал бы write-lock на большой базе.
+
+    Премиум переезжает в новый сезон только через bp_premium_next (см.
+    grant_bp_premium: он ставит флаг и для покупок, совершённых уже ПОСЛЕ
+    смены сезона, пока сброс не дошёл до этой строки)."""
     cur = current_season()
     stale = db.q("SELECT DISTINCT season_id s FROM users WHERE season_id < ?", (cur,))
     for row in stale:
         season = row["s"]
-        if not db.q1("SELECT 1 x FROM season_results WHERE season_id = ? LIMIT 1",
-                     (season,)):
-            # снапшот + награды — одна транзакция и только на первом проходе.
-            # add_cookies(count_earned=False) не трогает season_earned, поэтому
-            # платить можно до сброса, не пачкая новый сезон
-            with db.tx():
-                now = time.time()
-                for uid, rank, earned in _season_winners(season):
-                    reward = cfg.season_reward(rank, earned)
-                    db.exec(
-                        "INSERT OR IGNORE INTO season_results (season_id, user_id, "
-                        "rank, earned, reward_cookies, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (season, uid, rank, earned, reward, now))
-                    if reward:
-                        add_cookies(uid, reward, count_earned=False)
-        # Сброс сезонного прогресса порциями; премиум переезжает в новый
-        # сезон только через bp_premium_next (см. grant_bp_premium — он ставит
-        # флаг и для покупок, совершённых уже ПОСЛЕ смены сезона, пока сброс
-        # не дошёл до этой строки).
+        _ensure_season_snapshot(season)
         with db.tx():
             db.exec(
-                "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
-                "bp_premium = bp_premium_next, bp_premium_next = 0, "
-                "bp_claimed_free = '[]', bp_claimed_premium = '[]' "
+                _SEASON_RESET_SQL +
                 "WHERE user_id IN (SELECT user_id FROM users "
                 "                  WHERE season_id = ? LIMIT ?)",
                 (cur, season, SEASON_RESET_CHUNK))
@@ -398,7 +425,9 @@ def claimable_quests_count(user_id: int) -> int:
 # ---------- milestone-награды рефералки ----------
 
 def ref_milestones_state(user_id: int) -> list[dict]:
-    refs = db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
+    # считаем только «живых» рефералов: майлстоуны раздают буст, эксклюзивный
+    # скин и Premium Пасс — за пустые аккаунты это прямой денежный эквивалент
+    refs = ref_count(user_id)
     claimed = {r["milestone_key"] for r in
                db.q("SELECT milestone_key FROM ref_claims WHERE user_id = ?", (user_id,))}
     out = []
@@ -407,6 +436,7 @@ def ref_milestones_state(user_id: int) -> list[dict]:
             "key": key, "count": ms["count"], "type": ms["type"],
             "progress": min(refs, ms["count"]),
             "done": refs >= ms["count"], "claimed": key in claimed,
+            "qualify_level": cfg.REF_QUALIFY_LEVEL,
         })
     return out
 
@@ -762,8 +792,17 @@ def add_cookies(user_id: int, amount: float, count_earned: bool = True):
 
 # ---------- merge-доска: клетки ----------
 
-def ref_count(user_id: int) -> int:
-    return db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
+def ref_count(user_id: int, qualified_only: bool = True) -> int:
+    """Число приглашённых. По умолчанию считаются только «живые» — те, кто
+    дошёл до REF_QUALIFY_LEVEL. Иначе 25 пустых аккаунтов приносили
+    refs_premium, который в магазине стоит 100 Stars, плюс 4 клетки доски."""
+    if not qualified_only:
+        return db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?",
+                     (user_id,))["c"]
+    return db.q1(
+        "SELECT COUNT(*) c FROM referrals r JOIN users u ON u.user_id = r.referred_id "
+        "WHERE r.referrer_id = ? AND u.level >= ?",
+        (user_id, cfg.REF_QUALIFY_LEVEL))["c"]
 
 
 def compact_board(user_id: int, earned_cells: int) -> int:
@@ -830,15 +869,41 @@ def collect_passive(user: dict) -> float:
     return income
 
 
+# Мемо часового дохода. hourly_income обходится в ~12 SQL-запросов и раньше
+# звался по 3-5 раз за один full_state плюс отдельно на каждое из трёх дневных
+# заданий — это была треть от 79 запросов, которые делал один /api/state.
+# TTL короткий, а full_state сбрасывает кеш на входе, поэтому в ответе никогда
+# не бывает устаревших чисел: мемо живёт только внутри одного запроса.
+_income_memo: dict[int, tuple[float, float]] = {}
+_INCOME_MEMO_TTL = 1.0
+
+
+def invalidate_income(user_id: int | None = None):
+    if user_id is None:
+        _income_memo.clear()
+    else:
+        _income_memo.pop(user_id, None)
+
+
 def hourly_income(user_id: int) -> float:
     """Оценка часового дохода игрока для масштабируемых наград и цен:
     ферма + пассивка доски + скромная оценка кликов (5 мин активного тапа).
     Берём ТОЛЬКО постоянные множители: под золотой печенькой доход не должен
     подскакивать в 7 раз (это раздувало награды заказов и цены на доске)."""
+    now = time.time()
+    hit = _income_memo.get(user_id)
+    if hit and now - hit[0] < _INCOME_MEMO_TTL:
+        return hit[1]
     user = db.get_user(user_id)
+    if not user:
+        return 0.0
     clicks_estimate = (cfg.click_power(user["click_level"])
                        * permanent_click_multiplier(user_id) * 5 * 60)
-    return farm_cps(user_id) * 3600 + passive_per_hour(user_id) + clicks_estimate
+    value = farm_cps(user_id) * 3600 + passive_per_hour(user_id) + clicks_estimate
+    if len(_income_memo) > 10_000:
+        _income_memo.clear()
+    _income_memo[user_id] = (now, value)
+    return value
 
 
 def board_base_income(user_id: int) -> float:
@@ -867,7 +932,7 @@ def passive_per_hour(user_id: int) -> float:
 def achievements_state(user: dict, lang: str = "en") -> list[dict]:
     from server.i18n import tr
     user_id = user["user_id"]
-    refs = db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
+    refs = ref_count(user_id)   # только «живые» рефералы, как в майлстоунах
     claimed = {r["key"] for r in db.q(
         "SELECT key FROM achievements WHERE user_id = ? AND claimed = 1", (user_id,))}
     income = hourly_income(user_id)
@@ -1380,6 +1445,10 @@ def _direct_max_level(user: dict) -> int:
 
 
 def full_state(user_id: int) -> dict:
+    # full_state возвращается из каждой изменяющей ручки, поэтому сбрасываем
+    # мемо дохода здесь: внутри одного ответа все расчёты используют одно
+    # свежее значение, а между запросами оно не переживает мутацию
+    invalidate_income(user_id)
     user = db.get_user(user_id)
     user = refresh_energy(user)
     db.update_user(user_id, last_seen_at=time.time())

@@ -3,7 +3,7 @@ import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server.auth import tg_admin
 from server import game_config as cfg
@@ -18,10 +18,11 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 # ---------- промокоды ----------
 
 class PromoCreate(BaseModel):
-    code: str
-    reward_cookies: float = 0
-    reward_energy: float = 0
-    max_uses: int = 0  # 0 = безлимит
+    # промокод короче 10 символов перебирается словарём за минуты
+    code: str = Field(min_length=10, max_length=64)
+    reward_cookies: float = Field(default=0, ge=0)
+    reward_energy: float = Field(default=0, ge=0)
+    max_uses: int = Field(default=0, ge=0)  # 0 = безлимит
 
 
 @router.get("/promo")
@@ -57,8 +58,8 @@ async def toggle_promo(body: PromoToggle):
 # ---------- source-ссылки ----------
 
 class SourceCreate(BaseModel):
-    code: str
-    title: str = ""
+    code: str = Field(max_length=64)
+    title: str = Field(default="", max_length=128)
 
 
 @router.get("/sources")
@@ -84,7 +85,7 @@ async def create_source(body: SourceCreate):
 # ---------- рассылка (фоном, чтобы не держать HTTP-запрос) ----------
 
 class BroadcastIn(BaseModel):
-    text: str
+    text: str = Field(max_length=4000)   # лимит сообщения Telegram
     test: bool = False  # true = отправить только себе (превью)
 
 

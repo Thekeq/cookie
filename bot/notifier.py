@@ -82,14 +82,43 @@ def _prune_events():
             (time.time() - cfg.EVENTS_TTL_DAYS * 86400,))
 
 
+def _prune_boosts():
+    """Истёкшие бусты не удалялись никогда, а строка добавляется на каждую
+    золотую печеньку. active_boosts читается из click_multiplier на КАЖДЫЙ
+    батч кликов — таблица росла бесконечно прямо под самой горячей ручкой."""
+    db.exec("DELETE FROM boosts WHERE expires_at < ?", (time.time() - 86400,))
+
+
+def _rollover_seasons():
+    """Ролловер сезона по таймеру, а не из горячего пути запросов.
+
+    finalize_seasons зовётся из четырёх ручек, и в момент смены сезона каждый
+    входящий запрос запускал пакетный UPDATE на 500 юзеров — все они дрались
+    за один write-lock. Здесь он идёт спокойно и до конца."""
+    for _ in range(200):          # 200 x 500 = до 100k юзеров за проход
+        left = db.q1("SELECT COUNT(*) c FROM users WHERE season_id < ?",
+                     (gl.current_season(),))["c"]
+        if not left:
+            return
+        gl.finalize_seasons()
+        if db.q1("SELECT COUNT(*) c FROM users WHERE season_id < ?",
+                 (gl.current_season(),))["c"] >= left:
+            return                # не двигается — дальше крутиться бессмысленно
+
+
 async def run_notifier(bot):
     while True:
+        # сначала домалываем сезон, потом пуши: иначе игрок придёт по
+        # уведомлению и увидит несброшенный сезонный прогресс
+        for name, job in (("season rollover", _rollover_seasons),
+                          ("events prune", _prune_events),
+                          ("boosts prune", _prune_boosts)):
+            try:
+                job()
+            except Exception:
+                log.exception("%s failed", name)
         try:
             await _notify_pass(bot)
         except Exception:
             log.exception("notifier pass failed")
-        try:
-            _prune_events()
-        except Exception:
-            log.exception("events prune failed")
         await asyncio.sleep(CHECK_INTERVAL)

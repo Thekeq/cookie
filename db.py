@@ -237,6 +237,21 @@ class DataBase:
             "CREATE INDEX IF NOT EXISTS idx_events_name ON events(event, created_at)")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, status)")
+        # boosts читается из click_multiplier на КАЖДЫЙ батч кликов, под
+        # BEGIN IMMEDIATE — без индекса это full scan в самой горячей ручке
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_boosts_user ON boosts(user_id, expires_at)")
+        # ref_count зовётся из merge_cells_unlocked_for на каждый /api/state;
+        # UNIQUE висел только на referred_id, поиск по referrer_id сканировал всё
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
+        # finalize_seasons делает SELECT DISTINCT season_id на каждый запрос
+        # четырёх ручек; лидерборд фильтрует по (season_id, level)
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_season ON users(season_id, level)")
+        # fulfill_pending перебирает зависшие покупки на каждом /auth
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_purchases_user ON purchases(user_id, status)")
         self._dedupe_and_unique(db_file)
         self.connection.commit()
 

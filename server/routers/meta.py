@@ -4,7 +4,7 @@ import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server import game_config as cfg
 from server import game_logic as gl
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api")
 @router.post("/auth")
 async def auth(tg: dict = Depends(tg_user)):
     """Первый запрос при открытии Mini App: создаёт юзера, фиксирует ref_/src_."""
-    gl.finalize_seasons()
+    gl.ensure_user_season(tg["id"])
     user = db.get_user(tg["id"])
     just_registered = False
     if not user:
@@ -90,7 +90,7 @@ async def referrals(tg: dict = Depends(tg_user)):
 
 
 class MilestoneIn(BaseModel):
-    key: str
+    key: str = Field(max_length=64)
 
 
 @router.post("/referrals/milestone")
@@ -109,7 +109,7 @@ async def claim_milestone(body: MilestoneIn, tg: dict = Depends(tg_user)):
 # ---------- промокоды ----------
 
 class PromoIn(BaseModel):
-    code: str
+    code: str = Field(max_length=64)
 
 
 @router.post("/promo/redeem")
@@ -153,7 +153,8 @@ async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
 
 @router.get("/battlepass")
 async def battlepass(tg: dict = Depends(tg_user)):
-    gl.finalize_seasons()
+    gl.check_rate_limit(tg["id"], "heavy", cfg.HEAVY_PER_MINUTE, 60)
+    gl.ensure_user_season(tg["id"])
     user = db.get_user(tg["id"])
     if not user:
         raise HTTPException(404, "err_no_user")
@@ -187,8 +188,8 @@ async def battlepass(tg: dict = Depends(tg_user)):
 
 
 class BPClaim(BaseModel):
-    level: int
-    track: str  # "free" | "premium"
+    level: int = Field(ge=1, le=cfg.BP_MAX_LEVEL)
+    track: str = Field(max_length=16)  # "free" | "premium"
 
 
 @router.post("/battlepass/claim")
@@ -257,12 +258,15 @@ async def shop(tg: dict = Depends(tg_user)):
 
 
 class BuyIn(BaseModel):
-    item_key: str
+    item_key: str = Field(max_length=64)
 
 
 @router.post("/shop/invoice")
 async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
     """Создаёт invoice-ссылку на оплату Stars через бота."""
+    # дёргает Bot API: цикл запросов ловил глобальный 429 от Telegram и ломал
+    # платежи, /start и рассылки сразу всем игрокам
+    gl.check_rate_limit(tg["id"], "invoice", cfg.INVOICE_PER_MINUTE, 60)
     if body.item_key not in cfg.SHOP_ITEMS:
         raise HTTPException(400, "err_no_item")
     # постоянный апгрейд уже куплен (или тир ещё рано) — не даём заплатить
@@ -290,6 +294,37 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
 
 # ---------- лидерборд ----------
 
+# Кеш топа лиги: (сезон, лига) -> (время, строки, всего игроков).
+# Каждый вызов делал три полных прохода по users, а таблица за минуту
+# практически не меняется — цикл запросов деградировал базу для всех.
+_lb_cache: dict[tuple[int, str], tuple[float, list[dict], int]] = {}
+
+
+def _leaderboard_cached(season: int, lkey: str, cond: str,
+                        lparams: tuple) -> tuple[list[dict], int]:
+    key = (season, lkey)
+    hit = _lb_cache.get(key)
+    now = time.time()
+    if hit and now - hit[0] < cfg.LEADERBOARD_CACHE_SEC:
+        return hit[1], hit[2]
+    rows = db.q(
+        f"SELECT user_id, username, first_name, level, season_earned "
+        f"FROM users WHERE season_id = ? AND {cond} "
+        f"ORDER BY season_earned DESC, level DESC LIMIT 100",
+        [season] + list(lparams))
+    for i, row in enumerate(rows):
+        row["rank"] = i + 1
+        row["name"] = row.pop("first_name") or row.pop("username") or "Player"
+        row.pop("username", None)
+        row["prize"] = cfg.season_reward(i + 1, row["season_earned"])
+    total = db.q1(f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond}",
+                  [season] + list(lparams))["c"]
+    if len(_lb_cache) > 64:
+        _lb_cache.clear()
+    _lb_cache[key] = (now, rows, total)
+    return rows, total
+
+
 @router.get("/leaderboard")
 async def leaderboard(tg: dict = Depends(tg_user)):
     """Сезонный топ ВНУТРИ СВОЕЙ ЛИГИ: лига определяется уровнем (новичок
@@ -297,7 +332,8 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     именно он и обнуляется. Раньше сортировка шла по уровню, который сезон не
     сбрасывает: таблица стояла на месте, а престиж ронял игрока на дно.
     Топ-10 каждой лиги получают призы в конце сезона."""
-    gl.finalize_seasons()
+    gl.check_rate_limit(tg["id"], "heavy", cfg.HEAVY_PER_MINUTE, 60)
+    gl.ensure_user_season(tg["id"])
     season = gl.current_season()
     me = db.get_user(tg["id"])
     my_level = me["level"] if me else 1
@@ -305,16 +341,14 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     cond = "level >= ?" + (" AND level <= ?" if hi is not None else "")
     lparams = [lo] + ([hi] if hi is not None else [])
 
-    top = db.q(
-        f"SELECT user_id, username, first_name, level, season_earned "
-        f"FROM users WHERE season_id = ? AND {cond} "
-        f"ORDER BY season_earned DESC, level DESC LIMIT 100", [season] + lparams)
-    for i, row in enumerate(top):
-        row["rank"] = i + 1
-        row["name"] = row.pop("first_name") or row.pop("username") or "Player"
-        row.pop("username", None)
-        row["is_me"] = row["user_id"] == tg["id"]
-        row["prize"] = cfg.season_reward(i + 1, row["season_earned"])
+    # Топ и общее число игроков кешируются на LEADERBOARD_CACHE_SEC: это два
+    # прохода по users на каждый вызов, а таблица за минуту почти не меняется.
+    top, players_total = _leaderboard_cached(season, lkey, cond, tuple(lparams))
+    top = [dict(r) for r in top]
+    for row in top:
+        # is_me считаем здесь, а user_id в ответ НЕ отдаём: раньше уходили
+        # телеграм-id всех топ-100 — готовая база активных игроков для фишинга
+        row["is_me"] = row.pop("user_id") == tg["id"]
 
     my_rank = None
     if me:
@@ -326,9 +360,7 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     return {
         "top": top,
         "me": {"rank": my_rank, "season_earned": me["season_earned"] if me else 0},
-        "players_total": db.q1(
-            f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond}",
-            [season] + lparams)["c"],
+        "players_total": players_total,
         "league": {"key": lkey, "min_level": lo, "max_level": hi,
                    "all": [k for k, _lo in cfg.LEAGUES]},
         "season": season + 1,
@@ -357,6 +389,7 @@ async def channel(tg: dict = Depends(tg_user)):
 async def channel_claim(tg: dict = Depends(tg_user)):
     if not CHANNEL_USERNAME:
         raise HTTPException(400, "err_no_channel")
+    gl.check_rate_limit(tg["id"], "heavy", cfg.HEAVY_PER_MINUTE, 60)  # get_chat_member
     user = db.get_user(tg["id"])
     if not user:
         raise HTTPException(404, "err_no_user")

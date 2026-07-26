@@ -206,6 +206,9 @@ check("stale reward not paid", r.status_code == 200 and paid < 60_000_000
 r = c.get("/api/orders", headers=H)
 cheap = [o["reward_cookies"] for o in r.json()["offers"]]
 db.exec("UPDATE farm SET count = 500 WHERE user_id = ? AND building_key = 'granny'", (UID,))
+# hourly_income мемоизируется на секунду (иначе он звался по 15 раз за запрос);
+# правка БД в обход API мемо не сбрасывает — в бою его сбрасывает full_state
+gl.invalidate_income(UID)
 r = c.get("/api/orders", headers=H)
 rich = [o["reward_cookies"] for o in r.json()["offers"]]
 check("offers rescale when income grows", all(b > a for a, b in zip(cheap, rich)),

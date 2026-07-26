@@ -2,7 +2,7 @@
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server import game_config as cfg
 from server import game_logic as gl
@@ -23,8 +23,11 @@ def _ensure_user(tg: dict) -> dict:
 
 @router.get("/state")
 async def get_state(tg: dict = Depends(tg_user)):
+    # самая тяжёлая ручка: 40+ обращений к БД, а SQLite синхронный и держит
+    # весь процесс вместе с поллингом бота. Клиент поллит раз в 30 сек
+    gl.check_rate_limit(tg["id"], "state", cfg.STATE_PER_MINUTE, 60)
     user = _ensure_user(tg)
-    gl.finalize_seasons()
+    gl.ensure_user_season(tg["id"])
     passive = gl.collect_passive(user)
     farm_income = gl.collect_farm(db.get_user(tg["id"]))
     state = gl.full_state(tg["id"])
@@ -61,7 +64,7 @@ async def quests(tg: dict = Depends(tg_user)):
 
 
 class RerollQuest(BaseModel):
-    key: str
+    key: str = Field(max_length=64)
 
 
 @router.post("/quests/reroll")
@@ -76,7 +79,7 @@ async def quest_reroll(body: RerollQuest, tg: dict = Depends(tg_user)):
 
 
 class ClaimQuest(BaseModel):
-    key: str
+    key: str = Field(max_length=64)
 
 
 @router.post("/quests/claim")
@@ -94,8 +97,13 @@ async def quest_claim(body: ClaimQuest, tg: dict = Depends(tg_user)):
 # ---------- кликер ----------
 
 class ClickBatch(BaseModel):
-    clicks: int         # сколько кликов накопил клиент с прошлой отправки
-    batch_id: str = ""  # уникальный id батча: повтор (ретрай) не начисляется дважды
+    # Field-границы обязательны: без max_length строка материализуется целиком
+    # ещё до среза, и запрос с batch_id на 200 МБ клал процесс по памяти —
+    # вместе с ботом, он в том же процессе
+    clicks: int = Field(ge=0, le=200)
+    # batch_id ОБЯЗАТЕЛЕН: раньше он был необязательным, и читерский клиент
+    # просто не слал его, полностью отключая защиту от повторной отправки
+    batch_id: str = Field(min_length=6, max_length=64)
 
 
 @router.post("/click")
@@ -228,8 +236,8 @@ async def prestige_do(tg: dict = Depends(tg_user)):
 # ---------- merge ----------
 
 class MergeMove(BaseModel):
-    from_cell: int
-    to_cell: int
+    from_cell: int = Field(ge=0, le=cfg.BOARD_SIZE - 1)
+    to_cell: int = Field(ge=0, le=cfg.BOARD_SIZE - 1)
 
 
 def _board_map(user_id: int) -> dict[int, int]:
@@ -257,7 +265,7 @@ def _best_free_cell(free_cells: list[int], board: dict[int, int]) -> int:
 
 
 class SpawnIn(BaseModel):
-    level: int = 1  # прямая покупка печеньки уровня N (дорого, экономит слияния)
+    level: int = Field(default=1, ge=1, le=cfg.MAX_ITEM_LEVEL)
 
 
 @router.post("/merge/spawn")
@@ -361,7 +369,7 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
 
 
 class TrashIn(BaseModel):
-    cell: int
+    cell: int = Field(ge=0, le=cfg.BOARD_SIZE - 1)
 
 
 @router.post("/merge/trash")
@@ -436,7 +444,7 @@ async def achievements(tg: dict = Depends(tg_user)):
 
 
 class ClaimAch(BaseModel):
-    key: str
+    key: str = Field(max_length=64)
 
 
 @router.post("/achievements/claim")
@@ -457,7 +465,7 @@ async def orders(tg: dict = Depends(tg_user)):
 
 
 class TakeOrder(BaseModel):
-    slot: int
+    slot: int = Field(ge=1, le=3)
 
 
 @router.post("/orders/take")

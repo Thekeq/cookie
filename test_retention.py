@@ -77,14 +77,14 @@ check("golden double-claim blocked", r.status_code == 400)
 
 # --- комбо ---
 db.update_user(UID, energy=2000, combo_mult=1, combo_last_at=0)
-r = c.post("/api/click", json={"clicks": 10}, headers=H)
+r = c.post("/api/click", json={"clicks": 10, "batch_id": "auto-ret-1"}, headers=H)
 check("first batch combo=1", r.json().get("combo") == 1.0, str(r.json().get("combo")))
 time.sleep(1.2)  # 10 кликов за 1.2с = ~8 cps > COMBO_MIN_CPS, окно не истекло
-r = c.post("/api/click", json={"clicks": 10}, headers=H)
+r = c.post("/api/click", json={"clicks": 10, "batch_id": "auto-ret-2"}, headers=H)
 check("combo grows", r.json().get("combo", 0) > 1.0, str(r.json().get("combo")))
 # пауза дольше окна — сброс
 db.update_user(UID, combo_last_at=time.time() - cfg.COMBO_WINDOW - 2)
-r = c.post("/api/click", json={"clicks": 10}, headers=H)
+r = c.post("/api/click", json={"clicks": 10, "batch_id": "auto-ret-3"}, headers=H)
 check("combo resets after pause", r.json().get("combo") == 1.0, str(r.json().get("combo")))
 
 # --- дедупликация клик-батчей по batch_id ---
@@ -180,7 +180,7 @@ db.update_user(UID, energy=200000, clicks_day=gl._utc_day(time.time()),
 xp_before = db.get_user(UID)["xp"]
 db.exec("DELETE FROM daily_quests WHERE user_id = ?", (UID,))
 db.update_user(UID, cps_ts=0, cps_allowance=0)  # сброс CPS-окна (теперь в БД)
-r = c.post("/api/click", json={"clicks": 40}, headers=H)
+r = c.post("/api/click", json={"clicks": 40, "batch_id": "auto-ret-4"}, headers=H)
 accepted = r.json()["accepted"]
 xp_gained = db.get_user(UID)["xp"] - xp_before
 check("click xp capped to 0.125",

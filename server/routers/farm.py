@@ -1,6 +1,6 @@
 """Внутриигровой магазин за печеньки: ферма (автофарм), апгрейды, скины."""
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server import game_config as cfg
 from server import game_logic as gl
@@ -73,7 +73,7 @@ async def farm_state(tg: dict = Depends(tg_user)):
 
 
 class KeyIn(BaseModel):
-    key: str
+    key: str = Field(max_length=64)
 
 
 @router.post("/buy_building")
