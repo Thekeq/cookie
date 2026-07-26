@@ -302,10 +302,10 @@ check("income recovered after failed collect", r.status_code == 200)
 
 # --- канал: условный UPDATE отдаёт награду ровно одному запросу ---
 db.update_user(UID, channel_claimed=0)
-db.exec("UPDATE users SET channel_claimed = 1 WHERE user_id = ? AND channel_claimed = 0", (UID,))
-first = db.cursor.rowcount
-db.exec("UPDATE users SET channel_claimed = 1 WHERE user_id = ? AND channel_claimed = 0", (UID,))
-second = db.cursor.rowcount
+first = db.exec("UPDATE users SET channel_claimed = 1 "
+                "WHERE user_id = ? AND channel_claimed = 0", (UID,))
+second = db.exec("UPDATE users SET channel_claimed = 1 "
+                 "WHERE user_id = ? AND channel_claimed = 0", (UID,))
 check("channel conditional claim once", first == 1 and second == 0, f"{first},{second}")
 
 # ================= фичи залипательности =================

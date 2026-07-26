@@ -113,13 +113,13 @@ def find(user: dict) -> dict:
             # старт обоих счётчиков берём В МОМЕНТ старта: заявка могла висеть
             # часами, и заработок за это время не должен попадать в дуэль
             a_now = db.get_user(foe["user_a"])["total_earned"]
-            db.exec(
+            taken = db.exec(
                 "UPDATE duels SET user_b = ?, status = 'active', a_start = ?, "
                 "b_start = ?, started_at = ?, ends_at = ? "
                 "WHERE id = ? AND status = 'waiting'",
                 (uid, a_now, user["total_earned"], now,
                  now + cfg.DUEL_HOURS * 3600, foe["id"]))
-            if db.cursor.rowcount == 0:      # заявку перехватил кто-то ещё
+            if taken == 0:                   # заявку перехватил кто-то ещё
                 raise ValueError("err_duel_taken")
             gl.track(uid, "duel_start")
             return state(db.get_user(uid))
@@ -148,8 +148,8 @@ def claim(user: dict) -> dict:
     col = "claimed_a" if is_a else "claimed_b"
     reward = row["reward"] if row["winner_id"] == uid else 0
     with db.tx():
-        db.exec(f"UPDATE duels SET {col} = 1 WHERE id = ? AND {col} = 0", (row["id"],))
-        if db.cursor.rowcount == 0:
+        if db.exec(f"UPDATE duels SET {col} = 1 WHERE id = ? AND {col} = 0",
+                   (row["id"],)) == 0:
             raise ValueError("err_claimed")
         if reward:
             gl.add_cookies(uid, reward, count_earned=False)

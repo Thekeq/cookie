@@ -1,26 +1,38 @@
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 
+# сколько раз повторить BEGIN IMMEDIATE, если база занята другим писателем
+TX_RETRIES = 5
+
 
 class DataBase:
+    # Диалект и два имени, которые расходятся между движками. Всё остальное в
+    # новом SQL — общий синтаксис (ON CONFLICT DO NOTHING, RETURNING,
+    # UPDATE ... WHERE <guard>), так что переезд на PostgreSQL сведётся к смене
+    # DIALECT и драйвера соединения.
+    DIALECT = "sqlite"
+    GREATEST = "MAX"     # на postgres -> "GREATEST"
+    LEAST = "MIN"        # на postgres -> "LEAST"
+
     def __init__(self, db_file=None):
         # путь можно переопределить (тесты используют временную БД)
         db_file = db_file or os.environ.get("DATABASE_PATH", "data.db")
         self.db_file = db_file
-        # timeout=10 говорит базе: если занято, подожди 10 сек, а не падай сразу
-        self.connection = sqlite3.connect(db_file, check_same_thread=False, timeout=10)
-        # автокоммит на каждый statement; многошаговые операции — явно через tx()
-        self.connection.isolation_level = None
+        # соединение, курсор и глубина транзакции живут ПО ПОТОКАМ: один общий
+        # курсор на процесс — это гонка за rowcount (любой SELECT из другого
+        # потока сбрасывал его в -1 между записью и проверкой)
+        self._local = threading.local()
+        self._memory_conn = None
+        self.last_insert_id = None
 
-        # Включаем WAL-режим (МЕГА-ВАЖНО для онлайна и скорости)
-        self.connection.execute('PRAGMA journal_mode=WAL;')
-
-        # Чтобы получать результаты как словари, а не кортежи (удобнее читать)
-        self.connection.row_factory = sqlite3.Row
-        self.cursor = self.connection.cursor()
-        self._tx_depth = 0
+        # журнал применённых миграций. Создаётся ДО всего остального: на него
+        # опирается и _auto_migrate (__after_create__), и дедуп
+        self.cursor.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "name TEXT PRIMARY KEY, applied_at REAL NOT NULL DEFAULT 0)")
 
         self.tables_schema = {
             'users': {
@@ -279,29 +291,76 @@ class DataBase:
         self._dedupe_and_unique(db_file)
         self.connection.commit()
 
-    # пары колонок, которые обязаны быть уникальными; код и так это проверяет,
-    # но параллельные запросы могли бы создать дубли — БД теперь не даст
+    # Наборы колонок, которые обязаны быть уникальными; код и так это проверяет,
+    # но параллельные запросы могли бы создать дубли — БД теперь не даст.
+    # Ключ словаря = имя набора; поля:
+    #   cols   — колонки индекса (обязательно)
+    #   table  — таблица, если она называется не так, как ключ
+    #   where  — условие ЧАСТИЧНОГО уникального индекса (одинаково на обоих
+    #            движках). Дедуп обязан нести то же условие, иначе он удалит
+    #            строки, которые индекс бы разрешил
+    #   index  — имя индекса, если оно не выводится из table+cols
     UNIQUES = {
-        "board": ("user_id", "cell"),
-        "farm": ("user_id", "building_key"),
-        "upgrades": ("user_id", "upgrade_key"),
-        "skins": ("user_id", "skin_key"),
-        "achievements": ("user_id", "key"),
-        "promo_redemptions": ("user_id", "code"),
-        "ref_claims": ("user_id", "milestone_key"),
-        "season_results": ("season_id", "user_id"),
-        "click_batches": ("user_id", "batch_id"),
-        "collection": ("user_id", "item_level"),
+        "board": {"cols": ("user_id", "cell")},
+        "farm": {"cols": ("user_id", "building_key")},
+        "upgrades": {"cols": ("user_id", "upgrade_key")},
+        "skins": {"cols": ("user_id", "skin_key")},
+        "achievements": {"cols": ("user_id", "key")},
+        "promo_redemptions": {"cols": ("user_id", "code")},
+        "ref_claims": {"cols": ("user_id", "milestone_key")},
+        "season_results": {"cols": ("season_id", "user_id")},
+        "click_batches": {"cols": ("user_id", "batch_id")},
+        "collection": {"cols": ("user_id", "item_level")},
+        # один Stars-платёж — одна запись (charge_id уникален, NULL допустим);
+        # имя индекса историческое, менять нельзя — иначе создастся второй
+        "purchases": {"cols": ("tg_payment_id",),
+                      "where": "tg_payment_id IS NOT NULL",
+                      "index": "uq_purchases_charge"},
     }
 
+    # Схлопывание дублей С УЧЁТОМ ДАННЫХ: там, где лишнюю строку нельзя просто
+    # выбросить, сначала переносим её содержимое на выжившую (MIN(id))
+    DEDUPE_MERGE = {
+        # ферма: у выжившей строки — суммарное количество зданий
+        "farm": "UPDATE farm SET count = (SELECT SUM(f2.count) FROM farm f2 "
+                " WHERE f2.user_id = farm.user_id AND f2.building_key = farm.building_key) "
+                "WHERE id IN (SELECT MIN(id) FROM farm GROUP BY user_id, building_key "
+                "             HAVING COUNT(*) > 1)",
+        # доска: в клетке выживает печенька максимального уровня
+        "board": "DELETE FROM board WHERE EXISTS (SELECT 1 FROM board b2 "
+                 " WHERE b2.user_id = board.user_id AND b2.cell = board.cell "
+                 " AND (b2.item_level > board.item_level "
+                 "      OR (b2.item_level = board.item_level AND b2.id < board.id)))",
+        # ачивки: если хоть один дубль заклеймлен — сохраняем claimed=1
+        "achievements":
+            "UPDATE achievements SET claimed = (SELECT MAX(a2.claimed) FROM achievements a2 "
+            " WHERE a2.user_id = achievements.user_id AND a2.key = achievements.key) "
+            "WHERE id IN (SELECT MIN(id) FROM achievements GROUP BY user_id, key "
+            "             HAVING COUNT(*) > 1)",
+        # платежи: fulfilled важнее paid — переносим статус на выжившую строку
+        "purchases":
+            "UPDATE purchases SET status = 'fulfilled' "
+            "WHERE tg_payment_id IS NOT NULL AND status != 'fulfilled' AND EXISTS "
+            "(SELECT 1 FROM purchases p2 WHERE p2.tg_payment_id = purchases.tg_payment_id "
+            " AND p2.status = 'fulfilled')",
+    }
+
+    @staticmethod
+    def _unique_parts(key: str, spec: dict):
+        """(таблица, колонки, where, имя индекса) для набора уникальности."""
+        table = spec.get("table", key)
+        cols = spec["cols"]
+        name = spec.get("index") or f"uq_{table}_{'_'.join(cols)}"
+        return table, cols, spec.get("where"), name
+
     def _has_duplicates(self) -> bool:
-        for table, cols in self.UNIQUES.items():
-            if self.q1(f"SELECT 1 AS x FROM {table} GROUP BY {', '.join(cols)} "
-                       f"HAVING COUNT(*) > 1 LIMIT 1"):
+        for key, spec in self.UNIQUES.items():
+            table, cols, where, _ = self._unique_parts(key, spec)
+            cond = f"WHERE {where} " if where else ""
+            if self.q1(f"SELECT 1 AS x FROM {table} {cond}"
+                       f"GROUP BY {', '.join(cols)} HAVING COUNT(*) > 1 LIMIT 1"):
                 return True
-        return bool(self.q1(
-            "SELECT 1 AS x FROM purchases WHERE tg_payment_id IS NOT NULL "
-            "GROUP BY tg_payment_id HAVING COUNT(*) > 1 LIMIT 1"))
+        return False
 
     def _backup(self, db_file: str):
         """Копия базы перед разрушительной миграцией (sqlite backup API)."""
@@ -339,60 +398,71 @@ class DataBase:
                 pass
         return path
 
+    # ---------- миграции ----------
+
+    def _migration(self, name: str) -> bool:
+        """True, если миграция ещё не применялась к этой базе.
+
+        Выполнив тело, обязательно позвать _mark(name). Разово — потому что
+        дедуп РАЗРУШИТЕЛЕН: он удаляет строки. Раньше все десять DELETE'ов
+        выполнялись на каждом импорте, и любой новый частичный индекс означал
+        бы удаление живых данных при каждом старте."""
+        return not self.q1(
+            "SELECT 1 AS x FROM schema_migrations WHERE name = ?", (name,))
+
+    def _mark(self, name: str):
+        self.exec("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?) "
+                  "ON CONFLICT (name) DO NOTHING", (name, time.time()))
+
     def _dedupe_and_unique(self, db_file: str):
-        """Схлопывает дубли С УЧЁТОМ ДАННЫХ (ферма — суммируем количество,
-        доска — оставляем лучшую печеньку, ачивки — сохраняем claimed,
-        платежи — сохраняем fulfilled), затем вешает UNIQUE-индексы."""
-        if self._has_duplicates() and db_file != ":memory:":
+        """Разово схлопывает дубли С УЧЁТОМ ДАННЫХ, затем вешает UNIQUE-индексы.
+
+        Дедуп идёт один раз на набор уникальности (журнал schema_migrations),
+        создание индексов — на каждом старте, но оно идемпотентно."""
+        pending = [k for k in self.UNIQUES if self._migration(f"dedupe:{k}")]
+        if pending and db_file != ":memory:" and self._has_duplicates():
             self._backup(db_file)
 
-        # ферма: у выжившей строки — суммарное количество зданий
-        self.cursor.execute(
-            "UPDATE farm SET count = (SELECT SUM(f2.count) FROM farm f2 "
-            " WHERE f2.user_id = farm.user_id AND f2.building_key = farm.building_key) "
-            "WHERE id IN (SELECT MIN(id) FROM farm GROUP BY user_id, building_key "
-            "             HAVING COUNT(*) > 1)")
-        # доска: в клетке выживает печенька максимального уровня
-        self.cursor.execute(
-            "DELETE FROM board WHERE EXISTS (SELECT 1 FROM board b2 "
-            " WHERE b2.user_id = board.user_id AND b2.cell = board.cell "
-            " AND (b2.item_level > board.item_level "
-            "      OR (b2.item_level = board.item_level AND b2.id < board.id)))")
-        # ачивки: если хоть один дубль заклеймлен — сохраняем claimed=1
-        self.cursor.execute(
-            "UPDATE achievements SET claimed = (SELECT MAX(a2.claimed) FROM achievements a2 "
-            " WHERE a2.user_id = achievements.user_id AND a2.key = achievements.key) "
-            "WHERE id IN (SELECT MIN(id) FROM achievements GROUP BY user_id, key "
-            "             HAVING COUNT(*) > 1)")
-        # платежи: fulfilled важнее paid — переносим статус на выжившую строку
-        self.cursor.execute(
-            "UPDATE purchases SET status = 'fulfilled' "
-            "WHERE tg_payment_id IS NOT NULL AND status != 'fulfilled' AND EXISTS "
-            "(SELECT 1 FROM purchases p2 WHERE p2.tg_payment_id = purchases.tg_payment_id "
-            " AND p2.status = 'fulfilled')")
+        for key in pending:
+            table, cols, where, _ = self._unique_parts(key, self.UNIQUES[key])
+            merge = self.DEDUPE_MERGE.get(key)
+            if merge:
+                self.cursor.execute(merge)
+            # условие частичного индекса дублируется в обе половины запроса:
+            # и в отбор удаляемых строк, и в подзапрос выживших
+            pre = f"{where} AND " if where else ""
+            sub = f"WHERE {where} " if where else ""
+            self.cursor.execute(
+                f"DELETE FROM {table} WHERE {pre}id NOT IN "
+                f"(SELECT MIN(id) FROM {table} {sub}GROUP BY {', '.join(cols)})")
+            self._mark(f"dedupe:{key}")
 
-        for table, cols in self.UNIQUES.items():
-            col_list = ", ".join(cols)
-            self.cursor.execute(
-                f"DELETE FROM {table} WHERE id NOT IN "
-                f"(SELECT MIN(id) FROM {table} GROUP BY {col_list})")
-            self.cursor.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{table}_{'_'.join(cols)} "
-                f"ON {table}({col_list})")
-        # один Stars-платёж — одна запись (charge_id уникален, NULL допустим)
-        self.cursor.execute(
-            "DELETE FROM purchases WHERE tg_payment_id IS NOT NULL AND id NOT IN "
-            "(SELECT MIN(id) FROM purchases WHERE tg_payment_id IS NOT NULL "
-            " GROUP BY tg_payment_id)")
-        self.cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_charge "
-            "ON purchases(tg_payment_id) WHERE tg_payment_id IS NOT NULL")
+        for key, spec in self.UNIQUES.items():
+            table, cols, where, name = self._unique_parts(key, spec)
+            tail = f" WHERE {where}" if where else ""
+            try:
+                self.cursor.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
+                    f"ON {table}({', '.join(cols)}){tail}")
+            except sqlite3.IntegrityError as e:
+                # дедуп уже отработал, значит дубли появились ПОСЛЕ него —
+                # это баг в коде, а не наследие. Молча удалять живые строки
+                # нельзя, поэтому старт отменяется
+                raise RuntimeError(
+                    f"В таблице {table} есть дубли по {cols}, уникальный индекс "
+                    f"{name} не создаётся. Дедуп уже применялся — разберись с "
+                    f"причиной, автоматически удалять строки небезопасно.") from e
 
     def _auto_migrate(self):
         """ Умная система: создает таблицы или добавляет новые столбцы на лету """
-        for table_name, columns in self.tables_schema.items():
-            cols_sql = ", ".join([f"{col} {ctype}" for col, ctype in columns.items()])
-            self.cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({cols_sql})")
+        for table_name, spec in self.tables_schema.items():
+            # ключи с двумя подчёркиваниями — не колонки: __constraints__
+            # дописываются в CREATE TABLE, __after_create__ выполняется разово
+            columns = {k: v for k, v in spec.items() if not k.startswith("__")}
+            parts = [f"{col} {ctype}" for col, ctype in columns.items()]
+            parts += list(spec.get("__constraints__", ()))
+            self.cursor.execute(
+                f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(parts)})")
 
             self.cursor.execute(f"PRAGMA table_info({table_name})")
             existing_columns = [row['name'] for row in self.cursor.fetchall()]
@@ -402,7 +472,16 @@ class DataBase:
                     print(f"[*] Миграция: Добавлен новый столбец {col_name} в {table_name}")
                     self.cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
 
-        self._backfill_best_item_level()
+            after = spec.get("__after_create__")
+            key = f"after_create:{table_name}"
+            if after and self._migration(key):
+                for stmt in after:
+                    self.cursor.execute(stmt)
+                self._mark(key)
+
+        if self._migration("backfill_best_item_level"):
+            self._backfill_best_item_level()
+            self._mark("backfill_best_item_level")
         self.connection.commit()
 
     def _backfill_best_item_level(self):
@@ -415,20 +494,77 @@ class DataBase:
 
         Берём максимум из доски и альбома коллекции. Обновляем только нули,
         поэтому повторный запуск ничего не портит."""
-        self.cursor.execute("SELECT COUNT(*) c FROM users WHERE best_item_level = 0")
-        if not self.cursor.fetchone()["c"]:
+        cur = self.cursor
+        cur.execute("SELECT COUNT(*) c FROM users WHERE best_item_level = 0")
+        if not cur.fetchone()["c"]:
             return
-        self.cursor.execute("""
-            UPDATE users SET best_item_level = MAX(
+        cur.execute(f"""
+            UPDATE users SET best_item_level = {self.GREATEST}(
                 COALESCE((SELECT MAX(item_level) FROM board b
                           WHERE b.user_id = users.user_id), 0),
                 COALESCE((SELECT MAX(item_level) FROM collection c
                           WHERE c.user_id = users.user_id), 0))
             WHERE best_item_level = 0""")
-        if self.cursor.rowcount:
-            print(f"[*] Миграция: рекорд тира проставлен {self.cursor.rowcount} игрокам")
+        if cur.rowcount:
+            print(f"[*] Миграция: рекорд тира проставлен {cur.rowcount} игрокам")
+
+    # ---------- соединение (по потокам) ----------
+
+    def _connect(self):
+        """Новое соединение с прогретыми прагмами.
+
+        Прагмы, кроме journal_mode, действуют НА СОЕДИНЕНИЕ, поэтому ставятся
+        здесь, а не один раз в __init__."""
+        if self.db_file == ":memory:":
+            # у in-memory базы каждое соединение — своя пустая база, поэтому
+            # такое соединение одно на процесс (тесты и только они)
+            if self._memory_conn is not None:
+                return self._memory_conn
+        # timeout=10 говорит базе: если занято, подожди 10 сек, а не падай сразу
+        conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=10)
+        # автокоммит на каждый statement; многошаговые операции — явно через tx()
+        conn.isolation_level = None
+        # Чтобы получать результаты как словари, а не кортежи (удобнее читать)
+        conn.row_factory = sqlite3.Row
+        # WAL — МЕГА-ВАЖНО для онлайна и скорости
+        conn.execute("PRAGMA journal_mode=WAL")
+        # внешние ключи в SQLite выключены по умолчанию и включаются на каждое
+        # соединение отдельно; на PostgreSQL они всегда на
+        conn.execute("PRAGMA foreign_keys=ON")
+        if self.db_file == ":memory:":
+            self._memory_conn = conn
+        return conn
+
+    @property
+    def connection(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._local.conn = self._connect()
+            self._local.cur = conn.cursor()
+            self._local.depth = 0
+        return conn
+
+    @property
+    def cursor(self):
+        self.connection          # гарантирует, что соединение потока поднято
+        return self._local.cur
+
+    @property
+    def _tx_depth(self) -> int:
+        self.connection
+        return self._local.depth
+
+    @_tx_depth.setter
+    def _tx_depth(self, value: int):
+        self.connection
+        self._local.depth = value
 
     # ---------- универсальные хелперы ----------
+
+    def _sql(self, sql: str) -> str:
+        """Плейсхолдеры на всех call site'ах остаются '?'; под postgres их
+        переписывает шим, чтобы не править сотни запросов при переезде."""
+        return sql if self.DIALECT == "sqlite" else sql.replace("?", "%s")
 
     @contextmanager
     def tx(self):
@@ -441,8 +577,21 @@ class DataBase:
             finally:
                 self._tx_depth -= 1
             return
+        cur = self.cursor
+        for attempt in range(TX_RETRIES):
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as e:
+                # база занята другим писателем. Глубину НЕ трогаем до успешного
+                # BEGIN: иначе неудачная попытка оставила бы счётчик отравленным
+                # на весь процесс, и следующие tx() молча не коммитили бы
+                if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                    raise
+                if attempt == TX_RETRIES - 1:
+                    raise
+                time.sleep(0.02 * (2 ** attempt))
         self._tx_depth = 1
-        self.cursor.execute("BEGIN IMMEDIATE")
         try:
             yield
             self.connection.commit()
@@ -454,22 +603,45 @@ class DataBase:
 
     def q(self, sql, params=()):
         """SELECT: список dict"""
-        self.cursor.execute(sql, params)
-        return [dict(r) for r in self.cursor.fetchall()]
+        cur = self.cursor
+        cur.execute(self._sql(sql), params)
+        return [dict(r) for r in cur.fetchall()]
 
     def q1(self, sql, params=()):
         """SELECT: одна строка dict или None"""
-        self.cursor.execute(sql, params)
-        row = self.cursor.fetchone()
+        cur = self.cursor
+        cur.execute(self._sql(sql), params)
+        row = cur.fetchone()
         return dict(row) if row else None
 
-    def exec(self, sql, params=()):
-        """INSERT/UPDATE/DELETE, возвращает lastrowid.
+    def exec(self, sql, params=()) -> int:
+        """INSERT/UPDATE/DELETE, возвращает ЧИСЛО ЗАТРОНУТЫХ СТРОК.
+
+        Раньше возвращался lastrowid, но он ВРЁТ после проигнорированного
+        конфликтного INSERT: остаётся значение от прошлой вставки, и проверка
+        идемпотентности на нём выдала бы награду повторно. rowcount снимаем
+        немедленно — любой следующий стейтмент сбрасывает его в -1.
         Вне tx() — автокоммит; внутри tx() коммитит внешний блок."""
-        self.cursor.execute(sql, params)
+        cur = self.cursor
+        cur.execute(self._sql(sql), params)
+        rc = cur.rowcount
+        self.last_insert_id = cur.lastrowid
         if not self._tx_depth:
             self.connection.commit()
-        return self.cursor.lastrowid
+        return rc
+
+    def q1w(self, sql, params=()):
+        """Пишущий стейтмент с RETURNING: одна строка dict или None.
+
+        None означает, что запись не прошла (условие UPDATE не сошлось или
+        INSERT ушёл в ON CONFLICT DO NOTHING) — то есть тот же сигнал, что и
+        rowcount == 0, но вместе с данными строки, за одно обращение."""
+        cur = self.cursor
+        cur.execute(self._sql(sql), params)
+        row = cur.fetchone()
+        if not self._tx_depth:
+            self.connection.commit()
+        return dict(row) if row else None
 
     # ---------- юзеры ----------
 

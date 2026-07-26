@@ -408,9 +408,8 @@ def claim_quest(user: dict, key: str) -> dict:
     bp_xp = int(q["reward_bp_xp"] * bp_catchup_mult(user))
     with db.tx():  # отметка + печеньки + BP XP — одним куском
         # условный UPDATE: параллельный клейм не выдаст награду дважды
-        db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ? AND claimed = 0",
-                (row["id"],))
-        if db.cursor.rowcount == 0:
+        if db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ? AND claimed = 0",
+                   (row["id"],)) == 0:
             raise ValueError("err_claimed")
         add_cookies(user["user_id"], reward, count_earned=False)
         db.update_user(user["user_id"],
@@ -453,9 +452,8 @@ def claim_ref_milestone(user: dict, key: str) -> dict:
     with db.tx():  # отметка и награда — одним куском
         # INSERT OR IGNORE + rowcount: проверка claimed выше живёт вне
         # транзакции, и два параллельных клейма прошли бы её оба
-        db.exec("INSERT OR IGNORE INTO ref_claims (user_id, milestone_key, claimed_at) "
-                "VALUES (?, ?, ?)", (user["user_id"], key, time.time()))
-        if db.cursor.rowcount == 0:
+        if db.exec("INSERT OR IGNORE INTO ref_claims (user_id, milestone_key, claimed_at) "
+                   "VALUES (?, ?, ?)", (user["user_id"], key, time.time())) == 0:
             raise ValueError("err_claimed")
         if ms["type"] == "boost":
             db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
@@ -1067,10 +1065,9 @@ def claim_achievement(user: dict, key: str) -> float:
             with db.tx():  # отметка и награда — одним куском
                 # DO UPDATE ... WHERE claimed = 0 + rowcount: без условия два
                 # параллельных клейма выдали бы награду дважды
-                db.exec("INSERT INTO achievements (user_id, key, claimed) VALUES (?, ?, 1) "
-                        "ON CONFLICT(user_id, key) DO UPDATE SET claimed = 1 "
-                        "WHERE claimed = 0", (user["user_id"], key))
-                if db.cursor.rowcount == 0:
+                if db.exec("INSERT INTO achievements (user_id, key, claimed) VALUES (?, ?, 1) "
+                           "ON CONFLICT(user_id, key) DO UPDATE SET claimed = 1 "
+                           "WHERE claimed = 0", (user["user_id"], key)) == 0:
                     raise ValueError("err_claimed")
                 add_cookies(user["user_id"], a["reward"], count_earned=False)
             return a["reward"]
@@ -1275,9 +1272,9 @@ def claim_order(user: dict) -> dict:
     with db.tx():
         # WHERE status = 'active' + rowcount: два параллельных клейма одного
         # заказа иначе оба прошли бы проверку выше и заплатили дважды
-        db.exec("UPDATE orders SET status = 'done', reward_cookies = ?, reward_bp_xp = ? "
-                "WHERE id = ? AND status = 'active'", (reward, bp_xp, row["id"]))
-        if db.cursor.rowcount == 0:
+        if db.exec("UPDATE orders SET status = 'done', reward_cookies = ?, reward_bp_xp = ? "
+                   "WHERE id = ? AND status = 'active'",
+                   (reward, bp_xp, row["id"])) == 0:
             raise ValueError("err_claimed")
         add_cookies(uid, reward, count_earned=False)
         db.update_user(uid,
@@ -1401,9 +1398,8 @@ def claim_tutorial(user: dict) -> dict:
         raise ValueError("err_not_done")
     reward = tutorial_reward(user["user_id"])
     with db.tx():
-        db.exec("UPDATE users SET tutorial_done = 1 "
-                "WHERE user_id = ? AND tutorial_done = 0", (user["user_id"],))
-        if db.cursor.rowcount == 0:
+        if db.exec("UPDATE users SET tutorial_done = 1 "
+                   "WHERE user_id = ? AND tutorial_done = 0", (user["user_id"],)) == 0:
             raise ValueError("err_claimed")
         add_cookies(user["user_id"], reward, count_earned=False)
     track(user["user_id"], "tutorial_complete")

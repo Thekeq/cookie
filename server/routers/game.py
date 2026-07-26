@@ -123,10 +123,10 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
         # дедупликация по (user_id, batch_id): id уникален для каждого батча,
         # поэтому честные батчи с другого устройства не отбрасываются
         if batch.batch_id:
-            db.exec("INSERT OR IGNORE INTO click_batches (user_id, batch_id, "
-                    "created_at) VALUES (?, ?, ?)",
-                    (tg["id"], batch.batch_id[:64], now))
-            if db.cursor.rowcount == 0:  # уже обработан — ретрай потерянного ответа
+            fresh = db.exec("INSERT OR IGNORE INTO click_batches (user_id, batch_id, "
+                            "created_at) VALUES (?, ?, ?)",
+                            (tg["id"], batch.batch_id[:64], now))
+            if fresh == 0:  # уже обработан — ретрай потерянного ответа
                 return {"accepted": 0, "earned": 0, "duplicate": True,
                         "combo": gl.current_combo(user),
                         "energy": user["energy"], "cookies": user["cookies"],

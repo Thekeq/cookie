@@ -129,13 +129,11 @@ async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
     with db.tx():  # отметка активации + счётчик + награды — одним куском
         # оба UPDATE/INSERT условные: проверки «уже активировал» и «лимит
         # исчерпан» вне транзакции пробиваются параллельными запросами
-        db.exec("INSERT OR IGNORE INTO promo_redemptions (code, user_id, redeemed_at) "
-                "VALUES (?, ?, ?)", (code, tg["id"], time.time()))
-        if db.cursor.rowcount == 0:
+        if db.exec("INSERT OR IGNORE INTO promo_redemptions (code, user_id, redeemed_at) "
+                   "VALUES (?, ?, ?)", (code, tg["id"], time.time())) == 0:
             raise HTTPException(400, "err_promo_invalid")
-        db.exec("UPDATE promo_codes SET uses = uses + 1 "
-                "WHERE code = ? AND (max_uses = 0 OR uses < max_uses)", (code,))
-        if db.cursor.rowcount == 0:
+        if db.exec("UPDATE promo_codes SET uses = uses + 1 "
+                   "WHERE code = ? AND (max_uses = 0 OR uses < max_uses)", (code,)) == 0:
             raise HTTPException(400, "err_promo_invalid")
         if promo["reward_cookies"]:
             gl.add_cookies(tg["id"], promo["reward_cookies"], count_earned=False)
@@ -409,9 +407,8 @@ async def channel_claim(tg: dict = Depends(tg_user)):
     with db.tx():
         # условный UPDATE закрывает гонку: два запроса могли пройти проверку
         # выше до await get_chat_member — награду получит только один
-        db.exec("UPDATE users SET channel_claimed = 1 "
-                "WHERE user_id = ? AND channel_claimed = 0", (tg["id"],))
-        if db.cursor.rowcount == 0:
+        if db.exec("UPDATE users SET channel_claimed = 1 "
+                   "WHERE user_id = ? AND channel_claimed = 0", (tg["id"],)) == 0:
             raise HTTPException(400, "err_claimed")
         gl.add_cookies(tg["id"], reward, count_earned=False)
     return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}
