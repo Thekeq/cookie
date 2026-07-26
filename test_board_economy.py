@@ -597,6 +597,75 @@ check("early return keeps the dough",
       gl.recipe_status(db.get_user(UID))["state"] == "rising")
 db.update_user(UID, recipe_key=None, recipe_started_at=0)
 
+# закваску снимает условный UPDATE: два сбора вплотную оба видели готовое тесто
+db.update_user(UID, recipe_key="classic",
+               recipe_started_at=time.time() - _r["hours"] * 3600 - 60)
+check("recipe consumed once", gl._consume_recipe(UID) == _r["mult"])
+check("recipe not consumed twice", gl._consume_recipe(UID) == 1.0)
+check("recipe row cleared", db.get_user(UID)["recipe_key"] is None)
+
+# ================= оффлайн-доход: один интервал = одна оплата =================
+
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, 0, 8)", (UID,))
+gl.invalidate_income(UID)
+
+# ОДИН И ТОТ ЖЕ словарь в два сбора — так выглядят два запроса вплотную:
+# /api/state, /api/auth, /api/farm и каждый батч кликов зовут сбор, и раньше оба
+# видели один интервал и оба его оплачивали
+_now = time.time()
+_prev = _now - 3600
+db.update_user(UID, cookies=0, farm_collected_at=_prev, passive_collected_at=_prev)
+_stale = db.get_user(UID)
+# «сейчас» тоже одно на оба вызова: у настоящих параллельных запросов оно
+# совпадает с точностью до миллисекунд, а разные time.time() дали бы второму
+# вызову законные микросекунды дохода и спрятали бы саму проверку
+_f1 = gl.collect_farm(_stale, _now)
+_f2 = gl.collect_farm(_stale, _now)
+check("farm interval paid once", _f1 > 0 and _f2 == 0, f"{_f1:.0f} / {_f2:.0f}")
+_p1 = gl.collect_passive(_stale, _now)
+_p2 = gl.collect_passive(_stale, _now)
+check("passive interval paid once", _p1 > 0 and _p2 == 0, f"{_p1:.0f} / {_p2:.0f}")
+check("balance grew by both, once",
+      abs(db.get_user(UID)["cookies"] - _f1 - _p1) < 1e-6,
+      f"{db.get_user(UID)['cookies']:.2f} vs {_f1 + _p1:.2f}")
+
+# токен операции привязан к началу интервала: ретрай ручки не платит второй раз
+_op = f"farm:{UID}:{int(_prev * 1000)}"
+_led = db.q1("SELECT operation_id FROM economy_ledger WHERE user_id = ? "
+             "AND reason = 'passive_farm' ORDER BY id DESC LIMIT 1", (UID,))
+check("farm income carries the interval token",
+      _led and _led["operation_id"] == _op, str(_led))
+_bal = db.get_user(UID)["cookies"]
+gl.add_cookies(UID, 999_999, operation_id=_op, reason="passive_farm")
+check("interval token is idempotent",
+      abs(db.get_user(UID)["cookies"] - _bal) < 1e-6)
+
+# отметка НЕ отматывается назад. Раньше отматывалась к локальному «сейчас», и
+# часы воркера, ушедшие вперёд, превращались в повторную оплату тех же секунд
+_future = time.time() + 300
+db.update_user(UID, farm_collected_at=_future)
+check("future mark pays nothing", gl.collect_farm(db.get_user(UID)) == 0)
+check("future mark is kept", db.get_user(UID)["farm_collected_at"] == _future)
+
+# первый сбор только ставит отметку: платить за время до регистрации нечем
+db.update_user(UID, cookies=0, farm_collected_at=0, passive_collected_at=0)
+check("first farm collect pays nothing", gl.collect_farm(db.get_user(UID)) == 0)
+check("first passive collect pays nothing", gl.collect_passive(db.get_user(UID)) == 0)
+check("first collect sets both marks", db.get_user(UID)["farm_collected_at"] > 0
+      and db.get_user(UID)["passive_collected_at"] > 0)
+check("first collect paid nothing", db.get_user(UID)["cookies"] == 0)
+
+# collect_all отдаёт обоим сборам одно «сейчас»: иначе отметки расходятся на
+# длительность первого сбора, и разница копится с каждым сбором
+db.update_user(UID, farm_collected_at=time.time() - 60,
+               passive_collected_at=time.time() - 60)
+gl.collect_all(UID)
+_u = db.get_user(UID)
+check("collect_all uses one clock",
+      _u["farm_collected_at"] == _u["passive_collected_at"],
+      f"{_u['farm_collected_at']} vs {_u['passive_collected_at']}")
+
 # --- рецепт по уровню ---
 db.update_user(UID, level=1)
 try:

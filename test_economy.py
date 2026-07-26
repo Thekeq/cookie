@@ -824,6 +824,44 @@ check("8i.12 UPDATE с устаревшим prestige_count не проходит
              (PR, 0)) is None)
 
 # ==========================================================================
+# 8j. оффлайн-доход: интервал оплачивается один раз и целиком через книгу
+# ==========================================================================
+OF = BASE + 18
+db.create_user(OF, "of", "OF")
+db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'cursor', 5)", (OF,))
+db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, 0, 8)", (OF,))
+gl.invalidate_income(OF)
+_of_now = time.time()
+_of_prev = _of_now - 3600
+db.update_user(OF, farm_collected_at=_of_prev, passive_collected_at=_of_prev)
+_of_user = db.get_user(OF)
+_of_f = gl.collect_farm(_of_user, _of_now)
+_of_p = gl.collect_passive(_of_user, _of_now)
+check("8j.1 доход фермы и доски начислен", _of_f > 0 and _of_p > 0,
+      f"{_of_f} / {_of_p}")
+check("8j.2 сверка сходится после сбора",
+      abs(ec.reconcile(OF)["cookies"]["drift"]) < 1e-6, ec.reconcile(OF)["cookies"])
+
+# два запроса вплотную с одним «сейчас» — второй не платит: отметку времени
+# двигает compare-and-set, и проигравший видит уже оплаченный интервал
+check("8j.3 повтор того же интервала не платит",
+      gl.collect_farm(_of_user, _of_now) == 0
+      and gl.collect_passive(_of_user, _of_now) == 0)
+_of_moves = [r for r in ledger(OF, "cookies")
+             if r["reason"] in ("passive_farm", "passive_board")]
+check("8j.4 в книге ровно два движения", len(_of_moves) == 2,
+      [(r["reason"], r["operation_id"]) for r in _of_moves])
+check("8j.5 токены привязаны к началу интервала",
+      sorted(r["operation_id"] for r in _of_moves)
+      == sorted([f"farm:{OF}:{int(_of_prev * 1000)}",
+                 f"passive:{OF}:{int(_of_prev * 1000)}"]),
+      [r["operation_id"] for r in _of_moves])
+check("8j.6 оффлайн-доход считается заработком",
+      all(r["counts_earned"] == 1 for r in _of_moves))
+check("8j.7 сверка сходится и после повтора",
+      abs(ec.reconcile(OF)["cookies"]["drift"]) < 1e-6, ec.reconcile(OF)["cookies"])
+
+# ==========================================================================
 # 9. drift_report ловит запись мимо книги
 # ==========================================================================
 D = BASE + 8

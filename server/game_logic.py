@@ -930,14 +930,22 @@ def farm_cps(user_id: int, eff: dict | None = None) -> float:
     return base * eff["farm_mult"] * prestige * collection_multiplier(user_id)
 
 
-def collect_all(user_id: int) -> dict:
+def collect_all(user_id: int, now: float | None = None) -> dict:
     """Собирает ферму + пассивку доски и возвращает СВЕЖЕГО юзера.
     Обязателен перед любой проверкой «хватает ли печенек»: иначе сервер
     сравнивает цену со вчерашним балансом, а игрок видит уже натикавший —
-    «деньги есть, а купить не даёт»."""
+    «деньги есть, а купить не даёт».
+
+    Обоим сборам отдаём ОДНО «сейчас»: у каждого своя отметка времени, и если
+    брать time.time() дважды, отметки разъезжаются на длительность первого
+    сбора. Разница копится при каждом сборе и на активной игре (сбор идёт на
+    каждый батч кликов) заметно расходится с реальным временем."""
+    now = time.time() if now is None else now
     u = db.get_user(user_id)
-    collect_passive(u)
-    collect_farm(db.get_user(user_id))
+    if not u:
+        return u
+    collect_passive(u, now)
+    collect_farm(u, now)
     return db.get_user(user_id)
 
 
@@ -995,15 +1003,30 @@ def set_recipe(user: dict, key: str) -> dict:
     return recipe_status(db.get_user(user["user_id"]))
 
 
-def _consume_recipe(user: dict) -> float:
+def _consume_recipe(user_id: int, now: float | None = None) -> float:
     """Забирает множитель закваски и снимает её (одноразовая).
-    Возвращает множитель: 1.0, если рано или подгорело."""
-    st = recipe_status(user)
-    if st["state"] == "none":
+    Возвращает множитель: 1.0, если рано, подгорело или закваску уже съели.
+
+    Зовётся ТОЛЬКО из collect_farm и только внутри его транзакции. Строку читаем
+    сами, а не принимаем словарём: закваску могли поставить или съесть между
+    входом в ручку и этим моментом, и множитель посчитался бы по чужому тесту.
+
+    Снимает закваску условный UPDATE по (recipe_key, recipe_started_at): два
+    сбора вплотную оба видели готовое тесто и оба умножали свой доход на одну и
+    ту же закваску. Проигравший возвращает 1.0."""
+    now = time.time() if now is None else now
+    row = db.q1("SELECT user_id, recipe_key, recipe_started_at "
+                "FROM users WHERE user_id = ?", (user_id,))
+    if not row:
         return 1.0
-    if st["state"] == "rising":
-        return 1.0          # рано вернулся — тесто ещё стоит, не тратим
-    db.update_user(user["user_id"], recipe_key=None, recipe_started_at=0)
+    st = recipe_status(row, now)
+    if st["state"] in ("none", "rising"):
+        return 1.0          # нет закваски или рано вернулся — тесто ещё стоит
+    if db.exec("UPDATE users SET recipe_key = NULL, recipe_started_at = 0, "
+               "user_revision = user_revision + 1 "
+               "WHERE user_id = ? AND recipe_key = ? AND recipe_started_at = ?",
+               (user_id, row["recipe_key"], row["recipe_started_at"])) == 0:
+        return 1.0          # закваску съел параллельный сбор
     return st["mult"]
 
 
@@ -1041,25 +1064,60 @@ def passive_offline_cap_hours(user: dict) -> float:
     return cfg.PASSIVE_CAP_HOURS + offline_bonus_hours(user)
 
 
-def collect_farm(user: dict) -> float:
+def collect_farm(user: dict, now: float | None = None) -> float:
     """Начисляет накопленный доход фермы, возвращает сколько упало.
-    Таймер и деньги — одна транзакция: сбой не может «продвинуть» таймер,
-    потеряв недоначисленный доход."""
-    now = time.time()
-    seconds = min(farm_offline_cap_hours(user) * 3600,
-                  now - (user["farm_collected_at"] or now))
-    if seconds <= 0:
-        db.update_user(user["user_id"], farm_collected_at=now)
-        return 0
-    income = farm_cps(user["user_id"]) * seconds
-    # закваска умножает ТОЛЬКО оффлайн-доход и только если игрок вернулся в
-    # окно готовности; съедается один раз — на ферме, а не на каждом сборе
-    if seconds > 60:
-        income *= _consume_recipe(user)
+
+    Отметку времени двигает compare-and-set: `WHERE farm_collected_at = ?` по
+    значению, прочитанному в этой же транзакции. Раньше отметка читалась из
+    словаря, пришедшего в ручку, а писалась безусловно — два запроса вплотную
+    (а /api/state, /api/auth, /api/farm и каждый батч кликов зовут сбор) оба
+    видели один и тот же интервал и оба его оплачивали. Проигравший CAS не
+    доплачивает и не переспрашивает: интервал уже оплачен, он не наш.
+
+    Пустая отметка (первый сбор) только ставится — платить за время до
+    регистрации нечем и незачем.
+
+    При seconds <= 0 отметка НЕ переписывается. Раньше переписывалась, и это
+    отматывало её назад по локальным часам: у воркера с часами на секунду
+    вперед сбор ставил будущее время, следующий сбор на другом воркере видел
+    отрицательный интервал и откручивал отметку к своему «сейчас» — сдвиг NTP
+    между воркерами превращался в повторную оплату одних и тех же секунд.
+
+    Закваска съедается ВНУТРИ той же транзакции. Раньше _consume_recipe стоял
+    строкой выше `with db.tx()`, а db.update_user на нулевой глубине коммитит
+    сам: множитель списывался отдельной транзакцией от дохода, который он
+    умножает, и сбой между ними съедал закваску впустую."""
+    now = time.time() if now is None else now
+    uid = user["user_id"]
     with db.tx():
-        db.update_user(user["user_id"], farm_collected_at=now)
+        # кап и отметку берём СВЕЖИМИ: словарь ручки к этому моменту устарел,
+        # а от offline_bonus_hours зависит, сколько часов вообще оплачивать
+        row = db.q1("SELECT farm_collected_at, offline_bonus_hours "
+                    "FROM users WHERE user_id = ?", (uid,))
+        if not row:
+            return 0.0
+        prev = row["farm_collected_at"]
+        if not prev:                       # первый сбор: только ставим метку
+            db.exec("UPDATE users SET farm_collected_at = ? WHERE user_id = ? "
+                    "AND COALESCE(farm_collected_at, 0) = 0", (now, uid))
+            return 0.0
+        seconds = min(farm_offline_cap_hours(row) * 3600, now - prev)
+        if seconds <= 0:
+            return 0.0
+        if db.exec("UPDATE users SET farm_collected_at = ? "
+                   "WHERE user_id = ? AND farm_collected_at = ?",
+                   (now, uid, prev)) == 0:
+            return 0.0                     # интервал оплатил параллельный сбор
+        income = farm_cps(uid) * seconds
+        # закваска умножает ТОЛЬКО оффлайн-доход и только если игрок вернулся в
+        # окно готовности; съедается один раз — на ферме, а не на каждом сборе
+        if seconds > 60:
+            income *= _consume_recipe(uid, now)
         if income > 0:
-            add_cookies(user["user_id"], income)
+            # токен привязан к началу оплаченного интервала: ретрай ручки после
+            # потерянного ответа не платит второй раз за те же секунды
+            add_cookies(uid, income, operation_id=f"farm:{uid}:{int(prev * 1000)}",
+                        reason="passive_farm")
     return income
 
 
@@ -1289,19 +1347,35 @@ def board_cells_state(user: dict) -> dict:
 
 # ---------- пассивный доход с merge-доски ----------
 
-def collect_passive(user: dict) -> float:
-    """Начисляет накопленный пассивный доход, возвращает сколько упало.
-    Таймер и деньги — одна транзакция (см. collect_farm)."""
-    now = time.time()
-    hours = min(passive_offline_cap_hours(user),
-                (now - (user["passive_collected_at"] or now)) / 3600)
-    if hours <= 0:
-        return 0
-    income = passive_per_hour(user["user_id"]) * hours
+def collect_passive(user: dict, now: float | None = None) -> float:
+    """Начисляет накопленный пассивный доход доски, возвращает сколько упало.
+
+    Отметка двигается compare-and-set'ом, как у фермы (см. collect_farm): чтение
+    и запись в одной транзакции, проигравший не платит."""
+    now = time.time() if now is None else now
+    uid = user["user_id"]
     with db.tx():
-        db.update_user(user["user_id"], passive_collected_at=now)
+        row = db.q1("SELECT passive_collected_at, offline_bonus_hours "
+                    "FROM users WHERE user_id = ?", (uid,))
+        if not row:
+            return 0.0
+        prev = row["passive_collected_at"]
+        if not prev:
+            db.exec("UPDATE users SET passive_collected_at = ? WHERE user_id = ? "
+                    "AND COALESCE(passive_collected_at, 0) = 0", (now, uid))
+            return 0.0
+        hours = min(passive_offline_cap_hours(row), (now - prev) / 3600)
+        if hours <= 0:
+            return 0.0
+        if db.exec("UPDATE users SET passive_collected_at = ? "
+                   "WHERE user_id = ? AND passive_collected_at = ?",
+                   (now, uid, prev)) == 0:
+            return 0.0
+        income = passive_per_hour(uid) * hours
         if income > 0:
-            add_cookies(user["user_id"], income)
+            add_cookies(uid, income,
+                        operation_id=f"passive:{uid}:{int(prev * 1000)}",
+                        reason="passive_board")
     return income
 
 

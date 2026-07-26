@@ -28,8 +28,11 @@ async def get_state(tg: dict = Depends(tg_user)):
     gl.check_rate_limit(tg["id"], "state", cfg.STATE_PER_MINUTE, 60)
     user = _ensure_user(tg)
     gl.ensure_user_season(tg["id"])
-    passive = gl.collect_passive(user)
-    farm_income = gl.collect_farm(db.get_user(tg["id"]))
+    # одно «сейчас» на оба сбора: у каждого своя отметка времени, и два вызова
+    # time.time() разводят их на длительность первого сбора
+    now = time.time()
+    passive = gl.collect_passive(user, now)
+    farm_income = gl.collect_farm(user, now)
     state = gl.full_state(tg["id"])
     state["passive_collected"] = passive + farm_income
     return state
@@ -116,8 +119,8 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
         gl.refresh_energy(_ensure_user(tg))
         # доход фермы/доски капает и во время тапа: собираем каждый батч,
         # чтобы cookies в ответе не «откатывали» баланс у богатых игроков
-        gl.collect_passive(db.get_user(tg["id"]))
-        gl.collect_farm(db.get_user(tg["id"]))
+        gl.collect_passive(db.get_user(tg["id"]), now)
+        gl.collect_farm(db.get_user(tg["id"]), now)
         user = db.get_user(tg["id"])
 
         # дедупликация по (user_id, batch_id): id уникален для каждого батча,

@@ -19,6 +19,9 @@ def _user(tg: dict) -> dict:
 
 @router.get("")
 async def farm_state(tg: dict = Depends(tg_user)):
+    # единственный путь к сбору дохода, у которого не было лимитера вовсе.
+    # От двойного начисления защищает CAS в collect_farm, это второй слой
+    gl.check_rate_limit(tg["id"], "farm", cfg.STATE_PER_MINUTE, 60)
     user = _user(tg)
     collected = gl.collect_farm(user)
     counts = gl.farm_counts(tg["id"])

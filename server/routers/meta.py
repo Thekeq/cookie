@@ -77,8 +77,9 @@ async def auth(tg: dict = Depends(tg_user)):
 
     # оффлайн-доход начисляем сразу при входе, а не при первом /api/state —
     # иначе шапка первые полминуты показывала «вчерашний» баланс
-    passive = gl.collect_passive(db.get_user(tg["id"]))
-    farm_income = gl.collect_farm(db.get_user(tg["id"]))
+    _now = time.time()  # одно «сейчас» на оба сбора, см. collect_all
+    passive = gl.collect_passive(db.get_user(tg["id"]), _now)
+    farm_income = gl.collect_farm(db.get_user(tg["id"]), _now)
     # довыдаём Stars-покупки, зависшие в 'paid' после сбоя между оплатой и выдачей
     gl.fulfill_pending(tg["id"])
     gl.track(tg["id"], "session")  # аналитика сессий
