@@ -179,6 +179,10 @@ async def upgrade_click(tg: dict = Depends(tg_user)):
     # покупка не спишет один и тот же баланс дважды
     with db.tx():
         user = gl.collect_all(tg["id"])
+        # потолок по уровню игрока — тот же принцип, что req_level у зданий:
+        # одних денег мало, иначе ветка клика разгоняет инфляцию без предела
+        if user["click_level"] >= cfg.click_max_level(user["level"]):
+            raise HTTPException(400, "err_click_max")
         cost = cfg.click_upgrade_cost(user["click_level"])
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
@@ -277,7 +281,7 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         if level > max_direct:
             raise HTTPException(400, f"err_direct_cap|{max_direct}")
 
-        cost = cfg.direct_spawn_cost(level, len(board), gl.hourly_income(tg["id"]))
+        cost = cfg.direct_spawn_cost(level, len(board), gl.board_base_income(tg["id"]))
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
         cell = _best_free_cell(free_cells, board)
@@ -389,13 +393,14 @@ async def trash(body: TrashIn, tg: dict = Depends(tg_user)):
 @router.get("/levels")
 async def levels(tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
+    income = gl.hourly_income(tg["id"])   # награда уровня не обесценивается
     path = []
     for lvl in range(1, cfg.MAX_LEVEL + 1):
         unlocks = [i for i in range(1, cfg.MAX_ITEM_LEVEL + 1) if cfg.item_unlock_level(i) == lvl]
         path.append({
             "level": lvl,
             "xp_required": cfg.xp_for_level(lvl),
-            "reward": cfg.level_reward(lvl),
+            "reward": gl.level_reward_scaled(lvl, income),
             "unlocks_items": unlocks,
             "reached": user["level"] >= lvl,
         })
@@ -409,7 +414,7 @@ async def claim_level(tg: dict = Depends(tg_user)):
     nxt = gl.claimable_level(user)
     if not nxt:
         raise HTTPException(400, "err_no_xp")
-    reward = cfg.level_reward(nxt)
+    reward = gl.level_reward_scaled(nxt, gl.hourly_income(tg["id"]))
     with db.tx():  # уровень + награда + refill — одним куском
         db.update_user(tg["id"], level=nxt)
         gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)

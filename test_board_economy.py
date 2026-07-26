@@ -92,22 +92,54 @@ check("refund paid", s["trash_refund"] > 0 and db.get_user(UID)["cookies"] > bef
 r = c.post("/api/merge/trash", json={"cell": 5}, headers=H)
 check("trash empty cell blocked", r.status_code == 400)
 
-# --- цена спавна масштабируется от дохода ---
-check("spawn cost scales with income",
-      cfg.spawn_cost(0, 100_000) > cfg.spawn_cost(0, 0) * 10)
-check("spawn cost floor 50", cfg.spawn_cost(0, 0) == 50)
-# lvl1 обязан оставаться в разумных минутах дохода при любой заполненности:
-# именно перемножение трёх экспонент раньше давало цену в 1e17 (фидбек)
-for _items in (0, 12, 24):
-    _mins = cfg.spawn_cost(_items, 1e9) / 1e9 * 60
-    check(f"lvl1 cost sane at {_items} items ({_mins:.0f} min)", _mins <= 30, f"{_mins:.1f}")
-check("direct lvl5 under 5h of income",
-      cfg.direct_spawn_cost(5, 12, 1e9) / 1e9 <= 5,
-      f"{cfg.direct_spawn_cost(5, 12, 1e9) / 1e9:.1f}h")
-# премия над честным merge-путём (2^(N-1)) остаётся умеренной
-check("direct premium over merge path ~3x at lvl10",
-      2.5 <= (cfg.SPAWN_LEVEL_FACTOR / 2) ** 9 <= 4.5,
-      str((cfg.SPAWN_LEVEL_FACTOR / 2) ** 9))
+# --- цены доски ---
+# Путь слияния до тира L стоит 2^(L-1) спавнов, поэтому цена L1 обязана быть
+# почти абсолютной: любая привязка к доходу умножается на 2^L и делает слияние
+# в тысячи раз дороже прямой покупки, то есть убивает основной цикл.
+check("lvl1 spawn does not scale with income",
+      cfg.spawn_cost(0, 0) == cfg.spawn_cost(0, 1e12) == cfg.SPAWN_L1_BASE)
+check("lvl1 spawn grows with occupancy",
+      cfg.spawn_cost(24) > cfg.spawn_cost(0) * 3)
+# слияние ОБЯЗАНО быть выгоднее прямой покупки на всех тирах, и разрыв растёт
+_gaps = []
+for _lvl, _cells in ((6, 8), (10, 12), (16, 20)):
+    _direct = cfg.direct_spawn_cost(_lvl, _cells)
+    _merge = (2 ** (_lvl - 1)) * cfg.spawn_cost(_cells)
+    _gaps.append(_direct / _merge)
+    check(f"merge cheaper than direct at lvl{_lvl}", _direct > _merge,
+          f"{_direct:.0f} vs {_merge:.0f}")
+check("direct premium grows with tier", _gaps == sorted(_gaps), str(_gaps))
+# прямая покупка окупается за разумное время, а не за миллионы часов
+for _lvl, _cells in ((6, 8), (16, 20)):
+    _h = cfg.direct_spawn_cost(_lvl, _cells) / cfg.passive_income_per_hour(_lvl)
+    check(f"direct lvl{_lvl} pays back in {_h:.0f}h", _h <= 60, f"{_h:.1f}h")
+
+# --- слияние ОБЯЗАНО увеличивать доход, а не уменьшать ---
+# при базе 1.7 каждый мердж выше 12 уровня давал -15%: две печеньки давали
+# больше, чем одна следующего уровня, и основной цикл работал против игрока
+for _l in range(3, cfg.MAX_ITEM_LEVEL):
+    _two = 2 * cfg.passive_income_per_hour(_l)
+    _one = cfg.passive_income_per_hour(_l + 1)
+    check(f"merge L{_l} raises income", _one > _two,
+          f"{_two:.0f} -> {_one:.0f}")
+
+# --- клик обязан оставаться живым ---
+# Окупаемость мягко растёт (сила 1.55 против цены 1.8), но остаётся в часах,
+# а не в годах: при линейной силе апгрейд с 30 уровня окупался 52 000 часов.
+for _cl in (1, 10, 20, 30):
+    _inc = cfg.ENERGY_REGEN_PER_SEC * 3600 * cfg.click_power(_cl)
+    _pay = cfg.click_upgrade_cost(_cl) / _inc
+    check(f"click upgrade at lvl{_cl} pays back in {_pay:.2f}h", _pay <= 8.0,
+          f"{_pay:.2f}h")
+# потолок по уровню игрока не даёт ветке клика разгонять инфляцию
+check("click level gated by player level",
+      cfg.click_max_level(1) < cfg.click_max_level(30) <= 70,
+      f"{cfg.click_max_level(1)}..{cfg.click_max_level(30)}")
+
+# --- ферма не должна окупаться мгновенно ---
+for _k, _v in cfg.FARM_BUILDINGS.items():
+    _min = _v["base_cost"] / (_v["cps"] * 3600) * 60
+    check(f"farm {_k} pays back in {_min:.0f} min", 10 <= _min <= 90, f"{_min:.1f}")
 
 # --- буст пассивки мерджа ---
 check("passive lvl3 = 90/h", cfg.passive_income_per_hour(3) == 90)

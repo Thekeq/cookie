@@ -155,7 +155,8 @@ def daily_state(user: dict) -> dict:
         "can_claim": can_claim,
         "streak": user["daily_streak"],
         "next_streak": next_streak,
-        "next_reward": cfg.daily_reward(next_streak),
+        "next_reward": cfg.scaled_reward(cfg.daily_reward(next_streak), "daily",
+                                         hourly_income(user["user_id"])),
         "rewards": [{"day": d, "cookies": c} for d, c in sorted(cfg.DAILY_REWARDS.items())],
     }
 
@@ -178,7 +179,8 @@ def claim_daily(user: dict) -> dict:
         freeze_used = True
     else:
         streak = 1
-    reward = cfg.daily_reward(streak)
+    reward = cfg.scaled_reward(cfg.daily_reward(streak), "daily",
+                               hourly_income(user["user_id"]))
     extra = {"streak_freeze_week": _iso_week(now)} if freeze_used else {}
     with db.tx():  # отметка о получении и деньги — одним куском
         db.update_user(user["user_id"], daily_streak=streak, daily_claimed_at=now, **extra)
@@ -214,10 +216,16 @@ def _ensure_quest_rows(user_id: int, day: str, keys: list[str]):
     _quest_rows_ready.add((user_id, day))
 
 
-def quest_reward_cookies(user_id: int, base: float) -> float:
-    """Награда квеста: базовая сумма ИЛИ полчаса дохода игрока — что больше.
-    Так квесты не превращаются в мусор для прокачанных игроков."""
-    return max(base, hourly_income(user_id) * 0.5)
+def quest_reward_cookies(user_id: int, quest_key: str,
+                         income: float | None = None) -> float:
+    """Награда квеста: базовая сумма ИЛИ доля дохода игрока — что больше.
+    Доля своя у каждого задания: спавн- и мердж-квесты тратят печеньки и
+    обязаны отбивать затраты, кликовые бесплатны и платят меньше."""
+    q = cfg.DAILY_QUEST_POOL.get(quest_key)
+    if not q:
+        return 0.0
+    income = hourly_income(user_id) if income is None else income
+    return max(q["reward_cookies"], income * q.get("reward_hours", 0.5))
 
 
 def _user_quest_rows(user_id: int, day: str) -> list[dict]:
@@ -229,17 +237,22 @@ def _user_quest_rows(user_id: int, day: str) -> list[dict]:
 
 def quests_state(user_id: int) -> list[dict]:
     day = _utc_day(time.time())
+    # доход считаем ОДИН раз на все задания: раньше quest_reward_cookies
+    # дёргал hourly_income на каждое из трёх (12 запросов x 3) и это была
+    # треть от 79 SQL-запросов, которые делал один /api/state
+    income = hourly_income(user_id)
     out = []
     for r in _user_quest_rows(user_id, day):
         q = cfg.DAILY_QUEST_POOL.get(r["quest_key"])
         if not q:
             continue
+        goal = cfg.quest_goal(r["quest_key"], income)
         out.append({
-            "key": r["quest_key"], "metric": q["metric"], "goal": q["goal"],
-            "reward_cookies": quest_reward_cookies(user_id, q["reward_cookies"]),
+            "key": r["quest_key"], "metric": q["metric"], "goal": goal,
+            "reward_cookies": quest_reward_cookies(user_id, r["quest_key"], income),
             "reward_bp_xp": q["reward_bp_xp"],
-            "progress": min(r["progress"], q["goal"]),
-            "done": r["progress"] >= q["goal"], "claimed": bool(r["claimed"]),
+            "progress": min(r["progress"], goal),
+            "done": r["progress"] >= goal, "claimed": bool(r["claimed"]),
         })
     return out
 
@@ -311,14 +324,19 @@ def claim_quest(user: dict, key: str) -> dict:
         raise ValueError("err_no_quest")
     row = db.q1("SELECT * FROM daily_quests WHERE user_id = ? AND day = ? AND quest_key = ?",
                 (user["user_id"], day, key))
-    if not row or row["progress"] < q["goal"]:
+    income = hourly_income(user["user_id"])
+    if not row or row["progress"] < cfg.quest_goal(key, income):
         raise ValueError("err_not_done")
     if row["claimed"]:
         raise ValueError("err_claimed")
-    reward = quest_reward_cookies(user["user_id"], q["reward_cookies"])
+    reward = quest_reward_cookies(user["user_id"], key, income)
     bp_xp = int(q["reward_bp_xp"] * bp_catchup_mult(user))
     with db.tx():  # отметка + печеньки + BP XP — одним куском
-        db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ?", (row["id"],))
+        # условный UPDATE: параллельный клейм не выдаст награду дважды
+        db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ? AND claimed = 0",
+                (row["id"],))
+        if db.cursor.rowcount == 0:
+            raise ValueError("err_claimed")
         add_cookies(user["user_id"], reward, count_earned=False)
         db.update_user(user["user_id"],
                        bp_xp=db.get_user(user["user_id"])["bp_xp"] + bp_xp)
@@ -537,7 +555,16 @@ def prestige_state(user: dict) -> dict:
         "min_earned": threshold,
         "can_prestige": gain >= 1 and user["total_earned"] >= threshold,
         "mult_per_point": cfg.PRESTIGE_MULT_PER_POINT,
+        # что останется после перерождения — видно ДО нажатия кнопки
+        "kept_level": prestige_kept_level(user["level"]),
+        "next_multiplier": cfg.prestige_multiplier(
+            user["prestige_points"] + gain),
     }
+
+
+def prestige_kept_level(level: int) -> int:
+    """Какой уровень остаётся после престижа (не ниже 1)."""
+    return max(1, int(level * cfg.PRESTIGE_KEEP_LEVEL_SHARE))
 
 
 def do_prestige(user: dict) -> dict:
@@ -547,6 +574,10 @@ def do_prestige(user: dict) -> dict:
         raise ValueError("err_prestige_early")
     new_points = user["prestige_points"] + st["gain_available"]
     uid = user["user_id"]
+    # Уровень сохраняется частично. Полный откат на 1-й означал заново
+    # проходить все req_level зданий и предметов, а множитель престижа этого
+    # не ускорял — перерождаться было невыгодно ни в какой момент.
+    kept_level = prestige_kept_level(user["level"])
     # сохраняем: скины, ачивки, рефералов, стрик, БП сезона, покупки Stars, бусты.
     # Сброс и начисление очков — одна транзакция: полустёртого профиля не бывает
     with db.tx():
@@ -558,14 +589,16 @@ def do_prestige(user: dict) -> dict:
         db.exec("DELETE FROM orders WHERE user_id = ? AND status != 'done'", (uid,))
         db.update_user(
             uid,
-            cookies=0, click_level=1, level=1, xp=0,
-            energy=cfg.max_energy(1), energy_updated_at=time.time(),
+            cookies=0, click_level=1,
+            level=kept_level, xp=cfg.xp_for_level(kept_level),
+            energy=cfg.max_energy(kept_level), energy_updated_at=time.time(),
             passive_collected_at=time.time(), farm_collected_at=time.time(),
             combo_mult=1,
             prestige_points=new_points,
             prestige_count=user["prestige_count"] + 1,
         )
     return {"gained": st["gain_available"], "points": int(new_points),
+            "kept_level": kept_level,
             "multiplier": cfg.prestige_multiplier(new_points)}
 
 
@@ -636,8 +669,21 @@ def add_xp(user: dict, xp: float, bp_xp: float | None = None) -> dict:
     копим. bp_xp можно задать отдельно: у мерджа он ограничен капом, иначе одно
     топ-слияние закрывало бы весь сезонный пасс."""
     bp_xp = xp if bp_xp is None else bp_xp
+    # на потолке уровней XP копился в пустоту (мердж 24 lvl давал 58 208 XP
+    # в никуда) — переливаем его в батл-пасс, там прогресс продолжается
+    if user["level"] >= cfg.MAX_LEVEL and xp > 0:
+        bp_xp += min(xp * cfg.MAXLEVEL_XP_TO_BP, cfg.MERGE_BP_XP_CAP)
+        xp = 0
     db.update_user(user["user_id"], xp=user["xp"] + xp, bp_xp=user["bp_xp"] + bp_xp)
     return dict(user, xp=user["xp"] + xp, bp_xp=user["bp_xp"] + bp_xp)
+
+
+def level_reward_scaled(level: int, income: float) -> dict:
+    """Награда за уровень с поправкой на доход: константа 150*lvl^1.5 давала
+    на 30-м уровне 24 647 печенек — секунды дохода на этой стадии."""
+    r = dict(cfg.level_reward(level))
+    r["cookies"] = cfg.scaled_reward(r["cookies"], "level", income)
+    return r
 
 
 def claimable_level(user: dict) -> int | None:
@@ -743,9 +789,21 @@ def hourly_income(user_id: int) -> float:
     return farm_cps(user_id) * 3600 + passive_per_hour(user_id) + clicks_estimate
 
 
-def passive_per_hour(user_id: int) -> float:
+def board_base_income(user_id: int) -> float:
+    """СЫРОЙ доход доски, без множителей престижа/коллекции/апгрейдов.
+
+    От него считается цена спавна. Два «почему»:
+    1) не от общего дохода — иначе экспоненциальный рост фермы уносит цены
+       доски вверх, а доход печеньки остаётся константой, и доска умирает;
+    2) без множителей — иначе престиж поднимал бы цены ровно во столько же
+       раз, во сколько доход, спавнов в час было бы столько же, и престиж
+       вообще не ускорял бы набор XP (то есть был бы бессмыслен)."""
     rows = db.q("SELECT item_level FROM board WHERE user_id = ?", (user_id,))
-    base = sum(cfg.passive_income_per_hour(r["item_level"]) for r in rows)
+    return sum(cfg.passive_income_per_hour(r["item_level"]) for r in rows)
+
+
+def passive_per_hour(user_id: int) -> float:
+    base = board_base_income(user_id)
     user = db.get_user(user_id)
     prestige = cfg.prestige_multiplier(user["prestige_points"] if user else 0)
     return (base * upgrade_effects(user_id)["passive_mult"] * prestige
@@ -760,9 +818,13 @@ def achievements_state(user: dict, lang: str = "en") -> list[dict]:
     refs = db.q1("SELECT COUNT(*) c FROM referrals WHERE referrer_id = ?", (user_id,))["c"]
     claimed = {r["key"] for r in db.q(
         "SELECT key FROM achievements WHERE user_id = ? AND claimed = 1", (user_id,))}
+    income = hourly_income(user_id)
     out = []
-    for key, (_title, _desc, field, goal, reward) in cfg.ACHIEVEMENTS.items():
+    for key, (_title, _desc, field, goal, base_reward) in cfg.ACHIEVEMENTS.items():
         progress = refs if field == "_refs" else user.get(field, 0)
+        # награда не обесценивается: все ачивки вместе давали 69 000 печенек,
+        # на 10-й день это полторы секунды дохода
+        reward = cfg.scaled_reward(base_reward, "achievement", income)
         out.append({
             "key": key,
             "title": tr(lang, f"ach_{key}_t"),
@@ -801,10 +863,12 @@ def _order_difficulty(template_key: str) -> int:
 def order_reward(template_key: str, income: float) -> tuple[float, int]:
     """Награда заказа СЧИТАЕТСЯ ЗАНОВО от текущего дохода, а не хранится в строке.
     Иначе старый оффер, выписанный до престижа, платил бы 60M новичку 1 уровня,
-    а выросший игрок добивал бы копеечные заказы ради обновления расценок."""
+    а выросший игрок добивал бы копеечные заказы ради обновления расценок.
+    Часы дохода берутся по шаблону: заказ, который тратит печеньки на спавны и
+    слияния, обязан отбивать затраты, иначе он чистый убыток."""
     diff = _order_difficulty(template_key)
-    return (max(cfg.ORDER_REWARD_MIN[diff], income * cfg.ORDER_REWARD_HOURS[diff]),
-            cfg.ORDER_BP_XP[diff])
+    hours = cfg.ORDER_REWARD_HOURS.get(template_key, 0.3)
+    return (max(cfg.ORDER_REWARD_MIN[diff], income * hours), cfg.ORDER_BP_XP[diff])
 
 
 def _order_params(user: dict, template_key: str, income: float | None = None) -> dict:
@@ -1068,7 +1132,11 @@ def tutorial_state(user: dict) -> dict:
     return {"steps": [{"key": k, "done": done[k]} for k in cfg.TUTORIAL_STEPS],
             "all_done": all(done.values()),
             "claimed": bool(user["tutorial_done"]),
-            "reward": cfg.TUTORIAL_REWARD}
+            "reward": tutorial_reward(user["user_id"])}
+
+
+def tutorial_reward(user_id: int) -> float:
+    return cfg.scaled_reward(cfg.TUTORIAL_REWARD, "tutorial", hourly_income(user_id))
 
 
 def claim_tutorial(user: dict) -> dict:
@@ -1077,14 +1145,15 @@ def claim_tutorial(user: dict) -> dict:
         raise ValueError("err_claimed")
     if not st["all_done"]:
         raise ValueError("err_not_done")
+    reward = tutorial_reward(user["user_id"])
     with db.tx():
         db.exec("UPDATE users SET tutorial_done = 1 "
                 "WHERE user_id = ? AND tutorial_done = 0", (user["user_id"],))
         if db.cursor.rowcount == 0:
             raise ValueError("err_claimed")
-        add_cookies(user["user_id"], cfg.TUTORIAL_REWARD, count_earned=False)
+        add_cookies(user["user_id"], reward, count_earned=False)
     track(user["user_id"], "tutorial_complete")
-    return {"reward": cfg.TUTORIAL_REWARD}
+    return {"reward": reward}
 
 
 # ---------- выдача Stars-покупок ----------
@@ -1143,13 +1212,24 @@ def fulfill_pending(user_id: int) -> int:
 
 # ---------- профиль целиком (для фронта) ----------
 
+def max_item_unlocked(user_level: int) -> int:
+    return max((lvl for lvl in range(1, cfg.MAX_ITEM_LEVEL + 1)
+                if cfg.item_unlock_level(lvl) <= user_level), default=1)
+
+
+def _direct_max_level(user: dict) -> int:
+    """Максимальный тир для прямой покупки: топ-тиры только слиянием."""
+    return max(1, max_item_unlocked(user["level"]) - cfg.SPAWN_DIRECT_GAP)
+
+
 def full_state(user_id: int) -> dict:
     user = db.get_user(user_id)
     user = refresh_energy(user)
     db.update_user(user_id, last_seen_at=time.time())
     board = db.q("SELECT cell, item_level FROM board WHERE user_id = ? ORDER BY cell", (user_id,))
     items_count = len(board)
-    income = hourly_income(user_id)  # цены спавна масштабируются от дохода
+    income = hourly_income(user_id)          # награды масштабируются от дохода
+    board_income = board_base_income(user_id)  # цены спавна — только от доски
     nxt = user["level"] + 1
     eff = upgrade_effects(user_id)
     owned_skins = {r["skin_key"] for r in
@@ -1198,15 +1278,14 @@ def full_state(user_id: int) -> dict:
         "skins_owned": sorted(owned_skins),
         "board": board,
         "board_cells": board_cells_state(user),
-        "spawn_cost": cfg.spawn_cost(items_count, income),
-        # прямая покупка печенек выше 1 lvl: доступные уровни и цены
+        "spawn_cost": cfg.spawn_cost(items_count, board_income),
+        # прямая покупка печенек выше 1 lvl: доступные уровни и цены.
+        # Отдаём только реально доступные тиры: цены за 21 lvl (6.5 млн часов
+        # дохода) — мусор в ответе, который фронт всё равно не показывает
         "spawn_direct": {
-            "max_level": max(1, max(
-                (l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
-                 if cfg.item_unlock_level(l) <= user["level"]), default=1)
-                - cfg.SPAWN_DIRECT_GAP),
-            "costs": {str(l): cfg.direct_spawn_cost(l, items_count, income)
-                      for l in range(1, cfg.MAX_ITEM_LEVEL + 1)},
+            "max_level": _direct_max_level(user),
+            "costs": {str(l): cfg.direct_spawn_cost(l, items_count, board_income)
+                      for l in range(1, _direct_max_level(user) + 2)},
         },
         # бейдж на вкладке пекарни: активный заказ выполнен и ждёт сдачи
         "orders_claimable": bool(db.q1(
@@ -1219,7 +1298,5 @@ def full_state(user_id: int) -> dict:
                           "WHERE user_id = ? AND expires_at > ?", (user_id, time.time()))
         ],
         "claimable_level": claimable_level(user),
-        "max_item_unlocked": max(
-            (lvl for lvl in range(1, cfg.MAX_ITEM_LEVEL + 1)
-             if cfg.item_unlock_level(lvl) <= user["level"]), default=1),
+        "max_item_unlocked": max_item_unlocked(user["level"]),
     }

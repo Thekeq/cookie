@@ -204,6 +204,7 @@ const dict = {
   err_no_user: { en: 'Open the app via the bot (/start)', uk: 'Відкрий застосунок через бота (/start)', ru: 'Открой приложение через бота (/start)' },
   err_board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },
   err_no_cookies: { en: 'Not enough cookies', uk: 'Не вистачає печива', ru: 'Не хватает печенек' },
+  err_click_max: { en: 'Level up to upgrade the click further', uk: 'Візьми новий рівень, щоб качати клік далі', ru: 'Возьми новый уровень, чтобы качать клик дальше' },
   err_bad_move: { en: 'Invalid move', uk: 'Некоректний хід', ru: 'Некорректный ход' },
   err_empty_cell: { en: 'Empty cell', uk: 'Порожня клітинка', ru: 'Пустая клетка' },
   err_max_item: { en: 'Max cookie level reached', uk: 'Максимальний рівень печива', ru: 'Максимальный уровень печеньки' },

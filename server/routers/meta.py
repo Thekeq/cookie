@@ -47,7 +47,11 @@ async def auth(tg: dict = Depends(tg_user)):
         if referrer_id:
             db.exec("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at) "
                     "VALUES (?, ?, ?)", (referrer_id, tg["id"], time.time()))
-            gl.add_cookies(referrer_id, cfg.REF_REWARD_REFERRER, count_earned=False)
+            # награды масштабируются доходом ПРИГЛАСИВШЕГО: для ветерана
+            # 1000 печенек — доли секунды, приглашать было незачем
+            gl.add_cookies(referrer_id, cfg.scaled_reward(
+                cfg.REF_REWARD_REFERRER, "referrer",
+                gl.hourly_income(referrer_id)), count_earned=False)
             gl.add_cookies(tg["id"], cfg.REF_REWARD_REFERRED, count_earned=False)
 
     # синкаем язык Mini App в профиль — бот использует его для /start и пушей
@@ -143,12 +147,13 @@ async def battlepass(tg: dict = Depends(tg_user)):
     bp_level = cfg.bp_level_for_xp(user["bp_xp"])
     claimed_free = json.loads(user["bp_claimed_free"] or "[]")
     claimed_prem = json.loads(user["bp_claimed_premium"] or "[]")
+    income = gl.hourly_income(tg["id"])   # награды пасса масштабируются доходом
     levels = []
     for lvl in range(1, cfg.BP_MAX_LEVEL + 1):
         levels.append({
             "level": lvl,
-            "free": cfg.bp_reward(lvl, False),
-            "premium": cfg.bp_reward(lvl, True),
+            "free": cfg.bp_reward(lvl, False, income),
+            "premium": cfg.bp_reward(lvl, True, income),
             "reached": bp_level >= lvl,
             "free_claimed": lvl in claimed_free,
             "premium_claimed": lvl in claimed_prem,
@@ -186,7 +191,8 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
     if body.level in claimed:
         raise HTTPException(400, "err_claimed")
     claimed.append(body.level)
-    reward = cfg.bp_reward(body.level, body.track == "premium")
+    reward = cfg.bp_reward(body.level, body.track == "premium",
+                           gl.hourly_income(tg["id"]))
     with db.tx():  # отметка о клейме и награда — одним куском
         db.update_user(tg["id"], **{col: json.dumps(claimed)})
         if reward["cookies"]:
@@ -314,7 +320,8 @@ async def channel(tg: dict = Depends(tg_user)):
     user = db.get_user(tg["id"])
     return {
         "channel": CHANNEL_USERNAME,
-        "reward": cfg.CHANNEL_REWARD,
+        "reward": cfg.scaled_reward(cfg.CHANNEL_REWARD, "channel",
+                                    gl.hourly_income(tg["id"])),
         "claimed": bool(user and user["channel_claimed"]),
     }
 
@@ -337,6 +344,8 @@ async def channel_claim(tg: dict = Depends(tg_user)):
     if member.status in ("left", "kicked"):
         raise HTTPException(400, "err_not_subscribed")
 
+    reward = cfg.scaled_reward(cfg.CHANNEL_REWARD, "channel",
+                               gl.hourly_income(tg["id"]))
     with db.tx():
         # условный UPDATE закрывает гонку: два запроса могли пройти проверку
         # выше до await get_chat_member — награду получит только один
@@ -344,5 +353,5 @@ async def channel_claim(tg: dict = Depends(tg_user)):
                 "WHERE user_id = ? AND channel_claimed = 0", (tg["id"],))
         if db.cursor.rowcount == 0:
             raise HTTPException(400, "err_claimed")
-        gl.add_cookies(tg["id"], cfg.CHANNEL_REWARD, count_earned=False)
-    return {"reward": cfg.CHANNEL_REWARD, "cookies": db.get_user(tg["id"])["cookies"]}
+        gl.add_cookies(tg["id"], reward, count_earned=False)
+    return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}

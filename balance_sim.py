@@ -32,27 +32,43 @@ def farm_cps():
 
 
 def try_spend(t_min):
-    """Жадная стратегия: клик-апгрейд если окупается, иначе лучшее здание по cps/цене."""
+    """Жадная стратегия: покупаем то, что даёт больше всего cps на печеньку.
+
+    Клик и здания сравниваются ОДНОЙ метрикой. Раньше тут стоял костыль
+    `click_level < 12`: сила клика была линейной при экспоненциальной цене,
+    и качать её дальше 12 не имело смысла ни при каких числах. Теперь ветка
+    клика живая, и симуляция обязана выбирать честно — иначе она врёт."""
     spent_something = True
     while spent_something:
         spent_something = False
-        # клик-апгрейд — первые уровни очень выгодны
+        best, best_ratio, best_cost, best_kind = None, 0.0, 0.0, None
+
+        # клик: прирост дохода считаем по реальному темпу тапа в сессии
         up_cost = cfg.click_upgrade_cost(state["click_level"])
-        if state["click_level"] < 12 and state["cookies"] >= up_cost:
-            state["cookies"] -= up_cost
-            state["click_level"] += 1
-            spent_something = True
-            continue
+        gain_cps = (cfg.click_power(state["click_level"] + 1)
+                    - cfg.click_power(state["click_level"])) * CLICK_CPS
+        # клик работает только пока игрок в сессии — режем долей активного времени
+        gain_cps *= SESSION_MIN / (SESSION_MIN + BREAK_MIN)
+        if state["click_level"] >= cfg.click_max_level(state["level"]):
+            up_cost, gain_cps = float("inf"), 0.0   # упёрлись в потолок уровня
+        if state["cookies"] >= up_cost and gain_cps / up_cost > best_ratio:
+            best, best_ratio, best_cost, best_kind = "click", gain_cps / up_cost, up_cost, "click"
+
         # лучшее доступное здание по cps на печеньку
-        best, best_ratio = None, 0
         for key, b in cfg.FARM_BUILDINGS.items():
             if state["level"] < b["req_level"]:
                 continue
             cost = cfg.building_cost(key, state["buildings"].get(key, 0))
             ratio = b["cps"] / cost
             if state["cookies"] >= cost and ratio > best_ratio:
-                best, best_ratio, best_cost = key, ratio, cost
-        if best:
+                best, best_ratio, best_cost, best_kind = key, ratio, cost, "building"
+
+        if best_kind == "click":
+            state["cookies"] -= best_cost
+            state["click_level"] += 1
+            spent_something = True
+            continue
+        if best_kind == "building":
             state["cookies"] -= best_cost
             state["buildings"][best] = state["buildings"].get(best, 0) + 1
             spent_something = True
@@ -129,5 +145,11 @@ print(f"\nБатл-пасс ({cfg.BP_MAX_LEVEL} ур., всего {bp_total:,.0f
 assert bp_days <= cfg.SEASON_LENGTH_DAYS + 1, (
     f"батл-пасс не успевается за сезон: {bp_days:.1f}д > {cfg.SEASON_LENGTH_DAYS}д")
 assert state["level"] <= 12, f"прогрессия слишком быстрая: lvl {state['level']} за {SIM_HOURS}ч"
-assert state["earned"] < 2e9, f"гиперинфляция: {state['earned']:,.0f} за {SIM_HOURS}ч"
+assert state["earned"] < 1e9, f"гиперинфляция: {state['earned']:,.0f} за {SIM_HOURS}ч"
+# ветка клика обязана оставаться живой: жадный игрок качал её только до 12,
+# потому что сила была линейной при экспоненциальной цене
+assert state["click_level"] >= 15, (
+    f"ветка клика снова мертва: жадная стратегия бросила её на {state['click_level']}")
+# и не должна разгонять инфляцию: без потолка по уровню она давала 77 млрд
+assert state["click_level"] <= cfg.click_max_level(state["level"]), "потолок клика не работает"
 print("assertions: OK")

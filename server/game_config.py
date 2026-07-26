@@ -12,13 +12,27 @@ def max_energy(user_level: int) -> int:
     апгрейдами energy_cap — теперь их есть смысл покупать."""
     return 400 + (user_level - 1) * 50
 
+# Сила клика РАСТЁТ ЭКСПОНЕНЦИАЛЬНО. Раньше она была линейной (level * 1.0)
+# при цене 1.8^n: апгрейд с 20-го уровня окупался 219 часов, с 30-го — 52 000
+# часов, и главная механика игры умирала к 12 уровню.
+# 1.55 против цены 1.8 — окупаемость мягко растёт (x1.16 за уровень), поэтому
+# ветка остаётся живой, но не превращается в бесконечный источник инфляции.
+CLICK_POWER_GROWTH = 1.55
+CLICK_COST_GROWTH = 1.8
+
 def click_power(click_level: int) -> float:
     """Сколько cookies даёт один клик"""
-    return click_level * 1.0
+    return CLICK_POWER_GROWTH ** (click_level - 1)
 
 def click_upgrade_cost(click_level: int) -> float:
     """Цена прокачки клика с текущего уровня на следующий"""
-    return 100 * (1.8 ** (click_level - 1))
+    return 100 * (CLICK_COST_GROWTH ** (click_level - 1))
+
+# Потолок прокачки клика по уровню игрока — тот же принцип, что req_level у
+# зданий: одних денег мало, нужен прогресс. Без него жадная стратегия качает
+# клик бесконечно и за 72 часа выносит 77 миллиардов (проверено симуляцией).
+def click_max_level(user_level: int) -> int:
+    return 4 + 2 * user_level
 
 # ---------- Merge ----------
 BOARD_SIZE = 25                 # сетка 5x5 (рисуется целиком, но не вся открыта)
@@ -36,26 +50,41 @@ def merge_cells_unlocked(user_level: int, refs: int) -> int:
     cells += sum(1 for need in MERGE_CELL_REFS if refs >= need)
     return min(cells, BOARD_SIZE)
 
-# Цена спавна масштабируется от дохода игрока: печенька всегда стоит заметную
-# долю часового дохода, а не «копейки навсегда» (фидбек: покупки слишком дешёвые).
-# ВАЖНО: три множителя (доход x заполненность x уровень) перемножаются, поэтому
-# каждый держим мягким — иначе на среднем тире выходит цена в 1e17 (фидбек).
-SPAWN_COST_GROWTH = 1.12        # каждая занятая клетка делает следующую дороже
-SPAWN_INCOME_SHARE = 1 / 40     # база lvl1 = 1.5 минуты часового дохода
+# Цены доски. Раньше база спавна была income/40, где income включал ферму:
+# ферма растёт экспоненциально, доход печеньки — константа, поэтому окупаемость
+# предмета уезжала с 8 часов до 46 миллионов часов, и доска умирала.
+#
+# Ключевая математика: путь слияния до тира L стоит 2^(L-1) спавнов. Значит
+# цена L1-спавна ОБЯЗАНА быть почти абсолютной — любая привязка к доходу
+# умножается на 2^L и делает слияние в тысячи раз дороже прямой покупки, то
+# есть убивает основной цикл. Поэтому:
+#   L1-спавн   — константа x надбавка за заполненность доски;
+#   прямая покупка тира — привязана к тому, СКОЛЬКО ПРЕДМЕТ ПРОИЗВОДИТ.
+# Дефицит при этом создают КЛЕТКИ (их 12 базовых), а не бесконечная цена.
+SPAWN_COST_GROWTH = 1.08        # каждая занятая клетка делает следующую дороже
+SPAWN_L1_BASE = 50.0            # база спавна печеньки 1 уровня
+ITEM_PAYBACK_HOURS = 8.0        # за столько часов окупается купленный тир
 
-def spawn_cost(items_on_board: int, income_per_hour: float = 0.0) -> float:
-    """Цена спавна печеньки lvl1: max(50, доля дохода) x рост от заполненности"""
-    base = max(50.0, income_per_hour * SPAWN_INCOME_SHARE)
-    return base * (SPAWN_COST_GROWTH ** items_on_board)
+def spawn_cost(items_on_board: int, board_income_per_hour: float = 0.0) -> float:
+    """Цена спавна печеньки lvl1. board_income_per_hour оставлен в сигнатуре
+    для совместимости вызовов и будущих правок — на цену L1 он не влияет."""
+    return SPAWN_L1_BASE * (SPAWN_COST_GROWTH ** items_on_board)
 
-# Прямая покупка печеньки уровня N: цена 2^(N-1) слияний x небольшая премия.
-# 2.3 = 2 (честный merge-путь) x 1.15 за уровень: на 10 lvl премия ~3x, а не 20x
-SPAWN_LEVEL_FACTOR = 2.3
+def item_base_price(level: int) -> float:
+    """Сколько предмет производит за ITEM_PAYBACK_HOURS часов."""
+    return max(SPAWN_L1_BASE,
+               passive_income_per_hour(level) * ITEM_PAYBACK_HOURS)
+
 # топ-тиры только слиянием: напрямую можно купить максимум unlocked - 3
 SPAWN_DIRECT_GAP = 3
 
-def direct_spawn_cost(level: int, items_on_board: int, income_per_hour: float = 0.0) -> float:
-    return spawn_cost(items_on_board, income_per_hour) * (SPAWN_LEVEL_FACTOR ** (level - 1))
+def direct_spawn_cost(level: int, items_on_board: int,
+                      board_income_per_hour: float = 0.0) -> float:
+    """Прямая покупка тира: окупается за ITEM_PAYBACK_HOURS часов + та же
+    надбавка за заполненность. Всегда дороже пути слияния — слияние выгоднее."""
+    if level <= 1:
+        return spawn_cost(items_on_board, board_income_per_hour)
+    return item_base_price(level) * (SPAWN_COST_GROWTH ** items_on_board)
 
 # Мусорка/печь: перетащил печеньку — клетка освободилась, вернулась часть цены.
 # Возврат считается от ФАКТИЧЕСКИ вложенного (board.paid), а не от текущей цены:
@@ -64,8 +93,8 @@ TRASH_REFUND = 0.10
 
 def legacy_item_value(level: int) -> float:
     """Оценка вложенного для строк доски без paid (созданы до миграции).
-    Считаем по минимальной цене (без привязки к доходу) — щедрее не надо."""
-    return 50.0 * (SPAWN_LEVEL_FACTOR ** (level - 1))
+    Считаем по пути слияния на пустой доске — щедрее не надо."""
+    return SPAWN_L1_BASE * (2 ** (level - 1))
 
 def merge_reward_xp(new_level: int) -> float:
     """XP уровня игрока за создание печеньки new_level. После 10 lvl рост гасим."""
@@ -81,16 +110,20 @@ MERGE_BP_XP_CAP = 1200
 def merge_reward_bp_xp(new_level: int) -> float:
     return min(merge_reward_xp(new_level), MERGE_BP_XP_CAP)
 
+# Рост дохода печеньки за уровень. ОБЯЗАН быть > 2.0: слияние съедает две
+# печеньки, и при базе 1.7 каждый мердж выше 12 уровня УМЕНЬШАЛ доход на 15%
+# (2 x L12 = 217k/ч -> 1 x L13 = 185k/ч) — основной цикл игры работал против
+# игрока. 2.15 даёт честные +7.5% за слияние на всём диапазоне.
+PASSIVE_GROWTH = 2.15
+PASSIVE_BASE = 90.0
+
 def passive_income_per_hour(item_level: int) -> float:
-    """Пассивный доход cookies/час от печеньки на доске. После 12 lvl рост
-    мягче, чтобы пара топ-печенек не обгоняла всю ферму на порядки.
-    База 90: доска меньше (12-25 клеток), а доход мерджа должен конкурировать
-    с фермой (фидбек: «8к/ч — бабушки приносят столько за 80 секунд»)."""
+    """Пассивный доход cookies/час от печеньки на доске.
+    Единая экспонента без излома: доска маленькая (12-25 клеток) и жёстко
+    ограничена уровнем игрока, поэтому разогнаться она не может физически."""
     if item_level < 3:
         return 0
-    if item_level <= 12:
-        return 90 * (2.2 ** (item_level - 3))
-    return 90 * (2.2 ** 9) * (1.7 ** (item_level - 12))
+    return PASSIVE_BASE * (PASSIVE_GROWTH ** (item_level - 3))
 
 PASSIVE_CAP_HOURS = 3           # базовый кап оффлайн-дохода; Stars-покупка
                                 # offline_cap_* добавляет часы навсегда
@@ -105,6 +138,9 @@ def item_unlock_level(item_level: int) -> int:
 
 # ---------- Уровни (тропинка) ----------
 MAX_LEVEL = 30
+# На потолке уровней XP больше некуда девать — переливаем долю в батл-пасс,
+# иначе весь поздний прогресс уходил в пустоту
+MAXLEVEL_XP_TO_BP = 0.25
 
 def xp_for_level(level: int) -> float:
     """Сколько всего XP нужно, чтобы достичь уровня level.
@@ -173,10 +209,42 @@ CLICK_XP_SOFT_CAP = 10_000
 CLICK_XP_RATE = 0.5
 CLICK_XP_RATE_CAPPED = 0.125
 
-def bp_reward(bp_level: int, premium: bool) -> dict:
+# Награды пасса тоже в часах дохода: весь премиум-трек за 30 уровней давал
+# 186 000 печенек — на 30-й день это 0.04 секунды дохода, то есть Premium Пасс
+# за 100⭐ был в 190 000 раз хуже пачки печенек за 75⭐.
+BP_REWARD_HOURS_FREE = 0.10
+BP_REWARD_HOURS_PREMIUM = 0.28
+
+def bp_reward(bp_level: int, premium: bool, income_per_hour: float = 0.0) -> dict:
+    """Награда уровня пасса: базовая сумма ИЛИ доля часового дохода — что больше."""
     if premium:
-        return {"cookies": 400 * bp_level, "energy": 100 if bp_level % 5 == 0 else 0}
-    return {"cookies": 150 * bp_level, "energy": 0}
+        base = 400 * bp_level
+        scaled = income_per_hour * BP_REWARD_HOURS_PREMIUM * bp_level / BP_MAX_LEVEL
+        return {"cookies": max(base, scaled),
+                "energy": 100 if bp_level % 5 == 0 else 0}
+    base = 150 * bp_level
+    scaled = income_per_hour * BP_REWARD_HOURS_FREE * bp_level / BP_MAX_LEVEL
+    return {"cookies": max(base, scaled), "energy": 0}
+
+
+# ---------- Масштабирование фиксированных наград ----------
+# Весь слой констант (дейлик, ачивки, уровни, туториал, канал, рефералка)
+# умирал за 48 часов: на 10-й день дейлик в 15 000 печенек = 0.34 секунды
+# дохода. Каждая награда теперь max(константа, доля часового дохода).
+REWARD_INCOME_HOURS = {
+    "daily": 0.5,
+    "achievement": 1.0,
+    "level": 1.5,
+    "tutorial": 0.25,
+    "channel": 0.5,
+    "referrer": 0.75,
+    "referred": 0.4,
+    "season_top": 0.0,   # сезонные призы уже считаются долей season_earned
+}
+
+def scaled_reward(base: float, kind: str, income_per_hour: float) -> float:
+    """max(константа, доля часового дохода) — награда не обесценивается."""
+    return max(base, income_per_hour * REWARD_INCOME_HOURS.get(kind, 0.0))
 
 # ---------- Рефералка ----------
 REF_REWARD_REFERRER = 1000      # награда пригласившему
@@ -202,16 +270,29 @@ def daily_reward(streak_day: int) -> int:
 # ---------- Ежедневные задания ----------
 # Пул заданий; каждый день детерминированно выбираются DAILY_QUESTS_PER_DAY штук.
 # metric — что копим за день, goal — цель, reward_cookies + reward_bp_xp — награда.
+# reward_hours — доля часового дохода; задания, которые ТРАТЯТ печеньки
+# (спавн, мердж), платят больше, чем бесплатные кликовые, иначе они были чистым
+# убытком (merges_15 стоил 1.56ч дохода, а платил 0.5ч) и игрок их реролил.
 DAILY_QUESTS_PER_DAY = 3
 DAILY_QUEST_POOL = {
-    "clicks_200":   {"metric": "clicks",    "goal": 200, "reward_cookies": 1500, "reward_bp_xp": 200},
-    "clicks_500":   {"metric": "clicks",    "goal": 500, "reward_cookies": 3000, "reward_bp_xp": 350},
-    "merges_5":     {"metric": "merges",    "goal": 5,   "reward_cookies": 1200, "reward_bp_xp": 200},
-    "merges_15":    {"metric": "merges",    "goal": 15,  "reward_cookies": 3000, "reward_bp_xp": 350},
-    "spawn_10":     {"metric": "spawns",    "goal": 10,  "reward_cookies": 1000, "reward_bp_xp": 150},
-    "buy_2":        {"metric": "buildings", "goal": 2,   "reward_cookies": 2000, "reward_bp_xp": 250},
-    "earn_5k":      {"metric": "earned",    "goal": 5000, "reward_cookies": 2500, "reward_bp_xp": 300},
+    "clicks_200":   {"metric": "clicks",    "goal": 200, "reward_cookies": 1500, "reward_bp_xp": 200, "reward_hours": 0.35},
+    "clicks_500":   {"metric": "clicks",    "goal": 500, "reward_cookies": 3000, "reward_bp_xp": 350, "reward_hours": 0.5},
+    "merges_5":     {"metric": "merges",    "goal": 5,   "reward_cookies": 1200, "reward_bp_xp": 200, "reward_hours": 0.8},
+    "merges_15":    {"metric": "merges",    "goal": 15,  "reward_cookies": 3000, "reward_bp_xp": 350, "reward_hours": 1.8},
+    "spawn_10":     {"metric": "spawns",    "goal": 10,  "reward_cookies": 1000, "reward_bp_xp": 150, "reward_hours": 1.2},
+    "buy_2":        {"metric": "buildings", "goal": 2,   "reward_cookies": 2000, "reward_bp_xp": 250, "reward_hours": 0.6},
+    "earn_5k":      {"metric": "earned",    "goal": 5000, "reward_cookies": 2500, "reward_bp_xp": 300, "reward_hours": 0.5},
 }
+# Цель «заработай N» обязана масштабироваться: константа 5000 при доходе 2e9/ч
+# выполняется за 0.009 секунды и платит миллиард.
+QUEST_EARN_GOAL_HOURS = 0.5
+
+def quest_goal(quest_key: str, income_per_hour: float) -> float:
+    """Цель задания с поправкой на доход (для метрики earned)."""
+    q = DAILY_QUEST_POOL[quest_key]
+    if q["metric"] == "earned":
+        return max(q["goal"], round(income_per_hour * QUEST_EARN_GOAL_HOURS))
+    return q["goal"]
 
 # ---------- Подписка на канал ----------
 CHANNEL_REWARD = 2000           # разовая награда за подписку (если CHANNEL_USERNAME задан)
@@ -244,7 +325,13 @@ COMBO_MAX_MULT = 2.0
 PRESTIGE_MIN_EARNED = 10_000_000
 PRESTIGE_THRESHOLD_GROWTH = 15
 PRESTIGE_BASE = 1_000_000
-PRESTIGE_MULT_PER_POINT = 0.02      # +2% дохода за очко
+# Было +2% за очко: первый престиж давал +6% и стирал уровень, ферму, доску и
+# апгрейды — перерождаться не имело смысла никогда, оптимально было не
+# престижить вообще. 0.30 делает первый престиж примерно x1.9.
+PRESTIGE_MULT_PER_POINT = 0.30      # +30% дохода за очко
+# Престиж сохраняет часть уровня: полный откат на 1-й уровень означал заново
+# проходить все req_level зданий и предметов, а множитель этого не ускорял.
+PRESTIGE_KEEP_LEVEL_SHARE = 0.4
 
 def prestige_threshold(prestige_count: int) -> float:
     """Сколько total_earned нужно для престижа номер prestige_count+1."""
@@ -270,9 +357,14 @@ ORDER_TEMPLATES = {
     "special":   {"metric": "make_item", "goal": 0,   "difficulty": 3},   # печенье уровня N
     "marathon":  {"metric": "clicks",    "goal": 250, "difficulty": 3},   # клик-марафон
 }
-# 5 заказов x 1.1ч = 5.5ч дохода в день максимум. Было 8 x 1.8ч = 14.4ч —
-# больше, чем весь оффлайн-кап, при том что игрок всегда берёт сложность 3
-ORDER_REWARD_HOURS = {1: 0.3, 2: 0.6, 3: 1.1}   # часов дохода за сложность
+# Награда — ПО ШАБЛОНУ, а не по сложности: заказ, который тратит печеньки
+# (спавн/мердж), обязан отбивать затраты, иначе он чистый убыток. Бесплатные
+# кликовые заказы платят мало, поэтому суточный максимум чистыми ~1.75ч дохода
+# вместо прежних 5.5ч (это было больше, чем весь оффлайн-кап).
+ORDER_REWARD_HOURS = {
+    "warmup": 0.15, "delivery": 0.75, "batch": 1.1, "shopping": 0.4,
+    "profit": 0.5, "special": 1.0, "marathon": 0.35,
+}
 ORDER_REWARD_MIN = {1: 800, 2: 2200, 3: 5500}   # минимум печенек (холодный старт)
 ORDER_BP_XP = {1: 60, 2: 140, 3: 300}
 ORDERS_PER_DAY = 5                               # анти-гринд: заказов в день
@@ -289,8 +381,10 @@ TUTORIAL_REWARD = 1500
 # ---------- Коллекция блестящих печенек ----------
 SHINY_CHANCE = 0.06        # шанс блестяшки при мердже
 SHINY_PITY = 25            # гарантированная блестяшка после N мерджей без неё
-# наборы (диапазоны уровней); каждый собранный набор даёт постоянный бонус
-COLLECTION_SETS = [(1, 6), (7, 12), (13, 18), (19, 24)]
+# Наборы по 4 уровня вместо 6: прежние (13,18) и (19,24) требовали слияния до
+# L18 и L24 (131 072 и 8 388 608 спавнов) — половина коллекции была физически
+# недостижима, и реальный потолок бонуса составлял +6% вместо заявленных +12%.
+COLLECTION_SETS = [(1, 4), (5, 8), (9, 12), (13, 16)]
 COLLECTION_SET_BONUS = 0.03  # +3% ко всему доходу за набор
 
 # ---------- QoL: квесты и стрик ----------
@@ -363,19 +457,20 @@ BOOST_CLICK_X2_MULT = 2.0
 
 # ---------- Ферма (здания с автофармом, покупка за печеньки) ----------
 # key: (базовая цена, cookies/сек с одного, требуемый уровень игрока)
+# Окупаемость здания растёт с тиром: 17 минут у первого, ~65 минут у последнего.
+# Было 3.3 минуты (cursor: 100 печенек -> 1800/ч) — ферма окупалась почти
+# мгновенно, поэтому съедала весь капитал и делала клик и доску бессмысленными.
 FARM_BUILDINGS = {
-    "cursor":   {"base_cost": 100,      "cps": 0.5,   "req_level": 1},
-    "granny":   {"base_cost": 1_000,    "cps": 4,     "req_level": 2},
-    "bakery":   {"base_cost": 8_000,    "cps": 20,    "req_level": 4},
-    "factory":  {"base_cost": 50_000,   "cps": 90,    "req_level": 7},
-    "mine":     {"base_cost": 250_000,  "cps": 250,   "req_level": 10},
-    "portal":   {"base_cost": 1_500_000,"cps": 900,   "req_level": 15},
-    "timelab":  {"base_cost": 9_000_000,"cps": 3800,  "req_level": 20},
-    "moonbase": {"base_cost": 60_000_000,  "cps": 16000,  "req_level": 24},
-    "singularity": {"base_cost": 400_000_000, "cps": 75000, "req_level": 28},
+    "cursor":   {"base_cost": 500,      "cps": 0.5,   "req_level": 1},
+    "granny":   {"base_cost": 5_000,    "cps": 4,     "req_level": 2},
+    "bakery":   {"base_cost": 32_000,   "cps": 20,    "req_level": 4},
+    "factory":  {"base_cost": 180_000,  "cps": 90,    "req_level": 7},
+    "mine":     {"base_cost": 600_000,  "cps": 250,   "req_level": 10},
+    "portal":   {"base_cost": 2_500_000,"cps": 900,   "req_level": 15},
+    "timelab":  {"base_cost": 12_000_000,"cps": 3800, "req_level": 20},
+    "moonbase": {"base_cost": 56_000_000,  "cps": 16000,  "req_level": 24},
+    "singularity": {"base_cost": 300_000_000, "cps": 75000, "req_level": 28},
 }
-# 1.22 + пониженный cps топ-зданий: фидбек «залутал за часик и миллиарды»;
-# симуляция 72ч: earned 5.5B -> ~0.4B, фарм 70k -> 4k cps, ранний темп не тронут
 FARM_COST_GROWTH = 1.22          # цена растёт за каждое купленное здание
 FARM_OFFLINE_CAP_HOURS = 3       # базовый кап оффлайн-фарма (+ Stars-бонус offline_cap_*)
 

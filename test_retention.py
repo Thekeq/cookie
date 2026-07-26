@@ -115,16 +115,23 @@ db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, 'donut')", (UID,))
 r = c.get("/api/prestige", headers=H)
 pts = r.json()["gain_available"]
 check("prestige available", r.json()["can_prestige"] is True and pts == 5, str(pts))
+_lvl_before = db.get_user(UID)["level"]
 r = c.post("/api/prestige", headers=H)
 check("prestige done", r.status_code == 200, r.text[:200])
 s = r.json()
 u = db.get_user(UID)
-check("progress reset", u["cookies"] == 0 and u["level"] == 1 and u["click_level"] == 1)
+# престиж сохраняет часть уровня: полный откат на 1-й делал перерождение
+# бессмысленным (заново все req_level, а множитель этого не ускорял)
+_kept = gl.prestige_kept_level(_lvl_before)
+check("progress reset", u["cookies"] == 0 and u["click_level"] == 1
+      and u["level"] == _kept, f"lvl {u['level']} != {_kept}")
+check("prestige keeps part of the level", _kept >= 1 and _kept <= _lvl_before)
 check("farm wiped", gl.farm_counts(UID) == {})
 check("skins kept", db.q1("SELECT id FROM skins WHERE user_id = ? AND skin_key = 'donut'",
                           (UID,)) is not None)
 check("points saved", u["prestige_points"] == 5 and u["prestige_count"] == 1)
-check("multiplier applied", abs(s["user"]["click_power"] - 1 * 1.10) < 0.001,
+_expect_mult = 1 + 5 * cfg.PRESTIGE_MULT_PER_POINT
+check("multiplier applied", abs(s["user"]["click_power"] - _expect_mult) < 0.001,
       str(s["user"]["click_power"]))
 check("total_earned kept", u["total_earned"] == 25_000_000)
 r = c.post("/api/prestige", headers=H)
@@ -165,8 +172,11 @@ check("bp_level_for_xp", cfg.bp_level_for_xp(cfg.bp_total_xp(5)) == 5
       and cfg.bp_level_for_xp(cfg.bp_total_xp(5) - 1) == 4)
 
 # дневной кап XP кликов: после 10k кликов XP режется вчетверо
+# ниже потолка уровней: на MAX_LEVEL XP переливается в батл-пасс, и проверять
+# кап кликового XP на профильном xp уже нельзя
 db.update_user(UID, energy=200000, clicks_day=gl._utc_day(time.time()),
-               clicks_day_count=cfg.CLICK_XP_SOFT_CAP, combo_last_at=0)
+               clicks_day_count=cfg.CLICK_XP_SOFT_CAP, combo_last_at=0,
+               level=min(db.get_user(UID)["level"], cfg.MAX_LEVEL - 1))
 xp_before = db.get_user(UID)["xp"]
 db.exec("DELETE FROM daily_quests WHERE user_id = ?", (UID,))
 db.update_user(UID, cps_ts=0, cps_allowance=0)  # сброс CPS-окна (теперь в БД)
