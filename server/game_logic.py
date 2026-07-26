@@ -424,12 +424,19 @@ def reroll_quest(user: dict, key: str) -> str:
         raise ValueError("err_no_reroll")
     new_key = random.choice(candidates)
     with db.tx():
+        # право на реролл решает rowcount: проверка выше стоит над прочитанным
+        # словарём, и два нажатия вплотную оба её проходили — за день можно было
+        # перебрать несколько заданий вместо одного
+        if db.exec("UPDATE users SET quest_reroll_day = ?, "
+                   "user_revision = user_revision + 1 "
+                   "WHERE user_id = ? AND COALESCE(quest_reroll_day, '') <> ?",
+                   (day, user["user_id"], day)) == 0:
+            raise ValueError("err_no_reroll")
         db.exec("DELETE FROM daily_quests WHERE id = ?", (row["id"],))
         db.exec("INSERT INTO daily_quests (user_id, day, quest_key) "
                 "VALUES (?, ?, ?) "
                 "ON CONFLICT (user_id, day, quest_key) DO NOTHING",
                 (user["user_id"], day, new_key))
-        db.update_user(user["user_id"], quest_reroll_day=day)
     track(user["user_id"], "quest_reroll")
     return new_key
 
@@ -758,24 +765,33 @@ def golden_state(user: dict) -> dict:
 
 
 def claim_golden(user: dict) -> dict:
-    """Тап по золотой печеньке. Возвращает применённый эффект или ValueError."""
+    """Тап по золотой печеньке. Возвращает применённый эффект или ValueError.
+
+    Печеньку гасит УСЛОВНЫЙ UPDATE, и он же выдаёт разрешение на награду: раньше
+    проверка «не истекла» стояла над прочитанным словарём, а гашение шло
+    безусловным UPDATE — два тапа вплотную (а по золотой печеньке тапают именно
+    так) оба проходили проверку и оба платили. Эффект берём из RETURNING, а не
+    из словаря: он мог смениться следующим спавном."""
     now = time.time()
-    if now >= user["golden_expires_at"]:
-        raise ValueError("err_golden_gone")
-    effect = user["golden_effect"] or "chain"
-    if effect == "frenzy":
-        e = cfg.GOLDEN_EFFECTS["frenzy"]
-        with db.tx():
-            db.update_user(user["user_id"], golden_expires_at=0)
-            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
-                    (user["user_id"], "golden_frenzy", now + e["seconds"]))
-        return {"effect": "frenzy", "mult": e["mult"], "seconds": e["seconds"]}
-    e = cfg.GOLDEN_EFFECTS["chain"]
-    bonus = max(passive_per_hour(user["user_id"]) * e["passive_hours"],
-                e["min_per_level"] * user["level"])
+    uid = user["user_id"]
     with db.tx():
-        db.update_user(user["user_id"], golden_expires_at=0)
-        add_cookies(user["user_id"], bonus)
+        row = db.q1w("UPDATE users SET golden_expires_at = 0, "
+                     "user_revision = user_revision + 1 "
+                     "WHERE user_id = ? AND COALESCE(golden_expires_at, 0) > ? "
+                     "RETURNING golden_effect, level",
+                     (uid, now))
+        if row is None:
+            raise ValueError("err_golden_gone")
+        effect = row["golden_effect"] or "chain"
+        if effect == "frenzy":
+            e = cfg.GOLDEN_EFFECTS["frenzy"]
+            db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
+                    (uid, "golden_frenzy", now + e["seconds"]))
+            return {"effect": "frenzy", "mult": e["mult"], "seconds": e["seconds"]}
+        e = cfg.GOLDEN_EFFECTS["chain"]
+        bonus = max(passive_per_hour(uid) * e["passive_hours"],
+                    e["min_per_level"] * row["level"])
+        add_cookies(uid, bonus)
     # ключ "bonus", а не "cookies": роутер добавляет к ответу баланс под
     # ключом "cookies" и раньше затирал им сам бонус
     return {"effect": "chain", "bonus": bonus}
@@ -1642,19 +1658,39 @@ def claim_item_record(user: dict, item_level: int) -> dict | None:
     несколько ступеней, и иначе их XP пропадал бы молча.
 
     Возвращает описание награды для ответа ручки или None, если рекорд не
-    побит (подавляющее большинство мерджей)."""
+    побит (подавляющее большинство мерджей).
+
+    Рекорд двигается compare-and-set'ом: платим ровно за тот диапазон, который
+    сдвинули мы. Раньше рекорд писался безусловно поверх прочитанного значения —
+    два мерджа вплотную (пачки мерджей на активной игре — норма) оба видели
+    старый рекорд и оба платили XP за один и тот же тир. Это основной источник
+    XP уровня, то есть дублировалась вся ветка прогресса.
+
+    Проигравший CAS повторяет чтение: победитель мог поднять рекорд НИЖЕ нашего
+    (мерджи приходят вразнобой), и тогда за остаток диапазона всё ещё должны."""
     uid = user["user_id"]
-    best = user["best_item_level"] or 0
-    if item_level <= best:
-        return None
-    levels = range(max(best + 1, 2), item_level + 1)
-    xp = sum(cfg.first_item_xp(l) for l in levels)
-    bp_xp = sum(cfg.first_item_bp_xp(l) for l in levels)
-    cookies = cfg.scaled_reward(0, "item_record", hourly_income(uid))
-    db.update_user(uid, best_item_level=item_level)
-    if cookies:
-        add_cookies(uid, cookies)
-    add_xp(uid, xp, bp_xp)
+    with db.tx():
+        for _ in range(3):
+            cur = db.q1("SELECT best_item_level FROM users WHERE user_id = ?", (uid,))
+            if not cur:
+                return None
+            best = cur["best_item_level"] or 0
+            if item_level <= best:
+                return None
+            if db.exec("UPDATE users SET best_item_level = ?, "
+                       "user_revision = user_revision + 1 "
+                       "WHERE user_id = ? AND COALESCE(best_item_level, 0) = ?",
+                       (item_level, uid, best)):
+                break
+        else:
+            return None                      # рекорд всё время уезжал — не платим
+        levels = range(max(best + 1, 2), item_level + 1)
+        xp = sum(cfg.first_item_xp(l) for l in levels)
+        bp_xp = sum(cfg.first_item_bp_xp(l) for l in levels)
+        cookies = cfg.scaled_reward(0, "item_record", hourly_income(uid))
+        if cookies:
+            add_cookies(uid, cookies)
+        add_xp(uid, xp, bp_xp)
     track(uid, "item_record", item_level)
     return {"level": item_level, "xp": xp, "cookies": cookies}
 
@@ -1665,27 +1701,41 @@ def roll_shiny(user: dict, item_level: int) -> int | None:
 
     Если выпавший уровень уже собран, отдаём ближайший НЕсобранный (не выше
     выпавшего): раньше дубликат молча терялся в INSERT OR IGNORE, но pity
-    обнулялся — альбом можно было не добить никогда."""
+    обнулялся — альбом можно было не добить никогда.
+
+    Счётчик pity двигается ОТНОСИТЕЛЬНО (`shiny_pity + 1`), а не записью
+    посчитанного значения: пачка мерджей читала одно и то же число и писала
+    одно и то же, счётчик стоял на месте и гарантия дропа не наступала никогда.
+    Обнуляет его только тот вызов, чья вставка в альбом действительно прошла."""
     uid = user["user_id"]
-    pity = user["shiny_pity"] + 1
+    pity = (user["shiny_pity"] or 0) + 1
     if pity < cfg.SHINY_PITY and random.random() >= cfg.SHINY_CHANCE:
-        db.update_user(uid, shiny_pity=pity)
+        _bump_pity(uid)
         return None
     owned = {r["item_level"] for r in
              db.q("SELECT item_level FROM collection WHERE user_id = ?", (uid,))}
     target = item_level if item_level not in owned else next(
         (l for l in range(item_level - 1, 0, -1) if l not in owned), None)
     if target is None:  # всё до этого уровня собрано — pity сохраняем на будущее
-        db.update_user(uid, shiny_pity=pity)
+        _bump_pity(uid)
         return None
     with db.tx():
-        db.update_user(uid, shiny_pity=0)
-        db.exec("INSERT INTO collection (user_id, item_level, obtained_at) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT (user_id, item_level) DO NOTHING",
-                (uid, target, time.time()))
+        if db.exec("INSERT INTO collection (user_id, item_level, obtained_at) "
+                   "VALUES (?, ?, ?) "
+                   "ON CONFLICT (user_id, item_level) DO NOTHING",
+                   (uid, target, time.time())) == 0:
+            _bump_pity(uid)                  # уровень успели собрать параллельно
+            return None
+        db.exec("UPDATE users SET shiny_pity = 0, "
+                "user_revision = user_revision + 1 WHERE user_id = ?", (uid,))
     track(uid, "shiny_drop", target)
     return target
+
+
+def _bump_pity(user_id: int):
+    """+1 к счётчику гарантированного дропа, относительным UPDATE."""
+    db.exec("UPDATE users SET shiny_pity = COALESCE(shiny_pity, 0) + 1, "
+            "user_revision = user_revision + 1 WHERE user_id = ?", (user_id,))
 
 
 def collection_sets_done(user_id: int) -> int:

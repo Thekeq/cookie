@@ -75,6 +75,24 @@ else:
 r = c.post("/api/golden/claim", headers=H)
 check("golden double-claim blocked", r.status_code == 400)
 
+# два тапа ОДНИМ И ТЕМ ЖЕ словарём — по золотой печеньке тапают именно так, и
+# оба запроса видят её живой. Гасит печеньку условный UPDATE, он же решает, кому
+# платить; эффект фиксируем на chain, чтобы награда была деньгами, а не бустом
+db.update_user(UID, golden_expires_at=time.time() + 60, golden_effect="chain")
+_g_user = db.get_user(UID)
+_g_before = _g_user["cookies"]
+_g_paid = gl.claim_golden(_g_user)["bonus"]
+check("stale golden paid", _g_paid > 0 and
+      db.get_user(UID)["cookies"] - _g_before > 0, str(_g_paid))
+try:
+    gl.claim_golden(_g_user)
+    check("stale golden refused", False, "второй тап прошёл")
+except ValueError as e:
+    check("stale golden refused", str(e) == "err_golden_gone", str(e))
+check("stale golden paid once",
+      abs(db.get_user(UID)["cookies"] - _g_before - _g_paid) < 1e-6,
+      f"{db.get_user(UID)['cookies'] - _g_before} != {_g_paid}")
+
 # --- комбо ---
 db.update_user(UID, energy=2000, combo_mult=1, combo_last_at=0)
 r = c.post("/api/click", json={"clicks": 10, "batch_id": "auto-ret-1"}, headers=H)

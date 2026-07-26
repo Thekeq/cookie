@@ -358,6 +358,24 @@ check("reroll works", r.status_code == 200 and r.json()["new_key"] != qkey, r.te
 r = c.post("/api/quests/reroll", json={"key": r.json()["new_key"]}, headers=H(UID))
 check("second reroll blocked", r.status_code == 400)
 
+# два реролла ОДНИМ И ТЕМ ЖЕ словарём — так выглядят два запроса вплотную:
+# проверка «сегодня не рероллил» стоит над прочитанной строкой и оба её проходят,
+# отсечь второй может только rowcount условного UPDATE
+db.update_user(UID, quest_reroll_day=None)
+db.exec("UPDATE daily_quests SET claimed = 0 WHERE user_id = ?", (UID,))
+_rr_user = db.get_user(UID)
+_rr_day = gl._utc_day(time.time())
+_rr_keys = [q["quest_key"] for q in gl._user_quest_rows(UID, _rr_day)]
+gl.reroll_quest(_rr_user, _rr_keys[0])
+try:
+    gl.reroll_quest(_rr_user, _rr_keys[1])
+    check("stale reroll refused", False, "второй реролл прошёл")
+except ValueError as e:
+    check("stale reroll refused", str(e) == "err_no_reroll", str(e))
+check("reroll day marked once", db.get_user(UID)["quest_reroll_day"] == _rr_day)
+check("second quest survived stale reroll",
+      any(q["quest_key"] == _rr_keys[1] for q in gl._user_quest_rows(UID, _rr_day)))
+
 # --- заморозка стрика: пропуск одного дня раз в неделю прощается ---
 db.update_user(UID, daily_streak=5, daily_claimed_at=time.time() - 2 * 86400,
                streak_freeze_week=None)
@@ -414,6 +432,41 @@ check("duplicate roll gives a missing level", dup is None or dup not in range(1,
 db.exec("DELETE FROM collection WHERE user_id = ? AND item_level = 4", (UID,))
 db.update_user(UID, shiny_pity=cfg.SHINY_PITY)
 check("duplicate roll fills the hole", gl.roll_shiny(db.get_user(UID), 7) == 4)
+# счётчик pity двигается относительно: пачка мерджей читает одно и то же число,
+# и запись посчитанного значения оставляла счётчик на месте навсегда
+db.update_user(UID, shiny_pity=0)
+gl._bump_pity(UID)
+gl._bump_pity(UID)
+check("pity counts every roll", db.get_user(UID)["shiny_pity"] == 2,
+      db.get_user(UID)["shiny_pity"])
+# уровень, собранный параллельно, не съедает гарант дропа
+db.exec("DELETE FROM collection WHERE user_id = ? AND item_level = 4", (UID,))
+db.update_user(UID, shiny_pity=cfg.SHINY_PITY)
+_dup_before = db.get_user(UID)["shiny_pity"]
+db.exec("INSERT INTO collection (user_id, item_level, obtained_at) "
+        "VALUES (?, 4, ?) ON CONFLICT (user_id, item_level) DO NOTHING",
+        (UID, time.time()))          # «параллельный» дроп того же уровня
+check("pity survives a lost race",
+      gl.roll_shiny(db.get_user(UID), 4) is None
+      and db.get_user(UID)["shiny_pity"] == _dup_before + 1,
+      db.get_user(UID)["shiny_pity"])
+
+# --- рекорд тира: платим ровно за тот диапазон, который сдвинули мы ---
+db.update_user(UID, best_item_level=5)
+_rec_user = db.get_user(UID)
+_xp_before = db.get_user(UID)["xp"]
+_rec = gl.claim_item_record(_rec_user, 8)
+check("record claimed", _rec and _rec["level"] == 8, str(_rec))
+check("record paid xp", db.get_user(UID)["xp"] > _xp_before)
+_xp_after = db.get_user(UID)["xp"]
+# тот же (уже устаревший) словарь: повтор не платит за те же тиры второй раз
+check("record not paid twice", gl.claim_item_record(_rec_user, 8) is None)
+check("xp unchanged on repeat", db.get_user(UID)["xp"] == _xp_after)
+check("record kept", db.get_user(UID)["best_item_level"] == 8)
+# рекорд, поднятый «параллельно» ниже нашего, оставляет остаток диапазона за нами
+_rec2 = gl.claim_item_record(_rec_user, 10)
+check("record pays only the new range", _rec2 and _rec2["level"] == 10, str(_rec2))
+check("record moved to 10", db.get_user(UID)["best_item_level"] == 10)
 
 # --- лиги ---
 db.update_user(UID, level=3)

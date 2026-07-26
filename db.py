@@ -393,6 +393,12 @@ class DataBase:
         "ref_claims": {"cols": ("user_id", "milestone_key")},
         # награда пасса забирается один раз за сезон
         "bp_claims": {"cols": ("user_id", "season_id", "track", "level")},
+        # заявка в очереди дуэлей — одна на игрока. Два /duel/find вплотную
+        # вставляли по строке, и игрок стоял в очереди дважды: его забирали два
+        # разных соперника, а сам он видел только одну из дуэлей
+        "duels_waiting": {"cols": ("user_a",), "table": "duels",
+                          "where": "status = 'waiting'",
+                          "index": "uq_duels_waiting"},
         "season_results": {"cols": ("season_id", "user_id")},
         "click_batches": {"cols": ("user_id", "batch_id")},
         "collection": {"cols": ("user_id", "item_level")},

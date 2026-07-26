@@ -696,6 +696,41 @@ check("search can be cancelled", _st["duel"] is None)
 # приз есть и на экране приглашения, где дуэли ещё нет
 check("prize is shown with no duel", _st.get("prize", 0) >= cfg.DUEL_REWARD_MIN, str(_st))
 
+# --- очередь: одна заявка на игрока, и это гарантирует база ---
+_duels.find(db.get_user(_DA))
+try:
+    _duels.find(db.get_user(_DA))
+    check("second queue entry refused", False, "вторая заявка прошла")
+except ValueError as e:
+    check("second queue entry refused", "err_duel_active" in str(e), str(e))
+check("exactly one waiting row", db.q1(
+    "SELECT COUNT(*) c FROM duels WHERE user_a = ? AND status = 'waiting'",
+    (_DA,))["c"] == 1)
+# гонка обходит проверку в питоне — тогда её ловит уникальный индекс
+try:
+    db.exec("INSERT INTO duels (user_a, league, a_start, created_at, status) "
+            "VALUES (?, 'bronze', 0, ?, 'waiting')", (_DA, time.time()))
+    check("unique index guards the queue", False, "дубль вставился")
+except Exception:
+    check("unique index guards the queue", True)
+_duels.cancel(db.get_user(_DA))
+
+# приз за дуэль лежит в книге под своим токеном
+_prize_ops = db.q("SELECT operation_id FROM economy_ledger "
+                  "WHERE user_id = ? AND reason = 'duel_prize'", (_DA,))
+check("duel prize is ledgered", len(_prize_ops) == 1
+      and _prize_ops[0]["operation_id"].startswith("duel_prize:"), str(_prize_ops))
+
+# незакрытую дуэль забрать нельзя
+_duels.find(db.get_user(_DA))
+_duels.find(db.get_user(_DB))
+try:
+    _duels.claim(db.get_user(_DA))
+    check("active duel cannot be claimed", False, "клейм активной дуэли прошёл")
+except ValueError as e:
+    check("active duel cannot be claimed", "err_not_done" in str(e), str(e))
+db.exec("DELETE FROM duels WHERE user_a = ? OR user_b = ?", (_DA, _DA))
+
 for _u in (_DA, _DB):
     db.exec("DELETE FROM users WHERE user_id = ?", (_u,))
 db.exec("DELETE FROM duels WHERE user_a IN (?, ?) OR user_b IN (?, ?)",

@@ -98,12 +98,15 @@ def find(user: dict) -> dict:
     uid = user["user_id"]
     if user["level"] < cfg.DUEL_MIN_LEVEL:
         raise ValueError(f"err_req_level|{cfg.DUEL_MIN_LEVEL}")
-    if my_duel(uid):
-        raise ValueError("err_duel_active")
     league = cfg.league_of(user["level"])[0]
     now = time.time()
 
     with db.tx():
+        # «у меня уже есть дуэль» проверяется ВНУТРИ транзакции: снаружи два
+        # запроса вплотную (двойной тап по кнопке поиска) оба её проходили —
+        # игрок оказывался и в очереди, и в дуэли одновременно
+        if my_duel(uid):
+            raise ValueError("err_duel_active")
         # чужая заявка в этой же лиге — присоединяемся к ней
         foe = db.q1(
             "SELECT * FROM duels WHERE status = 'waiting' AND league = ? "
@@ -124,10 +127,18 @@ def find(user: dict) -> dict:
             gl.track(uid, "duel_start")
             return state(db.get_user(uid))
 
-        db.exec(
+        # INSERT ... SELECT ... WHERE NOT EXISTS, а не VALUES: право встать в
+        # очередь решает база, и уникальный индекс uq_duels_waiting не отдаёт
+        # игроку 500 вместо понятной ошибки
+        queued = db.exec(
             "INSERT INTO duels (user_a, league, a_start, created_at, status) "
-            "VALUES (?, ?, ?, ?, 'waiting')",
-            (uid, league, user["total_earned"], now))
+            "SELECT ?, ?, ?, ?, 'waiting' WHERE NOT EXISTS ("
+            "  SELECT 1 FROM duels WHERE (user_a = ? OR user_b = ?) "
+            "  AND (status <> 'done' OR (user_a = ? AND claimed_a = 0) "
+            "                        OR (user_b = ? AND claimed_b = 0)))",
+            (uid, league, user["total_earned"], now, uid, uid, uid, uid))
+        if queued == 0:
+            raise ValueError("err_duel_active")
     return state(db.get_user(uid))
 
 
@@ -139,19 +150,26 @@ def cancel(user: dict) -> dict:
 
 
 def claim(user: dict) -> dict:
-    """Забрать приз за победу. Проигравший закрывает дуэль без награды."""
+    """Забрать приз за победу. Проигравший закрывает дуэль без награды.
+
+    Право на приз даёт rowcount условного UPDATE: два нажатия вплотную оба
+    видели claimed = 0, и приз уходил дважды. Сумму берём из строки, прочитанной
+    УЖЕ внутри транзакции, — снаружи она могла принадлежать другой дуэли."""
     uid = user["user_id"]
-    row = my_duel(uid)
-    if not row or row["status"] != "done":
-        raise ValueError("err_not_done")
-    is_a = row["user_a"] == uid
-    col = "claimed_a" if is_a else "claimed_b"
-    reward = row["reward"] if row["winner_id"] == uid else 0
     with db.tx():
+        row = my_duel(uid)                   # заодно закрывает истёкшую дуэль
+        if not row or row["status"] != "done":
+            raise ValueError("err_not_done")
+        col = "claimed_a" if row["user_a"] == uid else "claimed_b"
+        reward = row["reward"] if row["winner_id"] == uid else 0
         if db.exec(f"UPDATE duels SET {col} = 1 WHERE id = ? AND {col} = 0",
                    (row["id"],)) == 0:
             raise ValueError("err_claimed")
         if reward:
-            gl.add_cookies(uid, reward, count_earned=False)
+            # токен привязан к дуэли и игроку: ретрай ручки не платит второй раз
+            # даже если охрана claimed окажется снята вручную
+            gl.add_cookies(uid, reward, count_earned=False,
+                           operation_id=f"duel_prize:{row['id']}:{uid}",
+                           reason="duel_prize")
     return {"reward": reward, "won": row["winner_id"] == uid,
             **state(db.get_user(uid))}
