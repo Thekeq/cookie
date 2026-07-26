@@ -99,6 +99,32 @@ db._mark("nope:никогда")  # повторный _mark не должен п
 check("повторный _mark идемпотентен",
       len(db.q("SELECT 1 x FROM schema_migrations WHERE name = ?", ("nope:никогда",))) == 1)
 
+print("\n=== перенос наград пасса в строки ===")
+
+# без переноса миграция ДАРИТ пройденный пасс: код смотрит только на строки
+db.exec("DELETE FROM bp_claims WHERE user_id = ?", (UID,))
+db.update_user(UID, season_id=7, bp_claimed_free='[1, 2, 2, 3]',
+               bp_claimed_premium='[1]')
+db._backfill_bp_claims()
+moved = db.q("SELECT track, level, season_id FROM bp_claims WHERE user_id = ? "
+             "ORDER BY track, level", (UID,))
+check("перенесены оба трека без дублей",
+      [(r["track"], r["level"]) for r in moved]
+      == [("free", 1), ("free", 2), ("free", 3), ("premium", 1)], str(moved))
+check("сезон взят из строки игрока", all(r["season_id"] == 7 for r in moved))
+
+# битый json от древнего сбоя не должен валить подъём процесса
+db.exec("DELETE FROM bp_claims WHERE user_id = ?", (UID,))
+db.update_user(UID, bp_claimed_free='[1, 2', bp_claimed_premium='[4]')
+db._backfill_bp_claims()
+check("битый json пропущен, целый перенесён",
+      [r["level"] for r in db.q("SELECT level FROM bp_claims WHERE user_id = ? "
+                                "AND track = 'premium'", (UID,))] == [4])
+db.exec("DELETE FROM bp_claims WHERE user_id = ?", (UID,))
+db.update_user(UID, bp_claimed_free='[]', bp_claimed_premium='[]')
+check("перенос отмечен в журнале и второй раз не пойдёт",
+      db._migration("backfill_bp_claims") is False)
+
 print("\n=== уникальные индексы ===")
 
 names = {r["name"] for r in db.q("SELECT name FROM sqlite_master WHERE type = 'index'")}

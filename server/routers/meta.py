@@ -1,5 +1,4 @@
 """Мета: авторизация/регистрация, рефералка, промокоды, батл-пасс, магазин."""
-import json
 import os
 import time
 
@@ -160,8 +159,14 @@ async def battlepass(tg: dict = Depends(tg_user)):
     if not user:
         raise HTTPException(404, "err_no_user")
     bp_level = cfg.bp_level_for_xp(user["bp_xp"])
-    claimed_free = json.loads(user["bp_claimed_free"] or "[]")
-    claimed_prem = json.loads(user["bp_claimed_premium"] or "[]")
+    # забранное читаем СТРОКАМИ своего сезона, а не json-списком из users:
+    # список приходилось перечитывать-дополнять-записывать целиком, и два клейма
+    # подряд затирали друг друга
+    claimed = db.q("SELECT track, level FROM bp_claims "
+                   "WHERE user_id = ? AND season_id = ?",
+                   (tg["id"], user["season_id"]))
+    claimed_free = {r["level"] for r in claimed if r["track"] == "free"}
+    claimed_prem = {r["level"] for r in claimed if r["track"] == "premium"}
     income = gl.hourly_income(tg["id"])   # награды пасса масштабируются доходом
     levels = []
     for lvl in range(1, cfg.BP_MAX_LEVEL + 1):
@@ -195,7 +200,9 @@ class BPClaim(BaseModel):
 
 @router.post("/battlepass/claim")
 async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
-    user = db.get_user(tg["id"])
+    # сезон приводим к текущему ДО чтения: иначе клейм на границе сезонов мог
+    # уйти в старый season_id, и после сброса тот же уровень забирался снова
+    user = gl.ensure_user_season(tg["id"])
     if not user:                      # единственная ручка без этой проверки:
         raise HTTPException(404, "err_no_user")   # раньше падала в 500
     if body.track not in ("free", "premium"):
@@ -205,18 +212,19 @@ async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
         raise HTTPException(400, "err_bp_locked")
     if body.track == "premium" and not user["bp_premium"]:
         raise HTTPException(400, "err_need_premium")
-    col = "bp_claimed_free" if body.track == "free" else "bp_claimed_premium"
     reward = cfg.bp_reward(body.level, body.track == "premium",
                            gl.hourly_income(tg["id"]))
     with db.tx():  # отметка о клейме и награда — одним куском
-        # список перечитывается УЖЕ внутри транзакции: чтение снаружи и запись
-        # целиком внутри теряли уровень при гонке, и его можно было забрать
-        # повторно
-        claimed = json.loads(db.get_user(tg["id"])[col] or "[]")
-        if body.level in claimed:
+        # право на награду решает вставка строки, а не проверка в питоне: второй
+        # клейм того же уровня проигрывает по rowcount. Раньше json-список
+        # читался, дополнялся и записывался целиком — два клейма разных уровней
+        # теряли один из них, а один и тот же уровень выдавался дважды
+        if db.exec("INSERT INTO bp_claims (user_id, season_id, track, level, "
+                   "claimed_at) VALUES (?, ?, ?, ?, ?) "
+                   "ON CONFLICT (user_id, season_id, track, level) DO NOTHING",
+                   (tg["id"], user["season_id"], body.track, body.level,
+                    time.time())) == 0:
             raise HTTPException(400, "err_claimed")
-        claimed.append(body.level)
-        db.update_user(tg["id"], **{col: json.dumps(claimed)})
         if reward["cookies"]:
             gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
         if reward.get("energy"):

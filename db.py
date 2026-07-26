@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import threading
@@ -61,7 +62,10 @@ class DataBase:
                 'bp_premium': 'INTEGER DEFAULT 0',
                 # премиум, купленный на стыке сезонов, переносится в новый сезон
                 'bp_premium_next': 'INTEGER DEFAULT 0',
-                'bp_claimed_free': 'TEXT DEFAULT "[]"',     # json-список уровней БП
+                # УСТАРЕЛИ: забранные награды пасса переехали в bp_claims
+                # (см. _backfill_bp_claims). Колонки не читаются и не пишутся, но
+                # оставлены — их данные единственный след истории до миграции.
+                'bp_claimed_free': 'TEXT DEFAULT "[]"',
                 'bp_claimed_premium': 'TEXT DEFAULT "[]"',
                 'farm_collected_at': 'REAL DEFAULT 0',      # когда забирали доход фермы
                 'active_skin': 'TEXT DEFAULT "classic"',    # скин большой печеньки
@@ -238,6 +242,20 @@ class DataBase:
                 'milestone_key': 'TEXT',
                 'claimed_at': 'REAL DEFAULT 0',
             },
+            # Забранные награды батл-пасса — СТРОКАМИ, а не json-списком в users.
+            # Список читался, дополнялся в питоне и записывался целиком: два
+            # клейма подряд затирали друг друга, один уровень терялся и его можно
+            # было забрать второй раз. Строка + UNIQUE делают клейм атомарным.
+            # season_id в ключе: сезонный сброс теперь не UPDATE на всех, а просто
+            # другой набор строк.
+            'bp_claims': {
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER',
+                'season_id': 'INTEGER',
+                'track': 'TEXT',               # 'free' | 'premium'
+                'level': 'INTEGER',
+                'claimed_at': 'REAL DEFAULT 0',
+            },
             'duels': {  # асинхронная дуэль 1x1: кто больше напечёт за сутки
                 'id': 'INTEGER PRIMARY KEY',
                 'user_a': 'INTEGER',           # создатель, ждёт соперника
@@ -373,6 +391,8 @@ class DataBase:
         "achievements": {"cols": ("user_id", "key")},
         "promo_redemptions": {"cols": ("user_id", "code")},
         "ref_claims": {"cols": ("user_id", "milestone_key")},
+        # награда пасса забирается один раз за сезон
+        "bp_claims": {"cols": ("user_id", "season_id", "track", "level")},
         "season_results": {"cols": ("season_id", "user_id")},
         "click_batches": {"cols": ("user_id", "batch_id")},
         "collection": {"cols": ("user_id", "item_level")},
@@ -570,6 +590,9 @@ class DataBase:
         if self._migration("backfill_best_item_level"):
             self._backfill_best_item_level()
             self._mark("backfill_best_item_level")
+        if self._migration("backfill_bp_claims"):
+            self._backfill_bp_claims()
+            self._mark("backfill_bp_claims")
         self.connection.commit()
 
     def _backfill_best_item_level(self):
@@ -595,6 +618,48 @@ class DataBase:
             WHERE best_item_level = 0""")
         if cur.rowcount:
             print(f"[*] Миграция: рекорд тира проставлен {cur.rowcount} игрокам")
+
+    def _backfill_bp_claims(self):
+        """Переносит забранные награды пасса из json-списков в строки bp_claims.
+
+        Без переноса миграция ДАРИТ награды: код после неё смотрит только на
+        строки, а у всех существующих игроков строк нет — весь пройденный пасс
+        можно забрать второй раз.
+
+        INSERT без ON CONFLICT намеренно: уникальный индекс на bp_claims в этот
+        момент ещё не создан (_dedupe_and_unique зовётся после _auto_migrate),
+        так что арбитр конфликта не существует. Разовость даёт журнал миграций, а
+        дубли внутри одного json-списка снимает set; всё, что всё-таки просочится,
+        схлопнет _dedupe_and_unique следом.
+
+        Битый json (обрезанная строка от древнего сбоя) молча пропускаем: потерять
+        отметку об одной награде дешевле, чем не подняться вовсе."""
+        cur = self.cursor
+        cur.execute("SELECT user_id, season_id, bp_claimed_free, bp_claimed_premium "
+                    "FROM users WHERE COALESCE(bp_claimed_free, '[]') <> '[]' "
+                    "   OR COALESCE(bp_claimed_premium, '[]') <> '[]'")
+        rows = cur.fetchall()
+        now = time.time()
+        moved = 0
+        for row in rows:
+            for track, col in (("free", "bp_claimed_free"),
+                               ("premium", "bp_claimed_premium")):
+                try:
+                    levels = json.loads(row[col] or "[]")
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(levels, list):
+                    continue
+                for lvl in sorted({int(x) for x in levels
+                                   if isinstance(x, (int, float))}):
+                    cur.execute(
+                        "INSERT INTO bp_claims (user_id, season_id, track, level, "
+                        "claimed_at) VALUES (?, ?, ?, ?, ?)",
+                        (row["user_id"], row["season_id"] or 0, track, lvl, now))
+                    moved += 1
+        if moved:
+            print(f"[*] Миграция: {moved} наград пасса перенесено в bp_claims "
+                  f"({len(rows)} игроков)")
 
     # ---------- соединение (по потокам) ----------
 

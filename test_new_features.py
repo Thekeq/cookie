@@ -452,6 +452,65 @@ for _ in range(cfg.STATE_PER_MINUTE + 2):
 check("state endpoint rate limited", last.status_code == 429, str(last.status_code))
 gl._rate_buckets.clear()
 
+# --- батл-пасс: награда забирается строкой, а не json-списком ---
+gl._rate_buckets.clear()
+db.exec("DELETE FROM bp_claims WHERE user_id = ?", (UID,))
+db.update_user(UID, bp_xp=cfg.bp_total_xp(3), bp_premium=0)
+
+
+def bp_claim(level, track="free"):
+    return c.post("/api/battlepass/claim",
+                  json={"level": level, "track": track}, headers=H(UID))
+
+
+def bp_rows():
+    return db.q1("SELECT COUNT(*) c FROM bp_claims WHERE user_id = ?", (UID,))["c"]
+
+
+_season = db.get_user(UID)["season_id"]
+r = c.get("/api/battlepass", headers=H(UID))
+_lv = {x["level"]: x for x in r.json()["levels"]}
+check("bp: 3 уровня открыто", _lv[3]["reached"] and not _lv[4]["reached"])
+check("bp: ничего не забрано", not _lv[1]["free_claimed"])
+
+_before = db.get_user(UID)["cookies"]
+r = bp_claim(1)
+check("bp: награда выдана", r.status_code == 200, r.text[:150])
+check("bp: печеньки начислены", db.get_user(UID)["cookies"] > _before)
+check("bp: клейм оставил строку", bp_rows() == 1)
+r = bp_claim(1)
+check("bp: повторный клейм отбит", r.status_code == 400
+      and r.json()["detail"] == "err_claimed", r.text[:100])
+
+# два разных уровня — тот самый потерянный апдейт json-списка
+r = bp_claim(2)
+check("bp: второй уровень тоже выдан", r.status_code == 200, r.text[:150])
+check("bp: обе отметки уцелели", bp_rows() == 2, bp_rows())
+r = c.get("/api/battlepass", headers=H(UID))
+_lv = {x["level"]: x for x in r.json()["levels"]}
+check("bp: GET видит обе отметки",
+      _lv[1]["free_claimed"] and _lv[2]["free_claimed"] and not _lv[3]["free_claimed"])
+
+r = bp_claim(1, "premium")
+check("bp: премиум-трек закрыт без премиума", r.status_code == 400
+      and r.json()["detail"] == "err_need_premium", r.text[:100])
+r = bp_claim(4)
+check("bp: недобранный уровень закрыт", r.status_code == 400
+      and r.json()["detail"] == "err_bp_locked", r.text[:100])
+r = bp_claim(1, "gold")
+check("bp: неизвестный трек отбит", r.status_code == 400, r.text[:100])
+
+# трек — часть ключа: премиум того же уровня выдаётся независимо от бесплатного
+db.update_user(UID, bp_premium=1)
+r = bp_claim(1, "premium")
+check("bp: премиум того же уровня выдан", r.status_code == 200, r.text[:150])
+check("bp: премиум добавил свою строку", bp_rows() == 3, bp_rows())
+
+# сезон — часть ключа: отметки прошлого сезона новый не блокируют
+db.exec("UPDATE bp_claims SET season_id = ? WHERE user_id = ?", (_season - 1, UID))
+r = bp_claim(1)
+check("bp: прошлый сезон не блокирует новый", r.status_code == 200, r.text[:150])
+
 # --- админские поля валидируются схемой ---
 from server.routers.admin import PromoCreate
 import pydantic
@@ -464,7 +523,7 @@ except pydantic.ValidationError:
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
           "ref_claims", "achievements", "boosts", "purchases", "orders",
-          "collection", "events", "click_batches"):
+          "collection", "events", "click_batches", "bp_claims"):
     db.exec(f"DELETE FROM {t} WHERE user_id IN (?, ?)", (UID, UID2))
 db.exec("DELETE FROM referrals WHERE referrer_id = ? OR referred_id IN (?, ?)",
         (UID, UID, UID2))

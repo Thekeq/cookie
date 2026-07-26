@@ -79,10 +79,13 @@ def league_brackets() -> list[tuple[str, int, int | None]]:
 SEASON_RESET_CHUNK = 500        # юзеров за один проход ролловера
 
 
+# bp_claimed_free/bp_claimed_premium тут больше не чистятся: забранные награды
+# живут строками bp_claims с season_id в ключе, поэтому новый сезон — просто
+# другой набор строк, сбрасывать нечего. Колонки остались в схеме нетронутыми,
+# чтобы откат кода на прошлую версию не потерял историю.
 _SEASON_RESET_SQL = (
     "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
-    "bp_premium = bp_premium_next, bp_premium_next = 0, "
-    "bp_claimed_free = '[]', bp_claimed_premium = '[]' ")
+    "bp_premium = bp_premium_next, bp_premium_next = 0 ")
 
 
 def _ensure_season_snapshot(season: int):
