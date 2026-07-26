@@ -802,15 +802,23 @@ class DataBase:
         return self.q1("SELECT * FROM users WHERE user_id = ?", (user_id,))
 
     def create_user(self, user_id, username, first_name, referrer_id=None, source_code=None):
+        """Возвращает (строка игрока, создали ли её ИМЕННО МЫ).
+
+        Второй элемент — не удобство, а разрешение на разовые действия
+        регистрации: бонус за реферала, счётчик источника, флаг just_registered.
+        Два запроса /auth от одного нового игрока (двойной тап по кнопке Mini
+        App) оба видят пустую базу, но вставка проходит ровно у одного; тот, кто
+        проиграл, получает чужую строку и False, и платить по ней нельзя."""
         now = time.time()
-        self.exec(
+        fresh = self.q1w(
             "INSERT INTO users (user_id, username, first_name, referrer_id, "
             "source_code, energy_updated_at, passive_collected_at, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT (user_id) DO NOTHING",
+            "ON CONFLICT (user_id) DO NOTHING "
+            "RETURNING user_id",
             (user_id, username, first_name, referrer_id, source_code, now, now, now),
         )
-        return self.get_user(user_id)
+        return self.get_user(user_id), fresh is not None
 
     def update_user(self, user_id, **fields):
         cols = ", ".join(f"{k} = ?" for k in fields)

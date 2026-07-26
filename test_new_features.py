@@ -164,8 +164,30 @@ if res and res["rank"] <= 10:
     check("season reward paid", db.get_user(UID)["cookies"] > 0)
 
 # --- ref milestones ---
+_inviter_before = db.get_user(UID)["cookies"]
 r = c.post("/api/auth", headers=H(UID2, username="friend", start_param=f"ref_{UID}"))
 check("referral registered", r.status_code == 200)
+check("referral marked as new", r.json()["just_registered"] is True)
+_ref_bonus = db.get_user(UID)["cookies"] - _inviter_before
+check("inviter paid", _ref_bonus > 0, _ref_bonus)
+check("newcomer paid", db.get_user(UID2)["cookies"] >= cfg.REF_REWARD_REFERRED)
+check("newcomer got current season",
+      db.get_user(UID2)["season_id"] == gl.current_season())
+# повторный /auth — не регистрация: строка уже есть, бонус второй раз не идёт
+r = c.post("/api/auth", headers=H(UID2, username="friend", start_param=f"ref_{UID}"))
+check("second auth is not a registration", r.json()["just_registered"] is False)
+check("inviter not paid twice",
+      abs(db.get_user(UID)["cookies"] - (_inviter_before + _ref_bonus)) < 1e-6)
+check("one referral row", db.q1(
+    "SELECT COUNT(*) c FROM referrals WHERE referred_id = ?", (UID2,))["c"] == 1)
+# гонка двух /auth: вставку выигрывает один, платит тоже он
+_race = UID2 + 500
+db.exec("DELETE FROM users WHERE user_id = ?", (_race,))
+_u1, _c1 = db.create_user(_race, "race", "Race")
+_u2, _c2 = db.create_user(_race, "race", "Race")
+check("create_user reports the winner", (_c1, _c2) == (True, False))
+check("loser still gets the row", _u2 and _u2["user_id"] == _race)
+db.exec("DELETE FROM users WHERE user_id = ?", (_race,))
 db.update_user(UID2, level=cfg.REF_QUALIFY_LEVEL)   # реферал дошёл до квалификации
 r = c.get("/api/referrals", headers=H(UID))
 ms = {m["key"]: m for m in r.json()["milestones"]}

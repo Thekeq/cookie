@@ -84,8 +84,11 @@ async def on_paid(message: Message):
     # факт оплаты фиксируем СРАЗУ отдельным коммитом: даже если выдача упадёт,
     # запись 'paid' переживёт сбой и покупка будет довыдана (retry или /auth)
     db.exec(
-        "INSERT OR IGNORE INTO purchases (user_id, item_key, stars_amount, "
-        "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'paid', ?)",
+        "INSERT INTO purchases (user_id, item_key, stars_amount, "
+        "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'paid', ?) "
+        # арбитр — частичный уникальный индекс по непустому charge_id; сюда мы
+        # доходим только с charge_id на руках, так что NULL-строки не мешают
+        "ON CONFLICT (tg_payment_id) WHERE tg_payment_id IS NOT NULL DO NOTHING",
         (user_id, item_key, sp.total_amount, charge_id, time.time()))
 
     # выдача атомарна и идемпотентна: статус перечитывается внутри транзакции

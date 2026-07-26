@@ -35,25 +35,41 @@ async def auth(tg: dict = Depends(tg_user)):
             code = sp[4:]
             if db.q1("SELECT id FROM sources WHERE code = ?", (code,)):
                 source_code = code
-                db.exec("UPDATE sources SET registrations = registrations + 1 WHERE code = ?", (code,))
 
-        user = db.create_user(tg["id"], tg["username"], tg["first_name"],
-                              referrer_id=referrer_id, source_code=source_code)
-        db.update_user(tg["id"], season_id=gl.current_season())
-        just_registered = True
-
-        # взаимная награда за реферала — сразу обоим
-        if referrer_id:
-            db.exec("INSERT INTO referrals (referrer_id, referred_id, created_at) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (referred_id) DO NOTHING",
-                    (referrer_id, tg["id"], time.time()))
-            # награды масштабируются доходом ПРИГЛАСИВШЕГО: для ветерана
-            # 1000 печенек — доли секунды, приглашать было незачем
-            gl.add_cookies(referrer_id, cfg.scaled_reward(
-                cfg.REF_REWARD_REFERRER, "referrer",
-                gl.hourly_income(referrer_id)), count_earned=False)
-            gl.add_cookies(tg["id"], cfg.REF_REWARD_REFERRED, count_earned=False)
+        # Вся регистрация — одним куском. Раньше строка игрока, его сезон,
+        # запись реферала и две награды коммитились по отдельности: сбой в
+        # середине оставлял игрока без сезона или реферала без награды, а два
+        # запроса /auth вплотную (двойной тап по кнопке Mini App) оба проходили
+        # проверку «юзера нет» и оба платили бонус за одного приглашённого.
+        # Право на разовое решает вставка: платит только тот, кто создал строку.
+        with db.tx():
+            user, created = db.create_user(
+                tg["id"], tg["username"], tg["first_name"],
+                referrer_id=referrer_id, source_code=source_code)
+            if created:
+                db.update_user(tg["id"], season_id=gl.current_season())
+                just_registered = True
+                if source_code:
+                    # счётчик источника внутри той же охраны: раньше он тикал до
+                    # создания юзера, и проигравший гонку запрос его удваивал
+                    db.exec("UPDATE sources SET registrations = registrations + 1 "
+                            "WHERE code = ?", (source_code,))
+                # взаимная награда за реферала — сразу обоим
+                if referrer_id and db.exec(
+                        "INSERT INTO referrals (referrer_id, referred_id, created_at) "
+                        "VALUES (?, ?, ?) "
+                        "ON CONFLICT (referred_id) DO NOTHING",
+                        (referrer_id, tg["id"], time.time())):
+                    # награды масштабируются доходом ПРИГЛАСИВШЕГО: для ветерана
+                    # 1000 печенек — доли секунды, приглашать было незачем
+                    gl.add_cookies(referrer_id, cfg.scaled_reward(
+                        cfg.REF_REWARD_REFERRER, "referrer",
+                        gl.hourly_income(referrer_id)), count_earned=False,
+                        operation_id=f"ref_bonus:{tg['id']}", reason="ref_referrer")
+                    gl.add_cookies(tg["id"], cfg.REF_REWARD_REFERRED,
+                                   count_earned=False,
+                                   operation_id=f"ref_join:{tg['id']}",
+                                   reason="ref_referred")
 
     # синкаем язык Mini App в профиль — бот использует его для /start и пушей
     if user.get("lang") != tg["lang"]:
