@@ -829,36 +829,69 @@ def prestige_kept_level(level: int) -> int:
 
 
 def do_prestige(user: dict) -> dict:
-    """Сбрасывает прогресс за постоянный множитель. Возвращает {gained, points, multiplier}."""
-    st = prestige_state(user)
-    if not st["can_prestige"]:
-        raise ValueError("err_prestige_early")
-    new_points = user["prestige_points"] + st["gain_available"]
+    """Сбрасывает прогресс за постоянный множитель. Возвращает {gained, points, multiplier}.
+
+    Право на перерождение перепроверяется ВНУТРИ транзакции и по свежей строке:
+    словарь, пришедший из ручки, к этому моменту уже устарел (между чтением и
+    записью успевает встать сбор фермы, клик, награда). Раньше проверка стояла
+    только снаружи, и два нажатия вплотную оба её проходили — очки начислялись
+    дважды за один и тот же total_earned.
+
+    Гарантию даёт не проверка, а условие `prestige_count = ?`: если параллельный
+    запрос переродил профиль первым, счётчик уже другой, наш UPDATE не проходит
+    вовсе, и мы отвечаем err_prestige_early вместо второго начисления.
+
+    Обнуление печенек, откат XP и выдача очков — движения в книге, а не тихий
+    UPDATE. Раньше все три колонки писались напрямую: сверка видела расхождение
+    на весь баланс, и после первого же перерождения игрок навсегда выпадал из
+    контроля за экономикой. Суммы берём фактические (после − до), а не
+    расчётные, — иначе книга описывала бы не то, что произошло."""
     uid = user["user_id"]
-    # Уровень сохраняется частично. Полный откат на 1-й означал заново
-    # проходить все req_level зданий и предметов, а множитель престижа этого
-    # не ускорял — перерождаться было невыгодно ни в какой момент.
-    kept_level = prestige_kept_level(user["level"])
-    # сохраняем: скины, ачивки, рефералов, стрик, БП сезона, покупки Stars, бусты.
-    # Сброс и начисление очков — одна транзакция: полустёртого профиля не бывает
     with db.tx():
+        before = db.get_user(uid)
+        if not before:
+            raise ValueError("err_no_user")
+        st = prestige_state(before)
+        if not st["can_prestige"]:
+            raise ValueError("err_prestige_early")
+        gain = st["gain_available"]
+        new_points = int(before["prestige_points"]) + gain
+        # Уровень сохраняется частично. Полный откат на 1-й означал заново
+        # проходить все req_level зданий и предметов, а множитель престижа этого
+        # не ускорял — перерождаться было невыгодно ни в какой момент.
+        kept_level = prestige_kept_level(before["level"])
+        kept_xp = cfg.xp_for_level(kept_level)
+        now = time.time()
+        # сохраняем: скины, ачивки, рефералов, стрик, БП сезона, покупки Stars, бусты
         db.exec("DELETE FROM board WHERE user_id = ?", (uid,))
         db.exec("DELETE FROM farm WHERE user_id = ?", (uid,))
         db.exec("DELETE FROM upgrades WHERE user_id = ?", (uid,))
         # незавершённые заказы выписаны под старый доход: цель «заработай 60M»
         # недостижима на 1 уровне, а награда по ней была бы читом
         db.exec("DELETE FROM orders WHERE user_id = ? AND status != 'done'", (uid,))
-        db.update_user(
-            uid,
-            cookies=0, click_level=1,
-            level=kept_level, xp=cfg.xp_for_level(kept_level),
-            energy=cfg.max_energy(kept_level), energy_updated_at=time.time(),
-            passive_collected_at=time.time(), farm_collected_at=time.time(),
-            combo_mult=1,
-            prestige_points=new_points,
-            prestige_count=user["prestige_count"] + 1,
-        )
-    return {"gained": st["gain_available"], "points": int(new_points),
+        row = db.q1w(
+            "UPDATE users SET cookies = 0, click_level = 1, "
+            "level = ?, xp = ?, "
+            # энергия наливается по потолку УЖЕ БЕЗ апгрейдов: их строки удалены
+            # выше в этой же транзакции, поэтому cfg.max_energy и есть новый бак
+            "energy = ?, energy_updated_at = ?, "
+            "passive_collected_at = ?, farm_collected_at = ?, combo_mult = 1, "
+            "prestige_points = ?, prestige_count = prestige_count + 1, "
+            "user_revision = user_revision + 1 "
+            "WHERE user_id = ? AND prestige_count = ? "
+            "RETURNING cookies, xp, prestige_points",
+            (kept_level, kept_xp, cfg.max_energy(kept_level), now, now, now,
+             new_points, uid, before["prestige_count"]))
+        if row is None:                     # кто-то переродился первым
+            raise ValueError("err_prestige_early")
+        op = f"prestige:{uid}:{before['prestige_count']}"
+        for currency, moved, after in (
+                ("cookies", row["cookies"] - before["cookies"], row["cookies"]),
+                ("xp", row["xp"] - before["xp"], row["xp"]),
+                ("prestige_points", gain, row["prestige_points"])):
+            if moved:
+                economy.record(uid, currency, moved, "prestige_reset", after, op)
+    return {"gained": gain, "points": int(new_points),
             "kept_level": kept_level,
             "multiplier": cfg.prestige_multiplier(new_points)}
 

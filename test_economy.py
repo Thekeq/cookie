@@ -6,8 +6,8 @@
   3. после обычной сессии сумма движений СХОДИТСЯ с колонкой — а если кто-то
      напишет мимо книги, сверка это покажет.
 
-Известные незакрытые дыры (сознательно, каждая — свой шаг плана): сброс престижа
-обнуляет cookies напрямую (S14), отзыв покупки за Stars списывает напрямую (S17).
+Известные незакрытые дыры (сознательно, каждая — свой шаг плана): отзыв покупки
+за Stars списывает печеньки напрямую, мимо книги (S17).
 Реген и трата энергии не пишутся в книгу и не будут — энергия производная от
 времени, а не запас (см. LEDGERED_PARTIAL); в книгу идут только её выдачи.
 Поэтому drift сверяется по cookies, xp и total_earned — по тем валютам, которые
@@ -774,6 +774,54 @@ check("8h.14 уже возвращённое не возвращается вт�
       gl.revoke_charge(CID + "-b") is False)
 
 check("8h.15 пустой charge_id не выдаёт ничего", gl.fulfill_charge("") is False)
+
+# ==========================================================================
+# 8i. Престиж: обнуление и выдача очков — движения в книге, и ровно один раз
+# ==========================================================================
+PR = BASE + 17
+db.create_user(PR, "pr", "PR")
+gl.add_cookies(PR, 25_000_000.0)            # count_earned=True: даёт право на престиж
+gl.add_xp(PR, 5000.0)
+db.update_user(PR, level=10, click_level=8)
+check("8i.1 до престижа сверка чистая",
+      not [k for k, v in ec.reconcile(PR).items() if abs(v["drift"]) > 1e-6],
+      ec.reconcile(PR))
+
+_pr_before = db.get_user(PR)
+res = gl.do_prestige(_pr_before)
+check("8i.2 очки начислены", res["gained"] == 5 and res["points"] == 5, res)
+_after = db.get_user(PR)
+check("8i.3 печеньки обнулены", _after["cookies"] == 0, _after["cookies"])
+check("8i.4 сверка сходится по ВСЕМ валютам после престижа",
+      not [k for k, v in ec.reconcile(PR).items() if abs(v["drift"]) > 1e-6],
+      ec.reconcile(PR))
+_moves = [r for r in ledger(PR) if r["operation_id"] == f"prestige:{PR}:0"]
+check("8i.5 в книге три движения одной операцией",
+      sorted(r["currency"] for r in _moves)
+      == ["cookies", "prestige_points", "xp"], [r["currency"] for r in _moves])
+check("8i.6 списание печенек записано фактической суммой",
+      abs(next(r["amount"] for r in _moves if r["currency"] == "cookies")
+          + _pr_before["cookies"]) < 1e-6,
+      [r["amount"] for r in _moves])
+check("8i.7 total_earned престиж не трогает",
+      _after["total_earned"] == _pr_before["total_earned"])
+check("8i.8 движения престижа не считаются заработком",
+      all(r["counts_earned"] == 0 for r in _moves))
+
+# повтор с тем же (уже устаревшим) словарём: очки за один total_earned дважды
+# не выдаются — право перепроверяется по свежей строке внутри транзакции
+raises("8i.9 повторный престиж отбит", lambda: gl.do_prestige(_pr_before),
+       ValueError, "err_prestige_early")
+check("8i.10 очки не удвоились", db.get_user(PR)["prestige_points"] == 5)
+check("8i.11 второй записи в книге нет",
+      len([r for r in ledger(PR) if r["operation_id"] == f"prestige:{PR}:0"]) == 3)
+
+# охрана prestige_count: если параллельный запрос переродил профиль первым,
+# наш UPDATE не проходит вовсе — вместо второго начисления
+check("8i.12 UPDATE с устаревшим prestige_count не проходит",
+      db.q1w("UPDATE users SET prestige_points = 999 "
+             "WHERE user_id = ? AND prestige_count = ? RETURNING user_id",
+             (PR, 0)) is None)
 
 # ==========================================================================
 # 9. drift_report ловит запись мимо книги
