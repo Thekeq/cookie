@@ -194,8 +194,10 @@ async def upgrade_click(tg: dict = Depends(tg_user)):
         cost = cfg.click_upgrade_cost(user["click_level"], gl.income_base(tg["id"]))
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
-        db.update_user(tg["id"], cookies=user["cookies"] - cost,
-                       click_level=user["click_level"] + 1)
+        try:
+            gl.buy_click_upgrade(tg["id"], cost, user["click_level"])
+        except gl.NoFunds:
+            raise HTTPException(400, "err_no_cookies")
     return gl.full_state(tg["id"])
 
 
@@ -294,7 +296,11 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
         cell = _best_free_cell(free_cells, board)
-        db.update_user(tg["id"], cookies=user["cookies"] - cost)
+        try:
+            gl.spend_cookies(tg["id"], cost, "board_spawn",
+                             ref_type="item_level", ref_id=str(level))
+        except gl.NoFunds:
+            raise HTTPException(400, "err_no_cookies")
         # paid — фактически вложенное; от него считается возврат при переплавке
         db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, ?, ?, ?)",
                 (tg["id"], cell, level, cost))

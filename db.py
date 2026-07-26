@@ -109,6 +109,13 @@ class DataBase:
                 'orders_completed': 'INTEGER DEFAULT 0',
                 'orders_day': 'TEXT',                   # день счётчика заказов
                 'orders_day_count': 'INTEGER DEFAULT 0',
+                # --- версии состояния: клиент присылает свою, сервер отвергает
+                # ход, посчитанный от устаревшей картинки ---
+                'user_revision': 'INTEGER NOT NULL DEFAULT 0',
+                'board_revision': 'INTEGER NOT NULL DEFAULT 0',
+                # долг: возврат Stars забирает больше, чем есть на балансе, —
+                # остаток висит здесь, а не уводит баланс в минус
+                'cookie_debt': 'REAL NOT NULL DEFAULT 0',
             },
             'events': {  # аналитика: одно событие = одна строка
                 'id': 'INTEGER PRIMARY KEY',
@@ -247,6 +254,56 @@ class DataBase:
                 'claimed_b': 'INTEGER DEFAULT 0',
                 'reward': 'REAL DEFAULT 0',
             },
+            # --- экономика: книга движений и токены операций ---
+            'economy_ledger': {  # НЕИЗМЕНЯЕМАЯ книга: строка = одно движение валюты
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER NOT NULL',
+                'operation_id': 'TEXT NOT NULL',   # токен операции (см. economy_ops)
+                'seq': 'INTEGER NOT NULL DEFAULT 0',  # номер движения внутри операции
+                'currency': 'TEXT NOT NULL',       # cookies | xp | bp_xp | energy | ...
+                'amount': 'REAL NOT NULL',         # со знаком: минт > 0, трата < 0
+                'reason': 'TEXT NOT NULL',         # за что (daily, farm_building, ...)
+                'ref_type': 'TEXT',                # на что ссылается (order, building)
+                'ref_id': 'TEXT',
+                'balance_after': 'REAL NOT NULL',  # баланс сразу после движения
+                'counts_earned': 'INTEGER NOT NULL DEFAULT 0',  # пошло в total_earned
+                'season_id': 'INTEGER',
+                'external': 'INTEGER NOT NULL DEFAULT 0',  # валюта вне users (Stars)
+                'created_at': 'REAL NOT NULL DEFAULT 0',
+                # NaN: на SQLite он ложится как NULL и его ловит NOT NULL,
+                # на PostgreSQL NaN хранится честно — и его ловит CHECK
+                '__constraints__': [
+                    "CHECK (amount = amount)",
+                    "CHECK (balance_after = balance_after)",
+                    "CHECK (amount > -1e15 AND amount < 1e15)",
+                    "CHECK (balance_after > -1e15 AND balance_after < 1e15)",
+                ],
+                # книга только дописывается: правка задним числом уничтожает
+                # весь смысл сверки
+                '__after_create__': [
+                    "CREATE TRIGGER IF NOT EXISTS trg_ledger_no_update "
+                    "BEFORE UPDATE ON economy_ledger "
+                    "BEGIN SELECT RAISE(ABORT, 'economy_ledger is append-only'); END",
+                    "CREATE TRIGGER IF NOT EXISTS trg_ledger_no_delete "
+                    "BEFORE DELETE ON economy_ledger "
+                    "BEGIN SELECT RAISE(ABORT, 'economy_ledger is append-only'); END",
+                ],
+            },
+            'economy_ops': {  # токен операции: ретрай не выдаёт награду второй раз
+                'id': 'INTEGER PRIMARY KEY',
+                'operation_id': 'TEXT NOT NULL',
+                'user_id': 'INTEGER NOT NULL',
+                'kind': 'TEXT NOT NULL',
+                'status': 'TEXT NOT NULL DEFAULT "open"',
+                'response': 'TEXT',        # ответ первого запроса, отдаётся ретраю
+                'created_at': 'REAL NOT NULL DEFAULT 0',
+            },
+            'economy_opening': {  # входящие остатки: с чем игрок пришёл в книгу
+                'user_id': 'INTEGER PRIMARY KEY',
+                'total_earned': 'REAL NOT NULL DEFAULT 0',
+                'season_earned': 'REAL NOT NULL DEFAULT 0',
+                'captured_at': 'REAL NOT NULL DEFAULT 0',
+            },
             'season_results': {  # снапшот топа прошедших сезонов + выданные награды
                 'id': 'INTEGER PRIMARY KEY',
                 'season_id': 'INTEGER',
@@ -288,7 +345,15 @@ class DataBase:
         # fulfill_pending перебирает зависшие покупки на каждом /auth
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_purchases_user ON purchases(user_id, status)")
+        # сверка баланса читает книгу по игроку, разбор инцидента — по причине
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_user ON economy_ledger(user_id, created_at)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_reason ON economy_ledger(reason, created_at)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_user ON economy_ops(user_id, created_at)")
         self._dedupe_and_unique(db_file)
+        self._install_invariants()
         self.connection.commit()
 
     # Наборы колонок, которые обязаны быть уникальными; код и так это проверяет,
@@ -316,6 +381,11 @@ class DataBase:
         "purchases": {"cols": ("tg_payment_id",),
                       "where": "tg_payment_id IS NOT NULL",
                       "index": "uq_purchases_charge"},
+        # книга: повтор операции не создаёт второе движение
+        "economy_ledger": {"cols": ("operation_id", "currency", "seq")},
+        # токен операции: на PostgreSQL второй worker заблокируется на этом
+        # индексе, дождётся коммита первого и прочитает готовый ответ
+        "economy_ops": {"cols": ("operation_id",)},
     }
 
     # Схлопывание дублей С УЧЁТОМ ДАННЫХ: там, где лишнюю строку нельзя просто
@@ -452,6 +522,24 @@ class DataBase:
                     f"В таблице {table} есть дубли по {cols}, уникальный индекс "
                     f"{name} не создаётся. Дедуп уже применялся — разберись с "
                     f"причиной, автоматически удалять строки небезопасно.") from e
+
+    def _install_invariants(self):
+        """Серверные инварианты на балансы.
+
+        users — существующая таблица, а CHECK нельзя добавить через ALTER, так
+        что роль ограничения играет триггер. Ловит не игровую ситуацию, а
+        арифметику, вышедшую из-под контроля: NaN (в SQLite он ложится как
+        NULL), бесконечность, переполнение. Пол в -1e6, а не в нуле: откат
+        покупки имеет право увести баланс в ноль, остаток уходит в cookie_debt,
+        и небольшой минус тут не аварийная ситуация, а запас на округления."""
+        if not self._migration("invariants:users_balance"):
+            return
+        self.cursor.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_users_balance_sane "
+            "BEFORE UPDATE OF cookies ON users "
+            "WHEN NEW.cookies IS NULL OR NEW.cookies < -1e6 OR NEW.cookies > 1e15 "
+            "BEGIN SELECT RAISE(ABORT, 'balance_insane'); END")
+        self._mark("invariants:users_balance")
 
     def _auto_migrate(self):
         """ Умная система: создает таблицы или добавляет новые столбцы на лету """
@@ -661,3 +749,20 @@ class DataBase:
     def update_user(self, user_id, **fields):
         cols = ", ".join(f"{k} = ?" for k in fields)
         self.exec(f"UPDATE users SET {cols} WHERE user_id = ?", (*fields.values(), user_id))
+
+
+_shared: "DataBase | None" = None
+
+
+def shared() -> DataBase:
+    """Единственный экземпляр базы на процесс.
+
+    Раньше он жил в game_logic, и любому новому модулю оставалось либо тянуть
+    game_logic (кольцевой импорт), либо завести ВТОРОЙ DataBase. Второй — это
+    второе соединение, то есть своя транзакция: запись такого модуля не попала
+    бы в db.tx() вызывающего и коммитилась бы отдельно. Ровно то, чего книга
+    операций не переживает."""
+    global _shared
+    if _shared is None:
+        _shared = DataBase(os.environ.get("DATABASE_PATH", "data.db"))
+    return _shared

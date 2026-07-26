@@ -92,7 +92,11 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
         cost = cfg.building_cost(body.key, owned)
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
-        db.update_user(tg["id"], cookies=user["cookies"] - cost)
+        try:
+            gl.spend_cookies(tg["id"], cost, "farm_building",
+                             ref_type="building", ref_id=body.key)
+        except gl.NoFunds:
+            raise HTTPException(400, "err_no_cookies")
         db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, ?, 1) "
                 "ON CONFLICT(user_id, building_key) DO UPDATE SET count = count + 1",
                 (tg["id"], body.key))
@@ -118,7 +122,11 @@ async def buy_upgrade(body: KeyIn, tg: dict = Depends(tg_user)):
         user = gl.collect_all(tg["id"])
         if user["cookies"] < u["cost"]:
             raise HTTPException(400, "err_no_cookies")
-        db.update_user(tg["id"], cookies=user["cookies"] - u["cost"])
+        try:
+            gl.spend_cookies(tg["id"], u["cost"], "farm_upgrade",
+                             ref_type="upgrade", ref_id=body.key)
+        except gl.NoFunds:
+            raise HTTPException(400, "err_no_cookies")
         db.exec("INSERT OR IGNORE INTO upgrades (user_id, upgrade_key) VALUES (?, ?)",
                 (tg["id"], body.key))
     return await farm_state(tg)
@@ -140,7 +148,11 @@ async def buy_skin(body: KeyIn, tg: dict = Depends(tg_user)):
         user = gl.collect_all(tg["id"])
         if user["cookies"] < s["cost"]:
             raise HTTPException(400, "err_no_cookies")
-        db.update_user(tg["id"], cookies=user["cookies"] - s["cost"])
+        try:
+            gl.spend_cookies(tg["id"], s["cost"], "skin_purchase",
+                             ref_type="skin", ref_id=body.key)
+        except gl.NoFunds:
+            raise HTTPException(400, "err_no_cookies")
         db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
                 (tg["id"], body.key))
     return await farm_state(tg)

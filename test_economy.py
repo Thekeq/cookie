@@ -1,0 +1,438 @@
+"""Книга операций: инварианты, идемпотентность, атомарность трат, сверка.
+
+Три вещи, ради которых написан файл:
+  1. баланс нельзя испортить (NaN, бесконечность, абсурдная величина);
+  2. книгу нельзя переписать задним числом;
+  3. после обычной сессии сумма движений СХОДИТСЯ с колонкой — а если кто-то
+     напишет мимо книги, сверка это покажет.
+
+Известные незакрытые дыры (сознательно, каждая — свой шаг плана): реген и трата
+энергии в книгу не пишутся вовсе, xp/bp_xp ещё не переведены на ledger (S7-S8),
+сброс престижа обнуляет cookies напрямую (S14), отзыв покупки за Stars списывает
+напрямую (S17). Поэтому drift сверяется по cookies и total_earned — по тем
+валютам, которые УЖЕ полностью в книге.
+"""
+import hashlib
+import hmac
+import json
+import math
+import os
+import sqlite3
+import sys
+import time
+from urllib.parse import urlencode
+
+os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
+# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается
+import tempfile
+os.environ["DATABASE_PATH"] = os.path.join(
+    tempfile.gettempdir(), f"cookie_econ_{os.getpid()}.db")
+
+from fastapi.testclient import TestClient
+
+from main import app
+import server.economy as ec
+import server.game_logic as gl
+import server.game_config as cfg
+from server.game_logic import db
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+c = TestClient(app)
+
+_ok = _fail = 0
+
+
+def check(name, cond, extra=""):
+    global _ok, _fail
+    if cond:
+        _ok += 1
+        print(f"OK   {name}")
+    else:
+        _fail += 1
+        print(f"FAIL {name} {extra}")
+
+
+def raises(name, fn, exc=Exception, match=""):
+    """Проверяет, что вызов падает нужным типом (и, если задано, с нужным текстом)."""
+    try:
+        fn()
+    except exc as e:
+        check(name, (match in str(e)) if match else True, f"текст: {e}")
+        return
+    except Exception as e:  # упало, но не тем
+        check(name, False, f"ожидали {exc.__name__}, получили {type(e).__name__}: {e}")
+        return
+    check(name, False, "не упало вовсе")
+
+
+def sign(user_id, username="econ", first_name="Econ"):
+    data = {"user": json.dumps({"id": user_id, "username": username,
+                                "first_name": first_name}),
+            "auth_date": str(int(time.time()))}
+    dcs = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    data["hash"] = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+    return urlencode(data)
+
+
+def H(uid):
+    return {"Authorization": "tma " + sign(uid)}
+
+
+def ledger(uid, currency=None):
+    sql = "SELECT * FROM economy_ledger WHERE user_id = ?"
+    p = [uid]
+    if currency:
+        sql += " AND currency = ?"
+        p.append(currency)
+    return db.q(sql + " ORDER BY id", tuple(p))
+
+
+BASE = 970_000_000 + int(time.time()) % 1_000_000
+
+# ==========================================================================
+# 0. Входящие остатки: игрок, пришедший в игру ДО книги
+#    Идёт первым: backfill проходит по всем игрокам сразу, и запускать его
+#    после того, как у остальных появилась история, значило бы приписать им
+#    вторые «входящие» поверх настоящих движений.
+# ==========================================================================
+OLD = BASE
+db.create_user(OLD, "old", "Old")
+db.update_user(OLD, cookies=12345.5, total_earned=99999.0, xp=700.0,
+               prestige_points=3)
+
+check("0.1 старый игрок без книги — сверка видит расхождение",
+      abs(ec.reconcile(OLD)["cookies"]["drift"] - 12345.5) < 1e-6,
+      ec.reconcile(OLD)["cookies"])
+
+db.exec("DELETE FROM schema_migrations WHERE name = ?", ("backfill:ledger_opening",))
+ec.backfill_opening()
+
+st = ec.reconcile(OLD)
+check("0.2 после backfill cookies сходятся", abs(st["cookies"]["drift"]) < 1e-6, st["cookies"])
+check("0.3 после backfill total_earned сходится",
+      abs(st["total_earned"]["drift"]) < 1e-6, st["total_earned"])
+check("0.4 входящий остаток — одна строка на валюту",
+      len(ledger(OLD, "cookies")) == 1 and ledger(OLD, "cookies")[0]["reason"] == "opening_balance")
+check("0.5 нулевые валюты входящих строк не получили",
+      len(ledger(OLD, "offline_hours")) == 0)
+check("0.6 снимок earned сохранён",
+      (db.q1("SELECT total_earned FROM economy_opening WHERE user_id = ?",
+             (OLD,)) or {}).get("total_earned") == 99999.0)
+
+ec.backfill_opening()  # повторный вызов после отметки — должен быть no-op
+check("0.7 backfill не повторяется", len(ledger(OLD, "cookies")) == 1)
+
+# ==========================================================================
+# 1. Инварианты баланса (триггер trg_users_balance_sane)
+# ==========================================================================
+U = BASE + 1
+db.create_user(U, "u", "U")
+gl.add_cookies(U, 1000.0)
+before = db.get_user(U)["cookies"]
+
+raises("1.1 NaN в баланс не пролезает",
+       lambda: db.update_user(U, cookies=float("nan")), sqlite3.IntegrityError)
+raises("1.2 бесконечность не пролезает",
+       lambda: db.update_user(U, cookies=float("inf")), sqlite3.IntegrityError)
+raises("1.3 абсурдный плюс не пролезает",
+       lambda: db.update_user(U, cookies=1e20), sqlite3.IntegrityError)
+raises("1.4 абсурдный минус не пролезает",
+       lambda: db.update_user(U, cookies=-2e6), sqlite3.IntegrityError)
+check("1.5 после отбитых записей баланс цел", db.get_user(U)["cookies"] == before)
+
+db.update_user(U, cookies=before)  # нормальная запись проходит
+check("1.6 нормальная запись проходит", db.get_user(U)["cookies"] == before)
+
+raises("1.7 NaN не доходит до SQL — его ловит _sane",
+       lambda: gl.add_cookies(U, float("nan")), ValueError, "err_bad_amount")
+raises("1.8 бесконечность ловится до SQL",
+       lambda: gl.add_cookies(U, float("inf")), ValueError, "err_bad_amount")
+raises("1.9 None ловится до SQL",
+       lambda: gl.add_cookies(U, None), ValueError, "err_bad_amount")
+raises("1.10 величина за пределом диапазона ловится до SQL",
+       lambda: gl.add_cookies(U, 1e16), ValueError, "err_bad_amount")
+check("1.11 отбитые начисления не оставили следа в книге",
+      len(ledger(U, "cookies")) == 1)
+
+# ==========================================================================
+# 2. Книга только дописывается
+# ==========================================================================
+rid = ledger(U, "cookies")[0]["id"]
+raises("2.1 строку книги нельзя изменить",
+       lambda: db.exec("UPDATE economy_ledger SET amount = 0 WHERE id = ?", (rid,)),
+       sqlite3.IntegrityError, "append-only")
+raises("2.2 строку книги нельзя удалить",
+       lambda: db.exec("DELETE FROM economy_ledger WHERE id = ?", (rid,)),
+       sqlite3.IntegrityError, "append-only")
+check("2.3 строка на месте и не тронута",
+      len(ledger(U, "cookies")) == 1 and ledger(U, "cookies")[0]["amount"] == 1000.0)
+
+# ==========================================================================
+# 3. record: повтор одной операции не удваивает движение
+# ==========================================================================
+R = BASE + 2
+db.create_user(R, "r", "R")
+op = "test-op-dup"
+ec.record(R, "cookies", 50, "unit", 50, op)
+raises("3.1 дубль (op, currency, seq) по умолчанию рвёт транзакцию",
+       lambda: ec.record(R, "cookies", 50, "unit", 50, op), sqlite3.IntegrityError)
+ec.record(R, "cookies", 50, "unit", 50, op, idempotent=True)
+check("3.1b с idempotent=True дубль гасится молча",
+      len(ledger(R, "cookies")) == 1)
+check("3.1c already_recorded видит записанное движение",
+      ec.already_recorded(op, "cookies") and not ec.already_recorded(op, "cookies", 9))
+ec.record(R, "cookies", 50, "unit", 100, op, seq=1)
+check("3.2 другой seq — законное второе движение той же операции",
+      len(ledger(R, "cookies")) == 2)
+ec.record(R, "xp", 10, "unit", 10, op)
+check("3.3 другая валюта той же операции пишется отдельно",
+      len(ledger(R, "xp")) == 1)
+ec.record(R, "stars", 100, "purchase", 0, "test-op-stars")
+check("3.4 Stars помечены как внешняя валюта", ledger(R, "stars")[0]["external"] == 1)
+check("3.5 внешняя валюта в сверку не входит", "stars" not in ec.reconcile(R))
+
+# ==========================================================================
+# 4. add_cookies
+# ==========================================================================
+A = BASE + 3
+db.create_user(A, "a", "A")
+bal = gl.add_cookies(A, 500.0, reason="test_mint", ref_type="unit", ref_id="x")
+row = ledger(A, "cookies")[-1]
+check("4.1 возвращён новый баланс", bal == 500.0, bal)
+check("4.2 колонка обновилась", db.get_user(A)["cookies"] == 500.0)
+check("4.3 в книге сумма, причина и ссылка",
+      row["amount"] == 500.0 and row["reason"] == "test_mint"
+      and row["ref_type"] == "unit" and row["ref_id"] == "x")
+check("4.4 balance_after совпадает с балансом", row["balance_after"] == 500.0)
+check("4.5 заработок засчитан", row["counts_earned"] == 1
+      and db.get_user(A)["total_earned"] == 500.0)
+
+gl.add_cookies(A, 300.0, count_earned=False, reason="compensation")
+check("4.6 count_earned=False не двигает total_earned",
+      db.get_user(A)["total_earned"] == 500.0)
+check("4.7 ...но движение в книге есть",
+      ledger(A, "cookies")[-1]["amount"] == 300.0
+      and ledger(A, "cookies")[-1]["counts_earned"] == 0)
+
+gl.add_cookies(A, -100.0, reason="penalty")
+check("4.8 отрицательное начисление не идёт в заработок",
+      db.get_user(A)["total_earned"] == 500.0 and db.get_user(A)["cookies"] == 700.0)
+
+raises("4.9 начисление несуществующему игроку падает",
+       lambda: gl.add_cookies(BASE + 999_999, 10.0), ValueError, "err_no_user")
+check("4.10 и не оставляет висячей строки в книге",
+      len(ledger(BASE + 999_999)) == 0)
+
+gl.add_cookies(A, 42.0, operation_id="fixed-op-1", reason="rewarded")
+second = gl.add_cookies(A, 42.0, operation_id="fixed-op-1", reason="rewarded")
+check("4.11 явный operation_id пишет ровно одну строку книги",
+      len([r for r in ledger(A, "cookies") if r["operation_id"] == "fixed-op-1"]) == 1)
+check("4.12 повтор по тому же токену НЕ двигает баланс второй раз",
+      db.get_user(A)["cookies"] == 742.0, db.get_user(A)["cookies"])
+check("4.13 идемпотентный повтор возвращает текущий баланс", second == 742.0, second)
+check("4.14 и не задваивает заработок", db.get_user(A)["total_earned"] == 542.0,
+      db.get_user(A)["total_earned"])
+check("4.15 после идемпотентного повтора сверка сходится",
+      abs(ec.reconcile(A)["cookies"]["drift"]) < 1e-6, ec.reconcile(A)["cookies"])
+
+# без токена повтор — законное второе начисление
+n = len(ledger(A, "cookies"))
+gl.add_cookies(A, 5.0, reason="tick")
+gl.add_cookies(A, 5.0, reason="tick")
+check("4.16 без токена два одинаковых начисления проходят оба",
+      len(ledger(A, "cookies")) == n + 2 and db.get_user(A)["cookies"] == 752.0)
+
+# дубль токена без предварительной проверки — рвёт транзакцию, а не молчит
+raises("4.17 record без idempotent на дубле падает, а не глушит",
+       lambda: ec.record(A, "cookies", 1, "unit", 0, "fixed-op-1"),
+       sqlite3.IntegrityError)
+check("4.18 сверка цела и после отбитого дубля",
+      abs(ec.reconcile(A)["cookies"]["drift"]) < 1e-6)
+
+# ==========================================================================
+# 5. spend_cookies — проверка и списание одним стейтментом
+# ==========================================================================
+S = BASE + 4
+db.create_user(S, "s", "S")
+gl.add_cookies(S, 1000.0)
+n_before = len(ledger(S, "cookies"))
+
+left = gl.spend_cookies(S, 250.0, "unit_spend", ref_type="thing", ref_id="k")
+check("5.1 списание вернуло остаток", left == 750.0, left)
+check("5.2 колонка уменьшилась", db.get_user(S)["cookies"] == 750.0)
+spent = ledger(S, "cookies")[-1]
+check("5.3 в книге трата со знаком минус", spent["amount"] == -250.0)
+check("5.4 трата не считается заработком",
+      spent["counts_earned"] == 0 and db.get_user(S)["total_earned"] == 1000.0)
+
+raises("5.5 списание сверх баланса отказывает",
+       lambda: gl.spend_cookies(S, 100_000.0, "too_much"), gl.NoFunds, "err_no_cookies")
+check("5.6 ПРИЁМКА: баланс после отказа не изменился",
+      db.get_user(S)["cookies"] == 750.0, db.get_user(S)["cookies"])
+check("5.7 ПРИЁМКА: отказ не написал строку в книгу",
+      len(ledger(S, "cookies")) == n_before + 1)
+check("5.8 после отказа сверка по-прежнему сходится",
+      abs(ec.reconcile(S)["cookies"]["drift"]) < 1e-6, ec.reconcile(S)["cookies"])
+
+check("5.9 списание ровно по балансу проходит",
+      gl.spend_cookies(S, 750.0, "exact") == 0.0)
+check("5.10 баланс обнулился ровно", db.get_user(S)["cookies"] == 0.0)
+raises("5.11 с нуля не списывается даже копейка",
+       lambda: gl.spend_cookies(S, 0.01, "nope"), gl.NoFunds)
+check("5.12 сверка сошлась и на нуле",
+      abs(ec.reconcile(S)["cookies"]["drift"]) < 1e-6)
+
+raises("5.13 NaN в трате ловится до SQL",
+       lambda: gl.spend_cookies(S, float("nan"), "bad"), ValueError, "err_bad_amount")
+
+gl.add_cookies(S, 400.0)
+gl.spend_cookies(S, 150.0, "paid", operation_id="spend-once")
+rest = gl.spend_cookies(S, 150.0, "paid", operation_id="spend-once")
+check("5.14 повторное списание по тому же токену не снимает второй раз",
+      db.get_user(S)["cookies"] == 250.0 and rest == 250.0, db.get_user(S)["cookies"])
+check("5.15 и сверка после этого сходится",
+      abs(ec.reconcile(S)["cookies"]["drift"]) < 1e-6)
+
+# ==========================================================================
+# 6. buy_click_upgrade — устаревший click_level не проходит
+# ==========================================================================
+K = BASE + 5
+db.create_user(K, "k", "K")
+gl.add_cookies(K, 10_000.0)
+lvl = db.get_user(K)["click_level"]
+
+raises("6.1 покупка с чужим click_level отбита",
+       lambda: gl.buy_click_upgrade(K, 100.0, lvl + 5), gl.NoFunds)
+check("6.2 после отбитой покупки уровень и баланс целы",
+      db.get_user(K)["click_level"] == lvl and db.get_user(K)["cookies"] == 10_000.0)
+check("6.3 отбитая покупка не написала в книгу", len(ledger(K, "cookies")) == 1)
+
+gl.buy_click_upgrade(K, 100.0, lvl)
+check("6.4 покупка с актуальным уровнем прошла",
+      db.get_user(K)["click_level"] == lvl + 1 and db.get_user(K)["cookies"] == 9900.0)
+check("6.5 списание попало в книгу",
+      ledger(K, "cookies")[-1]["amount"] == -100.0
+      and ledger(K, "cookies")[-1]["reason"] == "click_upgrade")
+raises("6.6 повтор с уже устаревшим уровнем отбит",
+       lambda: gl.buy_click_upgrade(K, 100.0, lvl), gl.NoFunds)
+check("6.7 сверка сходится после серии покупок",
+      abs(ec.reconcile(K)["cookies"]["drift"]) < 1e-6)
+
+# ==========================================================================
+# 7. Токены операций
+# ==========================================================================
+O = BASE + 6
+db.create_user(O, "o", "O")
+
+raises("7.1 begin_op вне транзакции — ошибка",
+       lambda: ec.begin_op("op-outside", O, "unit"), RuntimeError, "вне транзакции")
+
+with db.tx():
+    first = ec.begin_op("op-1", O, "unit")
+check("7.2 первый вызов отдаёт None — операция наша", first is None)
+
+with db.tx():
+    ec.finish_op("op-1", {"reward": 7})
+
+with db.tx():
+    replay = ec.begin_op("op-1", O, "unit")
+check("7.3 ретрай получает сохранённый ответ", replay == {"reward": 7}, replay)
+
+with db.tx():
+    replay2 = ec.begin_op("op-1", BASE + 777, "unit")
+check("7.4 токен глобальный: чужой user_id получает тот же ответ",
+      replay2 == {"reward": 7})
+
+with db.tx():
+    ec.finish_op("op-1", {"reward": 999})
+with db.tx():
+    again = ec.begin_op("op-1", O, "unit")
+check("7.5 закрытую операцию нельзя переписать", again == {"reward": 7}, again)
+
+def _begin_open():
+    with db.tx():
+        ec.begin_op("op-open", O, "unit")
+
+
+_begin_open()   # открыли и не закрыли
+raises("7.6 незакрытая операция — конфликт, а не тихий повтор",
+       _begin_open, ec.ConflictError, "err_state_conflict")
+
+# откат: эффект и токен уходят вместе
+try:
+    with db.tx():
+        ec.begin_op("op-rollback", O, "unit")
+        gl.add_cookies(O, 500.0, operation_id="op-rollback")
+        raise RuntimeError("падение на середине")
+except RuntimeError:
+    pass
+check("7.7 упавшая операция не оставила токена",
+      db.q1("SELECT 1 x FROM economy_ops WHERE operation_id = ?", ("op-rollback",)) is None)
+check("7.8 ...и не оставила ни денег, ни строки книги",
+      db.get_user(O)["cookies"] == 0 and len(ledger(O, "cookies")) == 0)
+
+with db.tx():
+    if ec.begin_op("op-rollback", O, "unit") is None:
+        gl.add_cookies(O, 500.0, operation_id="op-rollback")
+        ec.finish_op("op-rollback", {"ok": True})
+check("7.9 повтор после отката выдаёт награду ровно один раз",
+      db.get_user(O)["cookies"] == 500.0)
+with db.tx():
+    r = ec.begin_op("op-rollback", O, "unit")
+check("7.10 а следующий ретрай — уже реплей", r == {"ok": True}
+      and db.get_user(O)["cookies"] == 500.0)
+
+# ==========================================================================
+# 8. ПРИЁМКА: сверка после живой сессии через API
+# ==========================================================================
+P = BASE + 7
+r = c.post("/api/auth", headers=H(P))
+check("8.1 игрок завёлся через API", r.status_code == 200, r.text)
+
+gl.add_cookies(P, 5_000_000.0, reason="test_grant")
+for i in range(6):
+    c.post("/api/click", json={"clicks": 30, "batch_id": f"b{i}"}, headers=H(P))
+c.post("/api/click", json={"clicks": 30, "batch_id": "b0"}, headers=H(P))  # дубль
+c.post("/api/click/upgrade", headers=H(P))
+c.post("/api/merge/spawn", json={"level": 1}, headers=H(P))
+c.post("/api/merge/spawn", json={"level": 1}, headers=H(P))
+for key in list(cfg.FARM_BUILDINGS)[:2]:
+    c.post("/api/farm/buy_building", json={"key": key}, headers=H(P))
+    c.post("/api/farm/buy_building", json={"key": key}, headers=H(P))
+c.post("/api/daily/claim", headers=H(P))
+c.get("/api/farm", headers=H(P))
+c.post("/api/quests/claim", json={"quest_key": "clicks"}, headers=H(P))
+
+state = ec.reconcile(P)
+check("8.2 ПРИЁМКА: cookies сходятся после сессии",
+      abs(state["cookies"]["drift"]) < 1e-6, state["cookies"])
+check("8.3 ПРИЁМКА: total_earned сходится после сессии",
+      abs(state["total_earned"]["drift"]) < 1e-6, state["total_earned"])
+check("8.4 сессия действительно двигала деньги",
+      len(ledger(P, "cookies")) >= 5, len(ledger(P, "cookies")))
+check("8.5 balance_after последней строки равен колонке",
+      abs(ledger(P, "cookies")[-1]["balance_after"] - db.get_user(P)["cookies"]) < 1e-6)
+
+# ==========================================================================
+# 9. drift_report ловит запись мимо книги
+# ==========================================================================
+D = BASE + 8
+db.create_user(D, "d", "D")
+gl.add_cookies(D, 100.0)
+check("9.1 до порчи расхождения нет", abs(ec.reconcile(D)["cookies"]["drift"]) < 1e-6)
+
+db.update_user(D, cookies=999.0)   # прямой UPDATE в обход книги — это и есть баг
+drift = ec.reconcile(D)["cookies"]["drift"]
+check("9.2 запись мимо книги даёт расхождение", abs(drift - 899.0) < 1e-6, drift)
+
+bad = {b["user_id"] for b in ec.drift_report(limit=500)}
+check("9.3 drift_report называет виноватого", D in bad)
+check("9.4 ...и не трогает чистых", P not in bad and S not in bad and K not in bad)
+
+check("9.5 сверка несуществующего игрока — пустой словарь",
+      ec.reconcile(BASE + 888_888) == {})
+check("9.6 энергия из сверки исключена", "energy" not in ec.reconcile(D))
+
+print(f"\n{_ok} passed, {_fail} failed")
+sys.exit(1 if _fail else 0)

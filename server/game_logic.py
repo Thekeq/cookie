@@ -1,15 +1,15 @@
 """Общая игровая логика поверх БД. Сервер — единственный источник правды."""
 import datetime
 import json
-import os
 import random
 import time
 
-from db import DataBase
+from server import economy
 from server import game_config as cfg
 
-# DATABASE_PATH переопределяет путь (тесты подставляют временную БД)
-db = DataBase(os.environ.get("DATABASE_PATH", "data.db"))
+# один экземпляр базы на процесс: книга операций обязана писаться в ТОЙ ЖЕ
+# транзакции, что и само движение денег, а значит и через то же соединение
+db = economy.db
 
 
 # ---------- лимитер запросов ----------
@@ -871,16 +871,102 @@ def claimable_level(user: dict) -> int | None:
 
 # ---------- деньги ----------
 
-def add_cookies(user_id: int, amount: float, count_earned: bool = True):
-    user = db.get_user(user_id)
-    fields = {"cookies": user["cookies"] + amount}
-    if count_earned and amount > 0:
-        fields["total_earned"] = user["total_earned"] + amount
-        fields["season_earned"] = user["season_earned"] + amount
-        # честный заработок кормит дневное задание "заработай N" и заказ пекарни
-        quest_progress(user_id, "earned", amount)
-        order_progress(user_id, "earned", amount)
-    db.update_user(user_id, **fields)
+class NoFunds(ValueError):
+    """Денег не хватило. Отдельный тип, потому что это не ошибка — это отказ,
+    и обработчик обязан отличать его от поломки."""
+
+
+def add_cookies(user_id: int, amount: float, count_earned: bool = True,
+                *, operation_id: str | None = None, reason: str = "unspecified",
+                ref_type: str | None = None, ref_id: str | None = None) -> float:
+    """Атомарное начисление. Возвращает НОВЫЙ баланс.
+
+    Раньше было «прочитать, сложить в питоне, записать». Пока процесс один и
+    между чтением и записью нет await, это работает. Как только worker'ов
+    станет двое, два таких начисления затрут друг друга: оба прочитают старый
+    баланс и запишут свою сумму — одно начисление исчезнет без следа. Теперь
+    сложение делает сама база (`cookies = cookies + ?`), а движение попадает в
+    книгу той же транзакцией.
+
+    Клампа в ноль тут нет и раньше не было: отрицательная сумма уводит баланс
+    в минус ровно так же, как уводила. Это изменение атомарности, а не правил.
+
+    `operation_id` делает начисление идемпотентным целиком: повтор с тем же
+    токеном не двигает баланс и возвращает текущий. Без токена (auto_op)
+    повтор — это законное второе начисление, и защищаться от ретрая обязан
+    вызывающий."""
+    amount = economy._sane(amount, "add_cookies")
+    earn = amount if (count_earned and amount > 0) else 0.0
+    op = operation_id or economy.auto_op(user_id, reason)
+    with db.tx():
+        if operation_id and economy.already_recorded(operation_id, "cookies"):
+            return db.get_user(user_id)["cookies"]
+        row = db.q1w(
+            "UPDATE users SET cookies = cookies + ?, total_earned = total_earned + ?, "
+            "season_earned = season_earned + ?, user_revision = user_revision + 1 "
+            "WHERE user_id = ? RETURNING cookies, season_id",
+            (amount, earn, earn, user_id))
+        if row is None:
+            raise ValueError("err_no_user")
+        economy.record(user_id, "cookies", amount, reason, row["cookies"], op,
+                       ref_type=ref_type, ref_id=ref_id,
+                       counts_earned=1 if earn else 0, season_id=row["season_id"])
+        if earn:
+            # честный заработок кормит дневное задание "заработай N" и заказ пекарни
+            quest_progress(user_id, "earned", amount)
+            order_progress(user_id, "earned", amount)
+    return row["cookies"]
+
+
+def spend_cookies(user_id: int, cost: float, reason: str, *,
+                  operation_id: str | None = None,
+                  ref_type: str | None = None, ref_id: str | None = None) -> float:
+    """Атомарная трата. Возвращает НОВЫЙ баланс, кидает NoFunds при нехватке.
+
+    Условие `cookies >= ?` живёт в самом UPDATE, поэтому проверка и списание —
+    один шаг. Проверка отдельным SELECT'ом (как во всех шести местах покупок)
+    пробивается двумя параллельными запросами: оба видят достаточный баланс и
+    оба покупают.
+
+    С `operation_id` списание идемпотентно: повтор ничего не снимает и отдаёт
+    текущий баланс — важно там, где деньги берут за уже выданный товар."""
+    cost = economy._sane(cost, "spend_cookies")
+    op = operation_id or economy.auto_op(user_id, reason)
+    with db.tx():
+        if operation_id and economy.already_recorded(operation_id, "cookies"):
+            return db.get_user(user_id)["cookies"]
+        row = db.q1w("UPDATE users SET cookies = cookies - ?, "
+                     "user_revision = user_revision + 1 "
+                     "WHERE user_id = ? AND cookies >= ? RETURNING cookies",
+                     (cost, user_id, cost))
+        if row is None:
+            raise NoFunds("err_no_cookies")
+        economy.record(user_id, "cookies", -cost, reason, row["cookies"], op,
+                       ref_type=ref_type, ref_id=ref_id)
+    return row["cookies"]
+
+
+def buy_click_upgrade(user_id: int, cost: float, click_level: int) -> float:
+    """Списание и повышение уровня клика ОДНИМ условным UPDATE.
+
+    Отдельная функция, а не spend_cookies, потому что тут пишутся две колонки
+    от одного и того же устаревшего чтения. Условие `click_level = ?` держит
+    их вместе: куплен ровно тот уровень, за который посчитана цена, — иначе
+    два параллельных апгрейда списали бы цену первого уровня дважды и подняли
+    бы клик на две ступени."""
+    cost = economy._sane(cost, "click_upgrade")
+    op = economy.auto_op(user_id, "click_upgrade")
+    with db.tx():
+        row = db.q1w("UPDATE users SET cookies = cookies - ?, "
+                     "click_level = click_level + 1, "
+                     "user_revision = user_revision + 1 "
+                     "WHERE user_id = ? AND cookies >= ? AND click_level = ? "
+                     "RETURNING cookies, click_level",
+                     (cost, user_id, cost, click_level))
+        if row is None:
+            raise NoFunds("err_no_cookies")
+        economy.record(user_id, "cookies", -cost, "click_upgrade", row["cookies"], op)
+    return row["cookies"]
 
 
 # ---------- merge-доска: клетки ----------
