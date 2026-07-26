@@ -618,6 +618,105 @@ check("8e.6 новый день сбрасывает дневной счётчи
       u["clicks_day_count"] == 5 and u["total_clicks"] == 65, dict(u)["clicks_day_count"])
 
 # ==========================================================================
+# 8f. Ежедневная награда: право на неё решает база, стрик считается там же
+# ==========================================================================
+DL = BASE + 13
+db.create_user(DL, "dl", "DL")
+NOW = time.time()
+WEEK = gl._iso_week(NOW)
+D0 = gl._day_start(NOW)
+
+
+def daily_setup(claimed_at, streak, freeze_week=None):
+    db.update_user(DL, daily_claimed_at=claimed_at, daily_streak=streak,
+                   streak_freeze_week=freeze_week)
+
+
+daily_setup(D0 - 86400 + 3600, 3)          # забрал вчера
+r = gl.claim_daily(db.get_user(DL))
+check("8f.1 забирал вчера — стрик растёт", r["streak"] == 4, r)
+check("8f.2 заморозка не тратилась", r["freeze_used"] is False)
+check("8f.3 награда начислена и попала в книгу",
+      any(x["reason"] == "daily" or x["amount"] == r["reward"]
+          for x in ledger(DL, "cookies")), ledger(DL, "cookies"))
+
+raises("8f.4 второй клейм в тот же день отбит базой",
+       lambda: gl.claim_daily(db.get_user(DL)), ValueError, "err_already_today")
+n_rows = len(ledger(DL, "cookies"))
+raises("8f.5 ...и повторно тоже", lambda: gl.claim_daily(db.get_user(DL)),
+       ValueError, "err_already_today")
+check("8f.6 отбитые клеймы не начислили ничего", len(ledger(DL, "cookies")) == n_rows)
+
+# клейм по устаревшему словарю: в базе уже забрано сегодня, а на руках старая копия
+daily_setup(D0 - 86400 + 3600, 7)
+stale = db.get_user(DL)
+gl.claim_daily(stale)                      # первый проходит
+raises("8f.7 гонка двух нажатий: второй с тем же словарём проигрывает",
+       lambda: gl.claim_daily(stale), ValueError, "err_already_today")
+check("8f.8 стрик вырос ровно на один, а не на два",
+      db.get_user(DL)["daily_streak"] == 8, db.get_user(DL)["daily_streak"])
+
+daily_setup(D0 - 2 * 86400 + 3600, 5)      # пропустил ровно день, заморозка есть
+r = gl.claim_daily(db.get_user(DL))
+check("8f.9 заморозка спасает стрик", r["streak"] == 6, r)
+check("8f.10 ...и помечена потраченной на эту неделю",
+      r["freeze_used"] is True and db.get_user(DL)["streak_freeze_week"] == WEEK)
+
+daily_setup(D0 - 2 * 86400 + 3600, 6, WEEK)   # заморозка на этой неделе уже была
+r = gl.claim_daily(db.get_user(DL))
+check("8f.11 второй пропуск за неделю сжигает стрик", r["streak"] == 1, r)
+check("8f.12 ...и заморозку не тратит второй раз", r["freeze_used"] is False)
+
+daily_setup(D0 - 5 * 86400, 9)             # пропустил много дней
+check("8f.13 длинный пропуск сжигает стрик даже с заморозкой",
+      gl.claim_daily(db.get_user(DL))["streak"] == 1)
+
+daily_setup(D0 - 2 * 86400 + 3600, 0)      # стрика нет — замораживать нечего
+check("8f.14 нулевой стрик заморозку не получает",
+      gl.claim_daily(db.get_user(DL))["streak"] == 1)
+
+daily_setup(None, 0)                       # первый заход в игру
+r = gl.claim_daily(db.get_user(DL))
+check("8f.15 первый клейм — стрик один", r["streak"] == 1, r)
+check("8f.16 пустая метка не мешает охране",
+      db.get_user(DL)["daily_claimed_at"] is not None)
+
+# ==========================================================================
+# 8g. Призы сезона выдаются ровно один раз
+# ==========================================================================
+SEA = -777                                  # свой сезон, чтобы не мешать другим
+S1_ = BASE + 14
+S2_ = BASE + 15
+for uid, earned in ((S1_, 900_000.0), (S2_, 400_000.0)):
+    db.create_user(uid, f"s{uid}", "S")
+    db.update_user(uid, season_id=SEA, season_earned=earned, level=5)
+
+gl._ensure_season_snapshot(SEA)
+paid1 = db.get_user(S1_)["cookies"]
+prize = db.q1("SELECT reward_cookies FROM season_results WHERE season_id = ? "
+              "AND user_id = ?", (SEA, S1_))["reward_cookies"]
+check("8g.1 приз выдан", paid1 > 0 and abs(paid1 - prize) < 1e-6, f"{paid1} / {prize}")
+check("8g.2 снапшот записал обоих",
+      db.q1("SELECT COUNT(*) c FROM season_results WHERE season_id = ?",
+            (SEA,))["c"] == 2)
+
+gl._ensure_season_snapshot(SEA)              # быстрый выход по наличию строк
+check("8g.3 повторный ролловер не платит второй раз",
+      db.get_user(S1_)["cookies"] == paid1, db.get_user(S1_)["cookies"])
+
+# теряем маркер: теперь вставка снапшота ПРОЙДЁТ, и от второй выплаты защищает
+# только токен операции в книге — проверяем именно этот рубеж
+db.exec("DELETE FROM season_results WHERE season_id = ?", (SEA,))
+gl._ensure_season_snapshot(SEA)
+check("8g.4 даже без маркера книга не пропускает вторую выплату",
+      db.get_user(S1_)["cookies"] == paid1, db.get_user(S1_)["cookies"])
+check("8g.5 приз в книге одной строкой",
+      len([r for r in ledger(S1_, "cookies")
+           if r["operation_id"] == f"season_prize:{SEA}:{S1_}"]) == 1)
+check("8g.6 баланс победителя сходится с книгой",
+      abs(ec.reconcile(S1_)["cookies"]["drift"]) < 1e-6, ec.reconcile(S1_)["cookies"])
+
+# ==========================================================================
 # 9. drift_report ловит запись мимо книги
 # ==========================================================================
 D = BASE + 8

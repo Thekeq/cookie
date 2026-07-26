@@ -127,7 +127,8 @@ async def buy_upgrade(body: KeyIn, tg: dict = Depends(tg_user)):
                              ref_type="upgrade", ref_id=body.key)
         except gl.NoFunds:
             raise HTTPException(400, "err_no_cookies")
-        db.exec("INSERT OR IGNORE INTO upgrades (user_id, upgrade_key) VALUES (?, ?)",
+        db.exec("INSERT INTO upgrades (user_id, upgrade_key) VALUES (?, ?) "
+                "ON CONFLICT (user_id, upgrade_key) DO NOTHING",
                 (tg["id"], body.key))
     return await farm_state(tg)
 
@@ -153,7 +154,8 @@ async def buy_skin(body: KeyIn, tg: dict = Depends(tg_user)):
                              ref_type="skin", ref_id=body.key)
         except gl.NoFunds:
             raise HTTPException(400, "err_no_cookies")
-        db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
+        db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?) "
+                "ON CONFLICT (user_id, skin_key) DO NOTHING",
                 (tg["id"], body.key))
     return await farm_state(tg)
 

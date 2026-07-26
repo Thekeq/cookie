@@ -90,20 +90,31 @@ def _ensure_season_snapshot(season: int):
 
     Маркер — наличие строк season_results: без него после частичного сброса
     победители пересчитались бы по остатку. add_cookies(count_earned=False)
-    не трогает season_earned, поэтому платить можно до сброса."""
+    не трогает season_earned, поэтому платить можно до сброса.
+
+    Платит ТОЛЬКО тот вызов, чья вставка снапшота действительно прошла. Раньше
+    выдача стояла рядом с `INSERT OR IGNORE` и не смотрела на его результат:
+    конфликт гасился молча, а деньги уходили всё равно — и в момент смены сезона,
+    когда ролловер по таймеру и первый запрос игрока сходятся на одной секунде,
+    призы выдавались дважды. Проверка строк выше — быстрый выход, а не гарантия;
+    гарантию даёт rowcount. Плюс токен операции: даже если движение когда-нибудь
+    вызовут в обход этой проверки, книга не пропустит второе начисление."""
     if db.q1("SELECT 1 x FROM season_results WHERE season_id = ? LIMIT 1", (season,)):
         return
     with db.tx():
         now = time.time()
         for uid, rank, earned in _season_winners(season):
             reward = cfg.season_reward(rank, earned)
-            db.exec(
-                "INSERT OR IGNORE INTO season_results (season_id, user_id, "
+            fresh = db.exec(
+                "INSERT INTO season_results (season_id, user_id, "
                 "rank, earned, reward_cookies, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (season_id, user_id) DO NOTHING",
                 (season, uid, rank, earned, reward, now))
-            if reward:
-                add_cookies(uid, reward, count_earned=False)
+            if fresh and reward:
+                add_cookies(uid, reward, count_earned=False,
+                            operation_id=f"season_prize:{season}:{uid}",
+                            reason="season_prize")
 
 
 def ensure_user_season(user_id: int) -> dict | None:
@@ -200,6 +211,17 @@ def _iso_week(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%G-W%V")
 
 
+def _day_start(ts: float) -> float:
+    """Полночь UTC того дня, в который попал ts.
+
+    Нужна там, где «сегодня» проверяется в SQL: строку дня в базе не собрать
+    портируемо (strftime у SQLite и to_char у PostgreSQL — разные функции), а
+    сравнение метки с границей суток работает одинаково и точнее."""
+    d = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+    return datetime.datetime(d.year, d.month, d.day,
+                             tzinfo=datetime.timezone.utc).timestamp()
+
+
 def _freeze_available(user: dict, now: float) -> bool:
     """Заморозка стрика: раз в неделю пропуск ровно одного дня не сжигает стрик."""
     return user["daily_streak"] > 0 and user.get("streak_freeze_week") != _iso_week(now)
@@ -233,29 +255,55 @@ def daily_state(user: dict) -> dict:
 
 
 def claim_daily(user: dict) -> dict:
-    """Возвращает {streak, reward} или кидает ValueError."""
+    """Возвращает {streak, reward} или кидает ValueError.
+
+    Право на награду решает один стейтмент, и решает его база. Раньше проверка
+    «сегодня ещё не забирал» стояла в питоне над прочитанным словарём: два
+    нажатия вплотную (а именно так и выглядит нажатие на подвисшем соединении)
+    оба её проходили и оба выдавали награду — сколько нажатий, столько наград.
+    Теперь второй проигрывает по rowcount и получает err_already_today.
+
+    Ту же развилку — продолжить стрик, сжечь его или потратить недельную
+    заморозку — тоже считает база, от `daily_claimed_at` в самой строке.
+    Начислять по прочитанному `daily_streak` значило бы, что стрик может уехать
+    на день назад: два клейма в соседние сутки, разошедшиеся в чтении, записали
+    бы одно и то же значение.
+
+    Заморозка выдаётся один раз в ISO-неделю и только если стрик уже есть, — то
+    же условие, что и в `_freeze_available`, но выраженное в SQL."""
     now = time.time()
-    today = _utc_day(now)
-    last_day = _utc_day(user["daily_claimed_at"]) if user["daily_claimed_at"] else ""
-    if last_day == today:
-        raise ValueError("err_already_today")
-    yesterday = _utc_day(now - 86400)
-    day_before = _utc_day(now - 2 * 86400)
-    freeze_used = False
-    if last_day == yesterday:
-        streak = user["daily_streak"] + 1
-    elif last_day == day_before and _freeze_available(user, now):
-        # заморозка: пропущен ровно один день — стрик выживает (раз в неделю)
-        streak = user["daily_streak"] + 1
-        freeze_used = True
-    else:
-        streak = 1
-    reward = cfg.scaled_reward(cfg.daily_reward(streak), "daily",
-                               hourly_income(user["user_id"]))
-    extra = {"streak_freeze_week": _iso_week(now)} if freeze_used else {}
+    today0 = _day_start(now)
+    yest0 = today0 - 86400
+    dayb0 = today0 - 2 * 86400
+    week = _iso_week(now)
+    # «стрик выживает» = забирал вчера, либо позавчера и есть заморозка
+    alive = ("(COALESCE(daily_claimed_at, 0) >= ? "
+             " OR (COALESCE(daily_claimed_at, 0) >= ? "
+             "     AND COALESCE(streak_freeze_week, '') <> ? AND daily_streak > 0))")
+    # «заморозка тратится» = ровно пропущенный день, и она ещё не тратилась
+    thaw = ("(COALESCE(daily_claimed_at, 0) < ? AND COALESCE(daily_claimed_at, 0) >= ? "
+            " AND COALESCE(streak_freeze_week, '') <> ? AND daily_streak > 0)")
     with db.tx():  # отметка о получении и деньги — одним куском
-        db.update_user(user["user_id"], daily_streak=streak, daily_claimed_at=now, **extra)
+        row = db.q1w(
+            f"UPDATE users SET "
+            f"daily_streak = CASE WHEN {alive} THEN daily_streak + 1 ELSE 1 END, "
+            f"streak_freeze_week = CASE WHEN {thaw} THEN ? ELSE streak_freeze_week END, "
+            f"daily_claimed_at = ?, user_revision = user_revision + 1 "
+            f"WHERE user_id = ? AND COALESCE(daily_claimed_at, 0) < ? "
+            f"RETURNING daily_streak, streak_freeze_week",
+            (yest0, dayb0, week,            # alive
+             yest0, dayb0, week, week,      # thaw + новое значение недели
+             now, user["user_id"], today0))
+        if row is None:
+            raise ValueError("err_already_today")
+        streak = row["daily_streak"]
+        reward = cfg.scaled_reward(cfg.daily_reward(streak), "daily",
+                                   hourly_income(user["user_id"]))
         add_cookies(user["user_id"], reward, count_earned=False)
+    # метка недели могла измениться только этим стейтментом: любой параллельный
+    # клейм проставил бы сегодняшнюю дату и снял бы нашу охрану
+    freeze_used = (row["streak_freeze_week"] == week
+                   and user.get("streak_freeze_week") != week)
     return {"streak": streak, "reward": reward, "freeze_used": freeze_used}
 
 
@@ -280,8 +328,10 @@ def todays_quest_keys(day: str | None = None) -> list[str]:
 
 def _ensure_quest_rows(user_id: int, day: str, keys: list[str]):
     for key in keys:
-        db.exec("INSERT OR IGNORE INTO daily_quests (user_id, day, quest_key) "
-                "VALUES (?, ?, ?)", (user_id, day, key))
+        db.exec("INSERT INTO daily_quests (user_id, day, quest_key) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (user_id, day, quest_key) DO NOTHING",
+                (user_id, day, key))
     if len(_quest_rows_ready) > 20_000:
         _quest_rows_ready.clear()
     # Кеш ставим ТОЛЬКО если вставка уже зафиксирована. Внутри чужой открытой
@@ -372,8 +422,10 @@ def reroll_quest(user: dict, key: str) -> str:
     new_key = random.choice(candidates)
     with db.tx():
         db.exec("DELETE FROM daily_quests WHERE id = ?", (row["id"],))
-        db.exec("INSERT OR IGNORE INTO daily_quests (user_id, day, quest_key) "
-                "VALUES (?, ?, ?)", (user["user_id"], day, new_key))
+        db.exec("INSERT INTO daily_quests (user_id, day, quest_key) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (user_id, day, quest_key) DO NOTHING",
+                (user["user_id"], day, new_key))
         db.update_user(user["user_id"], quest_reroll_day=day)
     track(user["user_id"], "quest_reroll")
     return new_key
@@ -449,16 +501,19 @@ def claim_ref_milestone(user: dict, key: str) -> dict:
     if state["claimed"]:
         raise ValueError("err_claimed")
     with db.tx():  # отметка и награда — одним куском
-        # INSERT OR IGNORE + rowcount: проверка claimed выше живёт вне
-        # транзакции, и два параллельных клейма прошли бы её оба
-        if db.exec("INSERT OR IGNORE INTO ref_claims (user_id, milestone_key, claimed_at) "
-                   "VALUES (?, ?, ?)", (user["user_id"], key, time.time())) == 0:
+        # вставка + rowcount: проверка claimed выше живёт вне транзакции,
+        # и два параллельных клейма прошли бы её оба
+        if db.exec("INSERT INTO ref_claims (user_id, milestone_key, claimed_at) "
+                   "VALUES (?, ?, ?) "
+                   "ON CONFLICT (user_id, milestone_key) DO NOTHING",
+                   (user["user_id"], key, time.time())) == 0:
             raise ValueError("err_claimed")
         if ms["type"] == "boost":
             db.exec("INSERT INTO boosts (user_id, boost_key, expires_at) VALUES (?, ?, ?)",
                     (user["user_id"], "click_x2", time.time() + ms["hours"] * 3600))
         elif ms["type"] == "skin":
-            db.exec("INSERT OR IGNORE INTO skins (user_id, skin_key) VALUES (?, ?)",
+            db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?) "
+                    "ON CONFLICT (user_id, skin_key) DO NOTHING",
                     (user["user_id"], ms["skin"]))
         elif ms["type"] == "bp_premium":
             grant_bp_premium(user["user_id"])
@@ -1589,8 +1644,10 @@ def roll_shiny(user: dict, item_level: int) -> int | None:
         return None
     with db.tx():
         db.update_user(uid, shiny_pity=0)
-        db.exec("INSERT OR IGNORE INTO collection (user_id, item_level, obtained_at) "
-                "VALUES (?, ?, ?)", (uid, target, time.time()))
+        db.exec("INSERT INTO collection (user_id, item_level, obtained_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (user_id, item_level) DO NOTHING",
+                (uid, target, time.time()))
     track(uid, "shiny_drop", target)
     return target
 
@@ -1703,8 +1760,11 @@ def record_unmatched_payment(user_id: int, item_key: str, amount: int,
     сверить и вернуть невозможно. Строка с 'unmatched' попадает в
     /api/admin/payments, где её видит владелец."""
     db.exec(
-        "INSERT OR IGNORE INTO purchases (user_id, item_key, stars_amount, "
-        "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'unmatched', ?)",
+        # частичный индекс -> и в ON CONFLICT нужно то же условие: платёж без
+        # charge_id ни с чем не конфликтует и должен вставиться
+        "INSERT INTO purchases (user_id, item_key, stars_amount, "
+        "tg_payment_id, status, created_at) VALUES (?, ?, ?, ?, 'unmatched', ?) "
+        "ON CONFLICT (tg_payment_id) WHERE tg_payment_id IS NOT NULL DO NOTHING",
         (user_id, (item_key or payload or "")[:64], amount,
          charge_id or None, time.time()))
 

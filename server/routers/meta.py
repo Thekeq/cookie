@@ -45,8 +45,10 @@ async def auth(tg: dict = Depends(tg_user)):
 
         # взаимная награда за реферала — сразу обоим
         if referrer_id:
-            db.exec("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at) "
-                    "VALUES (?, ?, ?)", (referrer_id, tg["id"], time.time()))
+            db.exec("INSERT INTO referrals (referrer_id, referred_id, created_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (referred_id) DO NOTHING",
+                    (referrer_id, tg["id"], time.time()))
             # награды масштабируются доходом ПРИГЛАСИВШЕГО: для ветерана
             # 1000 печенек — доли секунды, приглашать было незачем
             gl.add_cookies(referrer_id, cfg.scaled_reward(
@@ -129,8 +131,10 @@ async def redeem_promo(body: PromoIn, tg: dict = Depends(tg_user)):
     with db.tx():  # отметка активации + счётчик + награды — одним куском
         # оба UPDATE/INSERT условные: проверки «уже активировал» и «лимит
         # исчерпан» вне транзакции пробиваются параллельными запросами
-        if db.exec("INSERT OR IGNORE INTO promo_redemptions (code, user_id, redeemed_at) "
-                   "VALUES (?, ?, ?)", (code, tg["id"], time.time())) == 0:
+        if db.exec("INSERT INTO promo_redemptions (code, user_id, redeemed_at) "
+                   "VALUES (?, ?, ?) "
+                   "ON CONFLICT (user_id, code) DO NOTHING",
+                   (code, tg["id"], time.time())) == 0:
             raise HTTPException(400, "err_promo_invalid")
         if db.exec("UPDATE promo_codes SET uses = uses + 1 "
                    "WHERE code = ? AND (max_uses = 0 OR uses < max_uses)", (code,)) == 0:

@@ -123,8 +123,9 @@ async def click(batch: ClickBatch, tg: dict = Depends(tg_user)):
         # дедупликация по (user_id, batch_id): id уникален для каждого батча,
         # поэтому честные батчи с другого устройства не отбрасываются
         if batch.batch_id:
-            fresh = db.exec("INSERT OR IGNORE INTO click_batches (user_id, batch_id, "
-                            "created_at) VALUES (?, ?, ?)",
+            fresh = db.exec("INSERT INTO click_batches (user_id, batch_id, "
+                            "created_at) VALUES (?, ?, ?) "
+                            "ON CONFLICT (user_id, batch_id) DO NOTHING",
                             (tg["id"], batch.batch_id[:64], now))
             if fresh == 0:  # уже обработан — ретрай потерянного ответа
                 return {"accepted": 0, "earned": 0, "duplicate": True,

@@ -739,9 +739,10 @@ class DataBase:
     def create_user(self, user_id, username, first_name, referrer_id=None, source_code=None):
         now = time.time()
         self.exec(
-            "INSERT OR IGNORE INTO users (user_id, username, first_name, referrer_id, "
+            "INSERT INTO users (user_id, username, first_name, referrer_id, "
             "source_code, energy_updated_at, passive_collected_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (user_id) DO NOTHING",
             (user_id, username, first_name, referrer_id, source_code, now, now, now),
         )
         return self.get_user(user_id)
