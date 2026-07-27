@@ -113,6 +113,10 @@ class DataBase:
                 'orders_completed': 'INTEGER DEFAULT 0',
                 'orders_day': 'TEXT',                   # день счётчика заказов
                 'orders_day_count': 'INTEGER DEFAULT 0',
+                # номер выписки офферов: из него сеется выбор шаблонов. Раньше
+                # сеялось из int(time.time()) — секундная гранулярность, и два
+                # параллельных обновления брали ОДИН И ТОТ ЖЕ набор шаблонов
+                'orders_offer_gen': 'INTEGER NOT NULL DEFAULT 0',
                 # --- версии состояния: клиент присылает свою, сервер отвергает
                 # ход, посчитанный от устаревшей картинки ---
                 'user_revision': 'INTEGER NOT NULL DEFAULT 0',
@@ -140,6 +144,20 @@ class DataBase:
                 'reward_bp_xp': 'REAL DEFAULT 0',
                 'status': 'TEXT DEFAULT "offer"',
                 'created_at': 'REAL DEFAULT 0',
+                # версия строки: клиент присылает (id, version) взятого заказа,
+                # и «сдать» со старого экрана не сдаёт ДРУГОЙ заказ, который
+                # успел встать на его место
+                'version': 'INTEGER NOT NULL DEFAULT 1',
+                # набор шаблонов, по которому заказ выписан: конфиг меняется
+                # между релизами, и по этой метке видно, чей заказ разбираем
+                'config_rev': 'TEXT',
+                # уровень и доход на момент взятия. NULL — заказ взят до этой
+                # миграции, достижимость для него пересчитывается по текущим
+                'taken_level': 'INTEGER',
+                'taken_income': 'REAL',
+                # печеньки, вложенные в этот заказ (спавны, здания). Если заказ
+                # снимает СЕРВЕР (цель стала недостижимой), они возвращаются
+                'invested': 'REAL NOT NULL DEFAULT 0',
             },
             'collection': {  # альбом блестящих печенек: строка = открытый слот
                 'id': 'INTEGER PRIMARY KEY',
@@ -430,6 +448,16 @@ class DataBase:
         "duels_waiting": {"cols": ("user_a",), "table": "duels",
                           "where": "status = 'waiting'",
                           "index": "uq_duels_waiting"},
+        # активный заказ — один на игрока, и это факт БАЗЫ, а не соглашение
+        # кода: два /orders/take вплотную проходили обе проверки и оставляли
+        # игрока с двумя активными заказами, из которых прогресс шёл обоим, а
+        # видел он один. Второй оффер того же слота — та же история на выписке
+        "orders_active": {"cols": ("user_id",), "table": "orders",
+                          "where": "status = 'active'",
+                          "index": "uq_orders_active"},
+        "orders_offer": {"cols": ("user_id", "slot"), "table": "orders",
+                         "where": "status = 'offer'",
+                         "index": "uq_orders_offer"},
         "season_results": {"cols": ("season_id", "user_id")},
         "click_batches": {"cols": ("user_id", "batch_id")},
         "collection": {"cols": ("user_id", "item_level")},

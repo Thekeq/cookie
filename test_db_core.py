@@ -147,6 +147,54 @@ try:
 except sqlite3.IntegrityError:
     check("повторный charge_id отбит", True)
 
+print("\n=== заказы: дедуп старой базы под частичные индексы ===")
+
+# База, где заказы жили БЕЗ уникальности: у игрока два активных заказа и два
+# оффера в одном слоте. Индексы на такую базу не встанут, пока дедуп не
+# схлопнет дубли, — а дедуп разрушителен, поэтому проверяем, что он оставляет
+# именно первую строку (MIN(id)), а не случайную.
+LEGACY = os.path.join(tempfile.gettempdir(), f"cookie_legacy_orders_{os.getpid()}.db")
+for suffix in ("", "-wal", "-shm"):
+    if os.path.exists(LEGACY + suffix):
+        os.remove(LEGACY + suffix)
+raw = sqlite3.connect(LEGACY)
+raw.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, slot INTEGER, "
+            "template TEXT, metric TEXT, goal REAL, progress REAL, reward_cookies REAL, "
+            "reward_bp_xp REAL, status TEXT, created_at REAL)")
+raw.executemany(
+    "INSERT INTO orders (id, user_id, slot, template, metric, goal, progress, status) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [(1, UID, 1, "warmup", "clicks", 80, 40, "active"),
+     (2, UID, 2, "batch", "merges", 8, 0, "active"),
+     (3, UID, 1, "warmup", "clicks", 80, 0, "offer"),
+     (4, UID, 1, "marathon", "clicks", 250, 0, "offer")])
+raw.commit()
+raw.close()
+
+legacy = DataBase(LEGACY)
+kept = legacy.q("SELECT id, status FROM orders ORDER BY id")
+check("дедуп оставил ровно один активный заказ",
+      [r["id"] for r in kept if r["status"] == "active"] == [1], str([dict(r) for r in kept]))
+check("дедуп оставил один оффер на слот",
+      [r["id"] for r in kept if r["status"] == "offer"] == [3], str([dict(r) for r in kept]))
+lnames = {r["name"] for r in legacy.q("SELECT name FROM sqlite_master WHERE type = 'index'")}
+check("частичные индексы заказов созданы",
+      {"uq_orders_active", "uq_orders_offer"} <= lnames, str(sorted(lnames)))
+try:
+    legacy.exec("INSERT INTO orders (user_id, slot, template, metric, goal, status) "
+                "VALUES (?, 9, 'warmup', 'clicks', 10, 'active')", (UID,))
+    check("второй активный заказ отбит базой", False, "вставка прошла")
+except sqlite3.IntegrityError:
+    check("второй активный заказ отбит базой", True)
+# 'done' под условие частичного индекса не попадает: сданных заказов у игрока
+# сколько угодно, и уникальность их касаться не должна
+legacy.exec("INSERT INTO orders (user_id, slot, template, metric, goal, status) "
+            "VALUES (?, 1, 'warmup', 'clicks', 10, 'done')", (UID,))
+legacy.exec("INSERT INTO orders (user_id, slot, template, metric, goal, status) "
+            "VALUES (?, 1, 'warmup', 'clicks', 10, 'done')", (UID,))
+check("сданные заказы уникальностью не ограничены",
+      legacy.q1("SELECT COUNT(*) c FROM orders WHERE status = 'done'")["c"] == 2)
+
 print("\n=== транзакции ===")
 
 db.update_user(UID, cookies=100)

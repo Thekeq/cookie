@@ -1,5 +1,6 @@
 """Общая игровая логика поверх БД. Сервер — единственный источник правды."""
 import datetime
+import hashlib
 import json
 import random
 import time
@@ -1562,6 +1563,47 @@ def claim_achievement(user: dict, key: str) -> float:
 # Клей между режимами: ферма/клики/мердж дают прогресс одному активному заказу,
 # награда-сундук масштабируется от дохода. offer(3) -> active(1) -> done.
 
+
+def _orders_config_rev() -> str:
+    """Отпечаток набора заказов. Пишется в строку при выписке.
+
+    Конфиг меняется между релизами, а заказ живёт между сессиями. По этой метке
+    видно, по каким правилам заказ выписан: разбирать жалобу «мне обещали
+    другое» иначе нечем, а миграция не может отличить свежую строку от строки,
+    выписанной прошлым набором шаблонов."""
+    blob = json.dumps([cfg.ORDER_TEMPLATES, cfg.ORDER_REWARD_HOURS,
+                       cfg.ORDER_REWARD_MIN, cfg.ORDER_BP_XP],
+                      sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+ORDER_CONFIG_REV = _orders_config_rev()
+
+
+def backfill_orders_config():
+    """Приводит заказы, выписанные до версионирования, к новым правилам.
+
+    Строки с шаблоном, которого в конфиге больше нет, удаляются: раньше они
+    доживали до вкладки пекарни и рисовались там отсутствующим ключом i18n —
+    заказ без названия, который нельзя ни сдать, ни понять. Дубли активных
+    заказов схлопывает dedupe:orders_active в db.py, он идёт раньше.
+
+    Меткой конфига помечаются только строки без неё: перештамповывать чужой
+    отпечаток нельзя, он для этого и нужен."""
+    if not db._migration("backfill:orders_version"):
+        return
+    known = list(cfg.ORDER_TEMPLATES)
+    holes = ", ".join("?" * len(known))
+    dropped = db.exec(f"DELETE FROM orders WHERE template NOT IN ({holes})", known)
+    db.exec("UPDATE orders SET version = 1 WHERE version IS NULL OR version < 1")
+    stamped = db.exec("UPDATE orders SET config_rev = ? WHERE config_rev IS NULL",
+                      (ORDER_CONFIG_REV,))
+    db._mark("backfill:orders_version")
+    if dropped or stamped:
+        print(f"[*] Миграция: заказы — {dropped} с исчезнувшим шаблоном удалено, "
+              f"{stamped} помечено версией конфига")
+
+
 def _order_difficulty(template_key: str) -> int:
     return cfg.ORDER_TEMPLATES.get(template_key, {}).get("difficulty", 1)
 
@@ -1594,13 +1636,26 @@ def _order_params(user: dict, template_key: str, income: float | None = None) ->
 
 
 def _gen_order_offers(user: dict, income: float | None = None):
-    """3 оффера: по одному каждой сложности, шаблон случайный."""
+    """Дозаполняет тройку офферов: по одному на каждую сложность.
+
+    Раньше было DELETE всех офферов + три INSERT, а сеялся выбор шаблонов из
+    `int(time.time())`. Две ручки, зашедшие в одну секунду (а /api/orders зовёт
+    выписку сам, стоит открыть вкладку), получали ОДИН И ТОТ ЖЕ набор шаблонов,
+    удаляли офферы друг друга и вставляли шесть строк — игрок видел то три
+    заказа, то шесть, а взять мог тот, которого уже нет.
+
+    Теперь номер выписки берётся из базы (`orders_offer_gen`), то есть у
+    параллельных вызовов он РАЗНЫЙ, а вставка идёт `ON CONFLICT DO NOTHING` по
+    частичному уникальному индексу: занятый слот остаётся за тем, кто успел
+    первым, проигравший просто ничего не делает. DELETE больше не нужен —
+    отсутствующие слоты дозаполняются, присутствующие не трогаются."""
     uid = user["user_id"]
     income = hourly_income(uid) if income is None else income
-    rnd = random.Random(f"{uid}:{int(time.time())}")
     now = time.time()
     with db.tx():
-        db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer'", (uid,))
+        gen = db.q1w("UPDATE users SET orders_offer_gen = orders_offer_gen + 1 "
+                     "WHERE user_id = ? RETURNING orders_offer_gen", (uid,))
+        rnd = random.Random(f"{uid}:{gen['orders_offer_gen'] if gen else 0}")
         for slot, diff in enumerate((1, 2, 3), start=1):
             keys = sorted(k for k, t in cfg.ORDER_TEMPLATES.items()
                           if t["difficulty"] == diff)
@@ -1608,32 +1663,46 @@ def _gen_order_offers(user: dict, income: float | None = None):
             p = _order_params(user, key, income)
             db.exec(
                 "INSERT INTO orders (user_id, slot, template, metric, goal, progress, "
-                "reward_cookies, reward_bp_xp, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'offer', ?)",
+                "reward_cookies, reward_bp_xp, status, created_at, config_rev) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'offer', ?, ?) "
+                "ON CONFLICT (user_id, slot) WHERE status = 'offer' DO NOTHING",
                 (uid, slot, key, p["metric"], p["goal"],
-                 p["reward_cookies"], p["reward_bp_xp"], now))
+                 p["reward_cookies"], p["reward_bp_xp"], now, ORDER_CONFIG_REV))
 
 
 def _refresh_offers(user: dict, income: float):
     """Непринятые офферы пересчитываются под текущий доход и уровень: игрок мог
     вырасти (или сделать престиж) с момента их выписки. Цель активного заказа
-    НЕ трогаем — иначе накопленный прогресс потерял бы смысл."""
+    НЕ трогаем — иначе накопленный прогресс потерял бы смысл.
+
+    Оффер с исчезнувшим из конфига шаблоном удаляется, а не пропускается: он
+    остаётся в тройке, рисуется на вкладке пустым ключом i18n и занимает слот,
+    который иначе дозаполнился бы живым заказом."""
     for o in db.q("SELECT id, template FROM orders WHERE user_id = ? AND status = 'offer'",
                   (user["user_id"],)):
         if o["template"] not in cfg.ORDER_TEMPLATES:
+            db.exec("DELETE FROM orders WHERE id = ? AND status = 'offer'", (o["id"],))
             continue
         p = _order_params(user, o["template"], income)
-        db.exec("UPDATE orders SET goal = ?, reward_cookies = ?, reward_bp_xp = ? "
-                "WHERE id = ?",
-                (p["goal"], p["reward_cookies"], p["reward_bp_xp"], o["id"]))
+        db.exec("UPDATE orders SET goal = ?, reward_cookies = ?, reward_bp_xp = ?, "
+                "config_rev = ? WHERE id = ? AND status = 'offer'",
+                (p["goal"], p["reward_cookies"], p["reward_bp_xp"],
+                 ORDER_CONFIG_REV, o["id"]))
 
 
 def _order_unreachable(user: dict, o: dict, income: float) -> bool:
     """Заказ стал невыполнимым: цель зафиксирована по старому прогрессу, а
     прогресс сбросился (престиж). «Сделай печеньку 23 уровня» при максимуме 8
     не закрыть никогда, а активный заказ всего один — вкладка пекарни намертво
-    блокируется вместе с шагом чеклиста (фидбек)."""
+    блокируется вместе с шагом чеклиста (фидбек).
+
+    Если игрок с момента взятия не потерял ни уровня, ни дохода, проверять
+    нечего: цель считалась ровно от этих величин, значит она достижима. Пустой
+    снимок (заказ взят до версионирования) означает «пересчитать по текущим»."""
     if o["progress"] >= o["goal"]:
+        return False
+    if (o["taken_level"] is not None and o["taken_income"] is not None
+            and user["level"] >= o["taken_level"] and income >= o["taken_income"]):
         return False
     if o["metric"] == "make_item":
         max_unlocked = max((l for l in range(1, cfg.MAX_ITEM_LEVEL + 1)
@@ -1646,11 +1715,40 @@ def _order_unreachable(user: dict, o: dict, income: float) -> bool:
 
 def _pack_order(o: dict, income: float) -> dict:
     reward, bp_xp = order_reward(o["template"], income)
-    return {"slot": o["slot"], "template": o["template"], "metric": o["metric"],
+    # id и version уезжают клиенту и возвращаются на сдаче/отказе: без них
+    # «сдать» адресовало бы просто «активный заказ», а это уже мог быть другой
+    return {"id": o["id"], "version": o["version"],
+            "slot": o["slot"], "template": o["template"], "metric": o["metric"],
             "goal": o["goal"], "progress": min(o["progress"], o["goal"]),
             "done": o["progress"] >= o["goal"],
             "reward_cookies": reward, "reward_bp_xp": bp_xp,
             "difficulty": _order_difficulty(o["template"])}
+
+
+def _drop_stale_order(user: dict, o: dict) -> float:
+    """Снимает недостижимый заказ и возвращает вложенное в него. Отдаёт сумму
+    компенсации (0, если возвращать нечего).
+
+    Заказ снимает СЕРВЕР, а не игрок: цель стала недостижимой после престижа.
+    Печеньки, потраченные на спавны и здания ради этого заказа, при этом просто
+    исчезали — игрок платил за задание, которое у него отобрали. Возвращаем их.
+
+    DELETE с проверкой rowcount: два параллельных чтения состояния оба видят
+    мёртвый заказ, но снимает его один, и только он платит компенсацию.
+    Токен операции привязан к id строки — ретрай ручки не заплатит второй раз."""
+    uid = user["user_id"]
+    with db.tx():
+        if db.exec("DELETE FROM orders WHERE id = ? AND status = 'active'",
+                   (o["id"],)) == 0:
+            return 0.0
+        back = max(0.0, o["invested"] or 0.0)
+        if back:
+            add_cookies(uid, back, count_earned=False,
+                        operation_id=f"order_comp:{o['id']}",
+                        reason="order_compensation",
+                        ref_type="order", ref_id=str(o["id"]))
+    track(uid, "order_stale_dropped")
+    return back
 
 
 def orders_state(user: dict) -> dict:
@@ -1662,26 +1760,54 @@ def orders_state(user: dict) -> dict:
     active = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
     # мёртвый заказ снимаем сами и БЕСПЛАТНО (дневной лимит не тратится):
     # игрок в него не виноват, а иначе пекарня заблокирована навсегда
+    compensated = 0.0
     if active and _order_unreachable(user, active, income):
-        db.exec("DELETE FROM orders WHERE id = ?", (active["id"],))
-        track(uid, "order_stale_dropped")
+        compensated = _drop_stale_order(user, active)
         active = None
     offers = []
     if not active and left > 0:
+        # сперва чистка и пересчёт, потом дозаполнение: refresh удаляет офферы с
+        # исчезнувшим шаблоном, и без этого порядка игрок увидел бы два заказа
+        # вместо трёх до следующего запроса
+        _refresh_offers(user, income)
         offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
                       "ORDER BY slot", (uid,))
         if len(offers) != 3:
             _gen_order_offers(user, income)
-        else:
-            _refresh_offers(user, income)
-        offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
-                      "ORDER BY slot", (uid,))
+            offers = db.q("SELECT * FROM orders WHERE user_id = ? AND status = 'offer' "
+                          "ORDER BY slot", (uid,))
     return {"active": _pack_order(active, income) if active else None,
             "offers": [_pack_order(o, income) for o in offers],
-            "left_today": left, "per_day": cfg.ORDERS_PER_DAY}
+            "left_today": left, "per_day": cfg.ORDERS_PER_DAY,
+            # чтобы вкладка могла сказать, за что пришли печеньки
+            "compensated": compensated}
 
 
-def take_order(user: dict, slot: int) -> dict:
+def _active_order(user_id: int, order_id: int | None = None,
+                  version: int | None = None) -> dict:
+    """Активный заказ игрока — с проверкой, что клиент имеет в виду ЕГО.
+
+    Ручки сдачи и отказа раньше работали с «тем заказом, который вернул SELECT».
+    Между показом экрана и нажатием кнопки активный заказ мог смениться: старый
+    сняли как недостижимый, игрок со второй сессии взял новый — и «сдать» сдало
+    бы совсем другое задание. Клиент присылает (id, version), расхождение —
+    409 вместо тихой подмены.
+
+    Ни id, ни версии нет — проверка не включается: сборки Mini App, которые их
+    ещё не знают, обязаны продолжать играть."""
+    row = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'",
+                (user_id,))
+    if not row:
+        raise ValueError("err_no_item")
+    if order_id is not None and row["id"] != order_id:
+        raise economy.ConflictError(user_id)
+    if version is not None and row["version"] != version:
+        raise economy.ConflictError(user_id)
+    return row
+
+
+def take_order(user: dict, slot: int, order_id: int | None = None,
+               version: int | None = None) -> dict:
     uid = user["user_id"]
     if db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'active'", (uid,)):
         raise ValueError("err_order_active")
@@ -1693,34 +1819,50 @@ def take_order(user: dict, slot: int) -> dict:
                 (uid, slot))
     if not row:
         raise ValueError("err_no_item")
+    if order_id is not None and row["id"] != order_id:
+        # слот тот же, а заказ в нём уже другой: офферы пересобрались, пока
+        # игрок смотрел на старый экран
+        raise economy.ConflictError(uid)
+    if row["template"] not in cfg.ORDER_TEMPLATES:
+        # шаблон исчез из конфига: раньше такой оффер молча становился активным
+        # и вставал на вкладке безымянным заданием, которое нельзя выполнить
+        db.exec("DELETE FROM orders WHERE id = ? AND status = 'offer'", (row["id"],))
+        raise ValueError("err_no_item")
     # цель фиксируем по СЕГОДНЯШНЕМУ доходу: оффер мог пролежать с прошлой сессии
     income = hourly_income(uid)
-    p = _order_params(user, row["template"], income) \
-        if row["template"] in cfg.ORDER_TEMPLATES else None
+    p = _order_params(user, row["template"], income)
     with db.tx():
-        if p:
-            db.exec("UPDATE orders SET goal = ?, reward_cookies = ?, reward_bp_xp = ?, "
-                    "status = 'active' WHERE id = ?",
-                    (p["goal"], p["reward_cookies"], p["reward_bp_xp"], row["id"]))
-            row = dict(row, goal=p["goal"])
-        else:
-            db.exec("UPDATE orders SET status = 'active' WHERE id = ?", (row["id"],))
+        # version в условии: два /orders/take вплотную иначе оба «взяли бы» один
+        # оффер, а дневной лимит списался бы дважды
+        if db.exec("UPDATE orders SET goal = ?, reward_cookies = ?, reward_bp_xp = ?, "
+                   "status = 'active', version = version + 1, config_rev = ?, "
+                   "taken_level = ?, taken_income = ?, invested = 0 "
+                   "WHERE id = ? AND status = 'offer' AND version = ?",
+                   (p["goal"], p["reward_cookies"], p["reward_bp_xp"],
+                    ORDER_CONFIG_REV, user["level"], income,
+                    row["id"], row["version"])) == 0:
+            raise economy.ConflictError(uid)
+        row = dict(row, goal=p["goal"], version=row["version"] + 1)
         db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer'", (uid,))
     track(uid, "order_take")
     return _pack_order(dict(row, status="active"), income)
 
 
-def abandon_order(user: dict) -> dict:
+def abandon_order(user: dict, order_id: int | None = None,
+                  version: int | None = None) -> dict:
     """Отказ от активного заказа по своей воле. В отличие от снятия мёртвого
     заказа стоит одну попытку из дневного лимита — иначе можно было бы
-    бесконечно перебирать офферы в поисках удобного."""
+    бесконечно перебирать офферы в поисках удобного.
+
+    Компенсации тут нет намеренно: заказ бросает сам игрок, вложенное — его
+    решение, а не отобранное сервером."""
     uid = user["user_id"]
-    row = db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
-    if not row:
-        raise ValueError("err_no_item")
+    row = _active_order(uid, order_id, version)
     day = _utc_day(time.time())
     with db.tx():
-        db.exec("DELETE FROM orders WHERE id = ?", (row["id"],))
+        if db.exec("DELETE FROM orders WHERE id = ? AND status = 'active'",
+                   (row["id"],)) == 0:
+            raise ValueError("err_no_item")   # успел сняться параллельно
         _bump_orders_day(uid, day)
     track(uid, "order_abandon")
     return orders_state(db.get_user(uid))
@@ -1748,25 +1890,33 @@ def _bump_orders_day(user_id: int, day: str, completed: bool = False):
         "WHERE user_id = ?", (day, day, user_id))
 
 
-def order_progress(user_id: int, metric: str, amount: float):
-    """Прогресс активного заказа. make_item — «лучший достигнутый уровень»."""
+def order_progress(user_id: int, metric: str, amount: float, spent: float = 0.0):
+    """Прогресс активного заказа. make_item — «лучший достигнутый уровень».
+
+    Адресуется по id найденной строки, а не условием
+    `status = 'active' AND metric = ?` без LIMIT: пока уникальность активного
+    заказа не была фактом базы, такой UPDATE двигал ОБА заказа, если их
+    оказывалось два, и один из них потом было нечем объяснить.
+
+    `spent` — печеньки, которые игрок вложил в этот заказ (спавн, здание). Они
+    копятся в строке, чтобы вернуть их, если заказ снимет сервер."""
     if amount <= 0:
         return
-    if metric == "make_item":
-        db.exec("UPDATE orders SET progress = MAX(progress, ?) "
-                "WHERE user_id = ? AND status = 'active' AND metric = 'make_item'",
-                (amount, user_id))
-    else:
-        db.exec("UPDATE orders SET progress = progress + ? "
-                "WHERE user_id = ? AND status = 'active' AND metric = ?",
-                (amount, user_id, metric))
+    row = db.q1("SELECT id, metric FROM orders WHERE user_id = ? AND status = 'active'",
+                (user_id,))
+    if not row or row["metric"] != metric:
+        return
+    setter = ("progress = MAX(progress, ?)" if metric == "make_item"
+              else "progress = progress + ?")
+    db.exec(f"UPDATE orders SET {setter}, invested = invested + ? "
+            f"WHERE id = ? AND status = 'active'",
+            (amount, max(0.0, spent), row["id"]))
 
 
-def claim_order(user: dict) -> dict:
+def claim_order(user: dict, order_id: int | None = None,
+                version: int | None = None) -> dict:
     uid = user["user_id"]
-    row = db.q1("SELECT * FROM orders WHERE user_id = ? AND status = 'active'", (uid,))
-    if not row:
-        raise ValueError("err_no_item")
+    row = _active_order(uid, order_id, version)
     if row["progress"] < row["goal"]:
         raise ValueError("err_not_done")
     day = _utc_day(time.time())
@@ -1774,13 +1924,18 @@ def claim_order(user: dict) -> dict:
     # платим по ТЕКУЩЕМУ доходу: хранимая сумма могла быть выписана до престижа
     reward, bp_xp = order_reward(row["template"], hourly_income(uid))
     with db.tx():
-        # WHERE status = 'active' + rowcount: два параллельных клейма одного
-        # заказа иначе оба прошли бы проверку выше и заплатили дважды
-        if db.exec("UPDATE orders SET status = 'done', reward_cookies = ?, reward_bp_xp = ? "
-                   "WHERE id = ? AND status = 'active'",
-                   (reward, bp_xp, row["id"])) == 0:
+        # WHERE status = 'active' + version + rowcount: два параллельных клейма
+        # одного заказа иначе оба прошли бы проверку выше и заплатили дважды
+        if db.exec("UPDATE orders SET status = 'done', reward_cookies = ?, "
+                   "reward_bp_xp = ?, version = version + 1 "
+                   "WHERE id = ? AND status = 'active' AND version = ?",
+                   (reward, bp_xp, row["id"], row["version"])) == 0:
             raise ValueError("err_claimed")
-        add_cookies(uid, reward, count_earned=False)
+        # токен по строке заказа: ретрай ручки после потерянного ответа не
+        # заплатит награду второй раз
+        add_cookies(uid, reward, count_earned=False,
+                    operation_id=f"order_claim:{row['id']}",
+                    reason="order_reward", ref_type="order", ref_id=str(row["id"]))
         add_xp(uid, 0, bp_xp)
         _bump_orders_day(uid, day, completed=True)
     track(uid, "order_done")
@@ -2433,3 +2588,9 @@ def full_state(user_id: int) -> dict:
     # заведомо устаревшей — клиент вернул бы её и получил 409 на ровном месте
     state["revision"] = _revisions(user_id)
     return state
+
+
+# Разовая миграция заказов выполняется на импорте — как и backfill книги в
+# economy.py: к моменту, когда первая ручка тронет пекарню, строки уже должны
+# быть приведены к текущему набору шаблонов.
+backfill_orders_config()

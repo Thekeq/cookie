@@ -309,7 +309,9 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(require_revision))
                 (tg["id"], cell, level, cost))
         gl.bump_board(tg["id"])
         gl.quest_progress(tg["id"], "spawns", 1)
-        gl.order_progress(tg["id"], "spawns", 1)
+        # цена спавна запоминается в заказе: если сервер снимет заказ как
+        # недостижимый, вложенное вернётся игроку
+        gl.order_progress(tg["id"], "spawns", 1, spent=cost)
         # прямая покупка тоже бьёт рекорд: иначе игрок, купивший тир напрямую,
         # получал бы за него XP только после того, как соберёт его слиянием
         record = gl.claim_item_record(db.get_user(tg["id"]), level)
@@ -489,35 +491,47 @@ async def orders(tg: dict = Depends(tg_user)):
 
 class TakeOrder(BaseModel):
     slot: int = Field(ge=1, le=3)
+    # id оффера, который игрок видел в этом слоте. Необязателен: сборки Mini
+    # App, которые его ещё не шлют, продолжают работать как раньше
+    id: int | None = None
+
+
+class OrderRef(BaseModel):
+    """Какой именно заказ имеет в виду клиент. Оба поля необязательны — без
+    них ручка ведёт себя по-старому и работает с активным заказом игрока."""
+    id: int | None = None
+    version: int | None = None
 
 
 @router.post("/orders/take")
 async def order_take(body: TakeOrder, tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
     try:
-        active = gl.take_order(user, body.slot)
+        active = gl.take_order(user, body.slot, body.id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"active": active}
 
 
 @router.post("/orders/abandon")
-async def order_abandon(tg: dict = Depends(tg_user)):
+async def order_abandon(body: OrderRef | None = None, tg: dict = Depends(tg_user)):
     """Отказ от заказа: тратит одну попытку из дневного лимита.
     Мёртвые заказы (цель недостижима после престижа) снимаются сами и бесплатно."""
     user = _ensure_user(tg)
+    ref = body or OrderRef()
     try:
-        orders = gl.abandon_order(user)
+        orders = gl.abandon_order(user, ref.id, ref.version)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"orders": orders}
 
 
 @router.post("/orders/claim")
-async def order_claim(tg: dict = Depends(tg_user)):
+async def order_claim(body: OrderRef | None = None, tg: dict = Depends(tg_user)):
     user = _ensure_user(tg)
+    ref = body or OrderRef()
     try:
-        r = gl.claim_order(user)
+        r = gl.claim_order(user, ref.id, ref.version)
     except ValueError as e:
         raise HTTPException(400, str(e))
     r["cookies"] = db.get_user(tg["id"])["cookies"]

@@ -325,6 +325,8 @@ const dict = {
   order_claim: { en: 'Deliver order', uk: 'Здати замовлення', ru: 'Сдать заказ' },
   order_done_toast: { en: 'Order delivered! +{n} 🍪 and +{m} BP XP', uk: 'Замовлення здано! +{n} 🍪 та +{m} BP XP', ru: 'Заказ сдан! +{n} 🍪 и +{m} BP XP' },
   orders_limit: { en: 'New orders tomorrow', uk: 'Нові замовлення завтра', ru: 'Новые заказы завтра' },
+  // заказ снял сервер: цель стала недостижимой после перерождения, вложенное вернули
+  order_compensated: { en: 'Order withdrawn — {n} 🍪 you put in are back', uk: 'Замовлення скасовано — {n} 🍪, вкладені в нього, повернулись', ru: 'Заказ снят — {n} 🍪, вложенные в него, вернулись' },
   order_warmup: { en: 'Warm up the oven: {n} taps', uk: 'Розігрій піч: {n} тапів', ru: 'Разогрей печь: {n} тапов' },
   order_delivery: { en: 'Buy {n} cookies for the board', uk: 'Купи {n} печива на дошку', ru: 'Купи {n} печенек на доску' },
   order_batch: { en: 'Bake a batch: {n} merges', uk: 'Партія випічки: {n} злиттів', ru: 'Партия выпечки: {n} слияний' },

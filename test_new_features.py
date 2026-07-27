@@ -349,6 +349,132 @@ check("orders_completed=1", db.get_user(UID)["orders_completed"] == 1)
 r = c.get("/api/orders", headers=H(UID))
 check("new offers after claim", len(r.json()["offers"]) == 3)
 
+# --- S19: заказ адресуется id и версией, а не «тем, что вернул SELECT» ---
+import sqlite3 as _sq3
+
+
+def _orders_reset():
+    """Дневной лимит обнуляем: проверяем идентичность заказов, а не анти-гринд."""
+    db.update_user(UID, orders_day_count=0, orders_day=None)
+
+
+_orders_reset()
+o = c.get("/api/orders", headers=H(UID)).json()
+_off = o["offers"][0]
+check("s19: оффер несёт id и версию",
+      isinstance(_off.get("id"), int) and isinstance(_off.get("version"), int), str(_off)[:120])
+
+# взятие по чужому id: офферы пересобрались, пока экран висел открытым
+r = c.post("/api/orders/take", json={"slot": _off["slot"], "id": _off["id"] + 10_000},
+           headers=H(UID))
+check("s19: взятие чужого заказа отбито 409", r.status_code == 409, r.text[:150])
+check("s19: активного заказа не появилось",
+      db.q1("SELECT COUNT(*) c FROM orders WHERE user_id = ? AND status = 'active'",
+            (UID,))["c"] == 0)
+
+r = c.post("/api/orders/take", json={"slot": _off["slot"], "id": _off["id"]}, headers=H(UID))
+check("s19: взятие своего заказа проходит", r.status_code == 200, r.text[:150])
+_act = r.json()["active"]
+check("s19: версия выросла на взятии", _act["version"] == _off["version"] + 1,
+      (_off["version"], _act["version"]))
+_row = db.q1("SELECT * FROM orders WHERE id = ?", (_act["id"],))
+check("s19: снимок уровня и дохода записан",
+      _row["taken_level"] is not None and _row["taken_income"] is not None, dict(_row))
+check("s19: отпечаток конфига проставлен",
+      _row["config_rev"] == gl.ORDER_CONFIG_REV, _row["config_rev"])
+check("s19: офферы убраны после взятия",
+      db.q1("SELECT COUNT(*) c FROM orders WHERE user_id = ? AND status = 'offer'",
+            (UID,))["c"] == 0)
+
+# база держит уникальность активного заказа: соглашения в коде мало
+try:
+    db.exec("INSERT INTO orders (user_id, slot, template, metric, goal, status) "
+            "VALUES (?, 1, 'warmup', 'clicks', 10, 'active')", (UID,))
+    _dup_ok = True
+except _sq3.IntegrityError:
+    _dup_ok = False
+check("s19: второй активный заказ база не пускает", _dup_ok is False)
+
+# сдача с устаревшей версией бьётся о 409, а не сдаёт чужой заказ
+db.exec("UPDATE orders SET progress = goal WHERE id = ?", (_act["id"],))
+r = c.post("/api/orders/claim", json={"id": _act["id"], "version": _act["version"] - 1},
+           headers=H(UID))
+check("s19: сдача по старой версии отбита 409", r.status_code == 409, r.text[:150])
+check("s19: заказ остался активным",
+      db.q1("SELECT status FROM orders WHERE id = ?", (_act["id"],))["status"] == "active")
+r = c.post("/api/orders/claim", json={"id": _act["id"], "version": _act["version"]},
+           headers=H(UID))
+check("s19: сдача по своей версии проходит", r.status_code == 200, r.text[:150])
+
+# отказ по чужому id тоже отбивается
+_orders_reset()
+o = c.get("/api/orders", headers=H(UID)).json()
+_off = o["offers"][1]
+c.post("/api/orders/take", json={"slot": _off["slot"], "id": _off["id"]}, headers=H(UID))
+_aid = db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'active'", (UID,))["id"]
+r = c.post("/api/orders/abandon", json={"id": _aid + 10_000}, headers=H(UID))
+check("s19: отказ от чужого заказа отбит 409", r.status_code == 409, r.text[:150])
+check("s19: заказ на месте",
+      db.q1("SELECT COUNT(*) c FROM orders WHERE id = ?", (_aid,))["c"] == 1)
+
+# --- компенсация: заказ снял сервер, вложенное вернулось ---
+# make_item с целью выше открытого максимума = недостижим (так выглядит заказ
+# после перерождения), в него уже вложено 500 печенек
+db.exec("UPDATE orders SET metric = 'make_item', goal = 999, progress = 0, "
+        "invested = 500, taken_level = NULL, taken_income = NULL WHERE id = ?", (_aid,))
+_cook = db.get_user(UID)["cookies"]
+r = c.get("/api/orders", headers=H(UID)).json()
+check("s19: недостижимый заказ снят", r["active"] is None, str(r)[:120])
+check("s19: компенсация названа в ответе", r["compensated"] == 500, r["compensated"])
+check("s19: вложенное вернулось на баланс",
+      abs(db.get_user(UID)["cookies"] - (_cook + 500)) < 1e-6,
+      (_cook, db.get_user(UID)["cookies"]))
+check("s19: компенсация попала в книгу",
+      db.q1("SELECT COUNT(*) c FROM economy_ledger WHERE user_id = ? AND "
+            "reason = 'order_compensation'", (UID,))["c"] == 1)
+check("s19: компенсация не считается заработком",
+      db.q1("SELECT counts_earned e FROM economy_ledger WHERE user_id = ? AND "
+            "reason = 'order_compensation'", (UID,))["e"] == 0)
+
+# --- вложенное копится только у заказа СВОЕЙ метрики ---
+_orders_reset()
+o = c.get("/api/orders", headers=H(UID)).json()
+_off = next(x for x in o["offers"] if x["metric"] == "clicks") if any(
+    x["metric"] == "clicks" for x in o["offers"]) else o["offers"][0]
+c.post("/api/orders/take", json={"slot": _off["slot"], "id": _off["id"]}, headers=H(UID))
+_aid = db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'active'", (UID,))["id"]
+db.exec("UPDATE orders SET metric = 'spawns', goal = 50, progress = 0, invested = 0 "
+        "WHERE id = ?", (_aid,))
+gl.order_progress(UID, "merges", 3, spent=777)
+check("s19: чужая метрика не двигает ни прогресс, ни вложенное",
+      db.q1("SELECT progress, invested FROM orders WHERE id = ?", (_aid,))["invested"] == 0)
+gl.order_progress(UID, "spawns", 1, spent=120)
+_o = db.q1("SELECT progress, invested FROM orders WHERE id = ?", (_aid,))
+check("s19: своя метрика двигает прогресс", _o["progress"] == 1, dict(_o))
+check("s19: потраченное запомнено в заказе", _o["invested"] == 120, dict(_o))
+
+# --- офферы: пропавший слот дозаполняется, живые не пересобираются ---
+c.post("/api/orders/abandon", json={"id": _aid}, headers=H(UID))
+_orders_reset()
+c.get("/api/orders", headers=H(UID))
+_kept = db.q1("SELECT id, template FROM orders WHERE user_id = ? AND status = 'offer' "
+              "AND slot = 1", (UID,))
+db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer' AND slot = 3", (UID,))
+o = c.get("/api/orders", headers=H(UID)).json()
+check("s19: пропавший слот дозаполнен", len(o["offers"]) == 3, str(o)[:150])
+check("s19: остальные офферы не пересобраны",
+      db.q1("SELECT id FROM orders WHERE user_id = ? AND status = 'offer' AND slot = 1",
+            (UID,))["id"] == _kept["id"])
+
+# оффер с исчезнувшим из конфига шаблоном не должен доживать до вкладки:
+# без названия его нельзя ни понять, ни выполнить
+db.exec("UPDATE orders SET template = 'сгинувший' WHERE user_id = ? AND status = 'offer' "
+        "AND slot = 2", (UID,))
+o = c.get("/api/orders", headers=H(UID)).json()
+check("s19: мёртвый шаблон выброшен и слот переиздан",
+      all(x["template"] != "сгинувший" for x in o["offers"]) and len(o["offers"]) == 3,
+      str(o)[:150])
+
 # --- реролл квеста (1/день) ---
 r = c.get("/api/quests", headers=H(UID))
 check("reroll available", r.json()["reroll_available"] is True)

@@ -15,6 +15,10 @@ const DIFF_STARS = ['', '★', '★★', '★★★']
 const DIFF_CHEST = ['', '🎁', '🧰', '🏆'] // сундук растёт со сложностью
 
 interface Order {
+  /** id и версия строки: сервер сверяет их и отбивает действие, посчитанное
+   *  по заказу, которого уже нет (вторая сессия успела его сменить) */
+  id: number
+  version: number
   slot: number
   template: string
   metric: string
@@ -31,6 +35,8 @@ interface OrdersState {
   offers: Order[]
   left_today: number
   per_day: number
+  /** сервер снял недостижимый заказ и вернул вложенное в него */
+  compensated?: number
 }
 
 export default function BakeryTab() {
@@ -40,7 +46,14 @@ export default function BakeryTab() {
   const [orders, setOrders] = useState<OrdersState | null>(null)
 
   const load = () => {
-    api.get('/api/orders').then(setOrders).catch(() => {})
+    api.get('/api/orders').then((r: OrdersState) => {
+      setOrders(r)
+      // заказ снял сервер (цель стала недостижимой) — говорим, за что деньги
+      if (r.compensated) {
+        toast(t('order_compensated', { n: fmt(r.compensated) }))
+        refresh()
+      }
+    }).catch(() => {})
   }
   useEffect(() => {
     load()
@@ -49,23 +62,29 @@ export default function BakeryTab() {
     return () => clearInterval(timer)
   }, [])
 
-  const takeOrder = async (slot: number) => {
+  const takeOrder = async (o: Order) => {
     try {
-      await api.post('/api/orders/take', { slot })
+      await api.post('/api/orders/take', { slot: o.slot, id: o.id })
       sfxBuy()
       load()
     } catch (e: any) {
       sfxError()
+      // офферы пересобрались, пока экран висел открытым: перечитываем, иначе
+      // игрок жал бы кнопку заказа, которого уже нет
+      load()
       toast(te(e.detail), true)
     }
   }
 
   const abandonOrder = async () => {
+    if (!orders?.active) return
     try {
-      const r = await api.post('/api/orders/abandon')
+      const r = await api.post('/api/orders/abandon',
+        { id: orders.active.id, version: orders.active.version })
       setOrders(r.orders)
     } catch (e: any) {
       sfxError()
+      load()
       toast(te(e.detail), true)
     }
   }
@@ -73,7 +92,8 @@ export default function BakeryTab() {
   const claimOrder = async () => {
     try {
       await flushClicks() // тапы должны долететь до сервера (метрика clicks)
-      const r = await api.post('/api/orders/claim')
+      const r = await api.post('/api/orders/claim',
+        active ? { id: active.id, version: active.version } : undefined)
       hapticSuccess()
       sfxFanfare()
       toast(t('order_done_toast', { n: fmt(r.reward_cookies), m: fmt(r.reward_bp_xp) }))
@@ -81,6 +101,7 @@ export default function BakeryTab() {
       refresh()
     } catch (e: any) {
       sfxError()
+      load()
       toast(te(e.detail), true)
     }
   }
@@ -193,7 +214,7 @@ export default function BakeryTab() {
       {/* --- офферы: три заказа разной сложности --- */}
       {!active && orders.left_today > 0 &&
         orders.offers.map((o) => (
-          <div className="card ach offer-card" key={`${o.slot}-${o.template}`}>
+          <div className="card ach offer-card" key={o.id}>
             <span className="ico">{METRIC_ICO[o.metric] || '🧾'}</span>
             <div className="grow">
               <b style={{ fontSize: 14 }}>
@@ -204,7 +225,7 @@ export default function BakeryTab() {
                 {DIFF_CHEST[o.difficulty]} 🍪 {fmt(o.reward_cookies)} · 🎖️ {fmt(o.reward_bp_xp)} XP
               </div>
             </div>
-            <button className="claim-chip" onClick={() => takeOrder(o.slot)}>
+            <button className="claim-chip" onClick={() => takeOrder(o)}>
               {t('order_take')}
             </button>
           </div>
