@@ -54,31 +54,53 @@ export function shareRefLink(botUsername: string, userId: number, text: string) 
 }
 
 export class ApiError extends Error {
-  constructor(public detail: string) {
+  /** state приходит только с 409: сервер сразу отдаёт актуальный экран */
+  constructor(public detail: string, public state?: unknown) {
     super(detail)
   }
 }
 
-async function request(method: string, path: string, body?: unknown) {
+// Версия раскладки доски, которую игрок сейчас видит. Ход адресуется номерами
+// клеток, поэтому «слей 3 и 4», отправленное со старого экрана (вторая сессия
+// на другом устройстве успела всё переставить), слило бы не то, что задумано.
+// Возвращаем версию серверу и получаем 409 вместо чужого хода.
+let boardRevision = -1
+
+function noteRevision(data: any) {
+  if (typeof data?.revision?.board === 'number') boardRevision = data.revision.board
+}
+
+async function request(method: string, path: string, body?: unknown,
+                       withRevision = false) {
   const initData: string = getInitData()
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: 'tma ' + initData,
+    // язык интерфейса — сервер локализует тексты (магазин, ачивки) и пуши
+    'X-Lang': localStorage.getItem('lang') || 'en',
+  }
+  if (withRevision && boardRevision >= 0) headers['X-Board-Revision'] = String(boardRevision)
   const res = await fetch(path, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'tma ' + initData,
-      // язык интерфейса — сервер локализует тексты (магазин, ачивки) и пуши
-      'X-Lang': localStorage.getItem('lang') || 'en',
-    },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new ApiError(data.detail || `HTTP ${res.status}`)
+  if (!res.ok) {
+    // 409 несёт свежее состояние — версию из него принимаем сразу, иначе
+    // повторный ход ушёл бы с той же устаревшей и отбивался бы вечно
+    noteRevision(data?.state)
+    throw new ApiError(data.detail || `HTTP ${res.status}`, data?.state)
+  }
+  noteRevision(data)
   return data
 }
 
 export const api = {
   get: (path: string) => request('GET', path),
   post: (path: string, body?: unknown) => request('POST', path, body),
+  /** Ход по доске: отправляется вместе с версией раскладки. */
+  postBoard: (path: string, body?: unknown) => request('POST', path, body, true),
 }
 
 export function initTelegram() {

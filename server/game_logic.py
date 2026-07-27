@@ -939,7 +939,8 @@ def do_prestige(user: dict) -> dict:
             "energy = ?, energy_updated_at = ?, "
             "passive_collected_at = ?, farm_collected_at = ?, combo_mult = 1, "
             "prestige_points = ?, prestige_count = prestige_count + 1, "
-            "user_revision = user_revision + 1 "
+            # доска стёрта выше в этой же транзакции — версию двигаем вместе
+            "user_revision = user_revision + 1, board_revision = board_revision + 1 "
             "WHERE user_id = ? AND prestige_count = ? "
             "RETURNING cookies, xp, prestige_points",
             (kept_level, kept_xp, cfg.max_energy(kept_level), now, now, now,
@@ -1351,6 +1352,19 @@ def ref_count(user_id: int, qualified_only: bool = True) -> int:
         (user_id, cfg.REF_QUALIFY_LEVEL))["c"]
 
 
+def bump_board(user_id: int) -> None:
+    """Отмечает, что доска изменилась.
+
+    Клиент присылает увиденную версию доски заголовком X-Board-Revision, и по
+    расхождению его действие отбивается 409 вместо того, чтобы примениться к
+    ЧУЖОЙ раскладке: перетаскивание адресуется номерами клеток, а не самими
+    печеньками, поэтому «слить 3 и 4», отправленное со старого экрана, слило бы
+    в этих клетках то, что там оказалось потом. Двух сессий на одном аккаунте
+    достаточно, чтобы это случилось (телефон + десктоп — обычное дело)."""
+    db.exec("UPDATE users SET board_revision = board_revision + 1 WHERE user_id = ?",
+            (user_id,))
+
+
 def compact_board(user_id: int, earned_cells: int) -> int:
     """Сдвигает печеньки в начало доски, если они стоят ВНЕ заслуженной зоны, и
     возвращает их количество. Нужно игрокам, набравшим 25 предметов до введения
@@ -1370,6 +1384,7 @@ def compact_board(user_id: int, earned_cells: int) -> int:
                 db.exec("UPDATE board SET cell = ? WHERE id = ?", (-1 - i, r["id"]))
             for i, r in enumerate(rows):
                 db.exec("UPDATE board SET cell = ? WHERE id = ?", (i, r["id"]))
+            bump_board(user_id)
     return len(rows)
 
 
@@ -2311,6 +2326,14 @@ def _direct_max_level(user: dict) -> int:
     return max(1, max_item_unlocked(user["level"]) - cfg.SPAWN_DIRECT_GAP)
 
 
+def _revisions(user_id: int) -> dict:
+    """Пара версий: состояние игрока и раскладка доски."""
+    row = db.q1("SELECT user_revision, board_revision FROM users WHERE user_id = ?",
+                (user_id,))
+    return {"user": row["user_revision"] if row else 0,
+            "board": row["board_revision"] if row else 0}
+
+
 def full_state(user_id: int) -> dict:
     # full_state возвращается из каждой изменяющей ручки, поэтому сбрасываем
     # мемо дохода здесь: внутри одного ответа все расчёты используют одно
@@ -2329,7 +2352,7 @@ def full_state(user_id: int) -> dict:
     owned_skins = {r["skin_key"] for r in
                    db.q("SELECT skin_key FROM skins WHERE user_id = ?", (user_id,))}
     owned_skins.add("classic")
-    return {
+    state = {
         "user": {
             "user_id": user["user_id"],
             "username": user["username"],
@@ -2405,3 +2428,8 @@ def full_state(user_id: int) -> dict:
         "recipe": recipe_status(user),
         "event": active_event(),
     }
+    # версии читаются ПОСЛЕДНИМИ: выше по функции refresh_energy и last_seen_at
+    # уже успели тронуть строку, и снятая заранее версия уехала бы в ответ
+    # заведомо устаревшей — клиент вернул бы её и получил 409 на ровном месте
+    state["revision"] = _revisions(user_id)
+    return state

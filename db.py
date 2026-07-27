@@ -902,8 +902,18 @@ class DataBase:
         )
         return self.get_user(user_id), fresh is not None
 
+    # Колонки, изменение которых игрок увидеть не может: служебные отметки
+    # времени и флаг доставки пушей. Они меняются в фоне (нотификатор, каждый
+    # GET /api/state), и если бы они двигали user_revision, версия состояния
+    # устаревала бы сама по себе — клиент вернул бы её обратно и получил 409
+    # на первое же осмысленное действие. Ревизия считает изменения СМЫСЛА,
+    # а не изменения строки.
+    SILENT_COLUMNS = frozenset({"last_seen_at", "last_notified_at", "notify_blocked"})
+
     def update_user(self, user_id, **fields):
         cols = ", ".join(f"{k} = ?" for k in fields)
+        if fields and not set(fields) <= self.SILENT_COLUMNS:
+            cols += ", user_revision = user_revision + 1"
         self.exec(f"UPDATE users SET {cols} WHERE user_id = ?", (*fields.values(), user_id))
 
 

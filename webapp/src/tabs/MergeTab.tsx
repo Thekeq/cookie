@@ -99,7 +99,7 @@ export default function MergeTab() {
     if (busy.current) return
     busy.current = true
     try {
-      const s = await api.post('/api/merge/move', { from_cell: from, to_cell: to })
+      const s = await api.postBoard('/api/merge/move', { from_cell: from, to_cell: to })
       setState(s)
       if (s.merged_level) {
         hapticSuccess()
@@ -134,6 +134,9 @@ export default function MergeTab() {
       }
     } catch (e: any) {
       sfxError()
+      // 409 приходит вместе со свежей раскладкой: показываем её сразу, иначе
+      // игрок повторил бы тот же ход по доске, которой уже нет
+      if (e.state) setState(e.state)
       toast(te(e.detail), true)
     } finally {
       busy.current = false
@@ -145,13 +148,16 @@ export default function MergeTab() {
     if (busy.current) return
     busy.current = true
     try {
-      const s = await api.post('/api/merge/trash', { cell })
+      const s = await api.postBoard('/api/merge/trash', { cell })
       setState(s)
       hapticSuccess()
       sfxBuy()
       toast(t('trash_done', { n: fmt(s.trash_refund || 0) }))
     } catch (e: any) {
       sfxError()
+      // 409 приходит вместе со свежей раскладкой: показываем её сразу, иначе
+      // игрок повторил бы тот же ход по доске, которой уже нет
+      if (e.state) setState(e.state)
       toast(te(e.detail), true)
     } finally {
       busy.current = false
@@ -227,7 +233,7 @@ export default function MergeTab() {
   const spawn = async () => {
     try {
       await flushClicks() // сервер должен знать про все тапы до проверки цены
-      const s = await api.post('/api/merge/spawn', { level: buyLevel })
+      const s = await api.postBoard('/api/merge/spawn', { level: buyLevel })
       setState(s)
       haptic('medium')
       sfxBuy()
@@ -235,6 +241,9 @@ export default function MergeTab() {
       if (s.record) toast(t('record_lvl', { n: s.record.level, xp: fmt(s.record.xp) }))
     } catch (e: any) {
       sfxError()
+      // 409 приходит вместе со свежей раскладкой: показываем её сразу, иначе
+      // игрок повторил бы тот же ход по доске, которой уже нет
+      if (e.state) setState(e.state)
       toast(te(e.detail), true)
     }
   }

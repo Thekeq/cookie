@@ -95,6 +95,8 @@ export interface RefMilestone {
 }
 
 export interface GameState {
+  /** версии состояния; клиент возвращает board обратно на ходах по доске */
+  revision?: { user: number; board: number }
   user: UserState
   farm: { buildings: Record<string, number>; cps: number }
   upgrades_owned: string[]

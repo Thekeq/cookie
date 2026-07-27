@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from server import game_config as cfg
 from server import game_logic as gl
 from server.auth import tg_user
+from server.deps import require_revision
 from server.game_logic import db
 
 router = APIRouter(prefix="/api")
@@ -273,7 +274,7 @@ class SpawnIn(BaseModel):
 
 
 @router.post("/merge/spawn")
-async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
+async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(require_revision)):
     _ensure_user(tg)
     # сбор дохода + все проверки + списание — одна транзакция
     with db.tx():
@@ -306,6 +307,7 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
         # paid — фактически вложенное; от него считается возврат при переплавке
         db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, ?, ?, ?)",
                 (tg["id"], cell, level, cost))
+        gl.bump_board(tg["id"])
         gl.quest_progress(tg["id"], "spawns", 1)
         gl.order_progress(tg["id"], "spawns", 1)
         # прямая покупка тоже бьёт рекорд: иначе игрок, купивший тир напрямую,
@@ -317,7 +319,7 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(tg_user)):
 
 
 @router.post("/merge/move")
-async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
+async def move(mv: MergeMove, tg: dict = Depends(require_revision)):
     user = _ensure_user(tg)
     if not (0 <= mv.from_cell < cfg.BOARD_SIZE and 0 <= mv.to_cell < cfg.BOARD_SIZE) \
             or mv.from_cell == mv.to_cell:
@@ -331,8 +333,10 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
         # перенос в пустую клетку — только в открытую (из закрытой выйти можно)
         if mv.to_cell >= gl.merge_cells_unlocked_for(user):
             raise HTTPException(400, "err_cell_locked")
-        db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = ?",
-                (mv.to_cell, tg["id"], mv.from_cell))
+        with db.tx():
+            db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = ?",
+                    (mv.to_cell, tg["id"], mv.from_cell))
+            gl.bump_board(tg["id"])
         return gl.full_state(tg["id"])
 
     dst = board[mv.to_cell]
@@ -347,6 +351,7 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
             db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = ?",
                     (mv.from_cell, tg["id"], mv.to_cell))
             db.exec("UPDATE board SET cell = ? WHERE user_id = ? AND cell = -1", (mv.to_cell, tg["id"]))
+            gl.bump_board(tg["id"])
         return gl.full_state(tg["id"])
 
     # merge!
@@ -364,6 +369,7 @@ async def move(mv: MergeMove, tg: dict = Depends(tg_user)):
         db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], mv.from_cell))
         db.exec("UPDATE board SET item_level = ?, paid = ? WHERE user_id = ? AND cell = ?",
                 (new_level, paid, tg["id"], mv.to_cell))
+        gl.bump_board(tg["id"])
         db.exec("UPDATE users SET total_merges = total_merges + 1 "
                 "WHERE user_id = ?", (tg["id"],))
         gl.add_xp(tg["id"], cfg.merge_reward_xp(new_level),
@@ -390,7 +396,7 @@ class TrashIn(BaseModel):
 
 
 @router.post("/merge/trash")
-async def trash(body: TrashIn, tg: dict = Depends(tg_user)):
+async def trash(body: TrashIn, tg: dict = Depends(require_revision)):
     """Печенька в мусорку/печь: клетка освобождается, возвращается TRASH_REFUND
     от ФАКТИЧЕСКИ вложенного (board.paid). По текущей цене считать нельзя:
     доска, собранная в бедности, переплавлялась бы по ценам богатого игрока."""
@@ -404,6 +410,7 @@ async def trash(body: TrashIn, tg: dict = Depends(tg_user)):
             raise HTTPException(400, "err_empty_cell")
         level = row["item_level"]
         db.exec("DELETE FROM board WHERE user_id = ? AND cell = ?", (tg["id"], body.cell))
+        gl.bump_board(tg["id"])
         # строки, созданные до появления paid, оцениваем по минимальной цене
         invested = row["paid"] or cfg.legacy_item_value(level)
         refund = invested * cfg.TRASH_REFUND

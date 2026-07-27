@@ -586,6 +586,83 @@ db.exec("UPDATE bp_claims SET season_id = ? WHERE user_id = ?", (_season - 1, UI
 r = bp_claim(1)
 check("bp: прошлый сезон не блокирует новый", r.status_code == 200, r.text[:150])
 
+# ---------- S18: версия состояния и 409 state_conflict ----------
+
+def _rev(uid=UID):
+    return db.q1("SELECT user_revision, board_revision FROM users WHERE user_id = ?",
+                 (uid,))
+
+
+db.exec("DELETE FROM board WHERE user_id = ?", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 0, 1, 10)", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 1, 1, 10)", (UID,))
+
+_st = c.get("/api/state", headers=H(UID)).json()
+check("rev: состояние отдаёт обе версии",
+      isinstance(_st.get("revision", {}).get("user"), int)
+      and isinstance(_st["revision"].get("board"), int), str(_st.get("revision")))
+
+# Чтение состояния не двигает версию ДОСКИ — иначе ход с только что открытого
+# экрана отбивался бы 409 сам по себе. Версия ИГРОКА на чтении двигаться может и
+# двигается: пассивный доход фермы капает при каждом заходе, а это настоящий
+# минт печенек. Ровно поэтому клиент возвращает только X-Board-Revision.
+_before = _rev()
+c.get("/api/state", headers=H(UID))
+c.get("/api/state", headers=H(UID))
+check("rev: чтение состояния не двигает версию доски",
+      _rev()["board_revision"] == _before["board_revision"], (_before, _rev()))
+_u0 = _rev()["user_revision"]
+db.update_user(UID, last_seen_at=time.time())
+check("rev: служебная отметка не двигает версию игрока",
+      _rev()["user_revision"] == _u0, (_u0, _rev()))
+db.update_user(UID, total_clicks=db.get_user(UID)["total_clicks"] + 1)
+check("rev: осмысленная запись версию двигает",
+      _rev()["user_revision"] == _u0 + 1, (_u0, _rev()))
+
+# ход по доске двигает ТОЛЬКО версию доски у того, кто ходил
+_b0 = _rev()["board_revision"]
+r = c.post("/api/merge/move", json={"from_cell": 0, "to_cell": 1}, headers=H(UID))
+check("rev: слияние прошло", r.status_code == 200, r.text[:150])
+_b1 = _rev()["board_revision"]
+check("rev: слияние подняло версию доски", _b1 > _b0, (_b0, _b1))
+check("rev: новая версия уехала в ответ", r.json()["revision"]["board"] == _b1,
+      (r.json()["revision"], _b1))
+
+# устаревшая версия -> 409 со свежим состоянием, ход НЕ применён
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 5, 3, 10)", (UID,))
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 6, 3, 10)", (UID,))
+_merges_before = db.get_user(UID)["total_merges"]
+r = c.post("/api/merge/move", json={"from_cell": 5, "to_cell": 6},
+           headers={**H(UID), "X-Board-Revision": str(_b0)})
+check("rev: ход со старого экрана отбит 409", r.status_code == 409, r.text[:150])
+check("rev: 409 назвал причину кодом ошибки",
+      r.json().get("detail") == "err_state_conflict", r.text[:150])
+check("rev: 409 принёс свежее состояние",
+      (r.json().get("state") or {}).get("revision", {}).get("board") == _b1,
+      str(r.json().get("state", {}).get("revision")))
+check("rev: отбитый ход ничего не слил",
+      db.get_user(UID)["total_merges"] == _merges_before,
+      (db.get_user(UID)["total_merges"], _merges_before))
+check("rev: печеньки остались на своих клетках",
+      db.q1("SELECT COUNT(*) c FROM board WHERE user_id = ? AND cell IN (5, 6)",
+            (UID,))["c"] == 2)
+
+# актуальная версия проходит
+r = c.post("/api/merge/move", json={"from_cell": 5, "to_cell": 6},
+           headers={**H(UID), "X-Board-Revision": str(_b1)})
+check("rev: ход со свежего экрана проходит", r.status_code == 200, r.text[:150])
+
+# заголовка нет — проверки нет: старые сборки Mini App работают как раньше
+r = c.post("/api/merge/trash", json={"cell": 6}, headers=H(UID))
+check("rev: без заголовка проверка не включается", r.status_code == 200, r.text[:150])
+
+# мусор в заголовке не должен превращаться в вечный 409
+db.exec("INSERT INTO board (user_id, cell, item_level, paid) VALUES (?, 7, 2, 10)", (UID,))
+r = c.post("/api/merge/trash", json={"cell": 7},
+           headers={**H(UID), "X-Board-Revision": "not-a-number"})
+check("rev: битый заголовок игнорируется, а не блокирует игру",
+      r.status_code == 200, r.text[:150])
+
 # --- админские поля валидируются схемой ---
 from server.routers.admin import PromoCreate
 import pydantic

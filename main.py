@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from bot.loader import bot, dp
 from bot.handlers import start, payments
 from bot.notifier import run_notifier
+from server.economy import ConflictError
 from server.routers import game, meta, admin, farm
 
 # Логи: раньше был только basicConfig(WARNING) в stdout, то есть про поломку
@@ -51,7 +52,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-Lang"],
+    allow_headers=["Authorization", "Content-Type", "X-Lang",
+                   "X-User-Revision", "X-Board-Revision"],
 )
 
 
@@ -66,6 +68,40 @@ async def limit_body_size(request, call_next):
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse({"detail": "Payload too large"}, status_code=413)
     return await call_next(request)
+
+
+@app.exception_handler(ConflictError)
+async def state_conflict(request, exc: ConflictError):
+    """409 + свежее состояние одним ответом.
+
+    Клиенту нельзя просто сказать «не получилось»: он не знает, что именно
+    разошлось, а слепой ретрай отправил бы тот же устаревший ход ещё раз.
+    Отдаём состояние прямо здесь — игрок видит обновлённый экран сразу, а не
+    после лишнего круга запросов. `detail` держим потому, что весь фронт
+    читает ошибки из него."""
+    from server import game_logic as gl
+    # у ошибки драйвера (см. ниже) user_id нет — тогда состояние не прикладываем
+    user_id = getattr(exc, "user_id", None)
+    try:
+        state = gl.full_state(user_id) if user_id else None
+    except Exception:            # игрока могло не быть вовсе — 409 важнее
+        logging.exception("full_state failed while building 409 for %s", user_id)
+        state = None
+    return JSONResponse(status_code=409,
+                        content={"detail": "err_state_conflict",
+                                 "error": "state_conflict", "state": state})
+
+
+# На PostgreSQL проигравший в гонке транзакции получает не rowcount 0, а
+# SerializationFailure. Для игрока это ровно тот же случай «состояние уехало»,
+# и отвечать надо так же 409, а не 500. Модуля здесь пока нет — обработчик
+# регистрируется сам, когда появится драйвер.
+try:                                                   # pragma: no cover
+    from psycopg import errors as _pg_errors
+
+    app.add_exception_handler(_pg_errors.SerializationFailure, state_conflict)
+except ImportError:
+    pass
 
 
 app.include_router(meta.router)

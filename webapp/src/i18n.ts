@@ -273,6 +273,8 @@ const dict = {
   err_no_cookies: { en: 'Not enough cookies', uk: 'Не вистачає печива', ru: 'Не хватает печенек' },
   err_click_max: { en: 'Level up to upgrade the click further', uk: 'Візьми новий рівень, щоб качати клік далі', ru: 'Возьми новый уровень, чтобы качать клик дальше' },
   err_bad_move: { en: 'Invalid move', uk: 'Некоректний хід', ru: 'Некорректный ход' },
+  // доска изменилась в другой сессии — ход отменён, на экране уже новая раскладка
+  err_state_conflict: { en: 'Board changed — check it and try again', uk: 'Дошка змінилася — поглянь і спробуй ще', ru: 'Доска изменилась — посмотри и попробуй снова' },
   err_empty_cell: { en: 'Empty cell', uk: 'Порожня клітинка', ru: 'Пустая клетка' },
   err_max_item: { en: 'Max cookie level reached', uk: 'Максимальний рівень печива', ru: 'Максимальный уровень печеньки' },
   err_item_locked: { en: 'Unlocks at player level {n}', uk: 'Відкриється на {n} рівні гравця', ru: 'Откроется на {n} уровне игрока' },
