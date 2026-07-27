@@ -92,7 +92,7 @@ export default function BakeryTab() {
   const claimOrder = async () => {
     try {
       await flushClicks() // тапы должны долететь до сервера (метрика clicks)
-      const r = await api.post('/api/orders/claim',
+      const r = await api.postOnce('/api/orders/claim',
         active ? { id: active.id, version: active.version } : undefined)
       hapticSuccess()
       sfxFanfare()

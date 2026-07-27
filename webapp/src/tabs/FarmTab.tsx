@@ -31,10 +31,12 @@ export default function FarmTab() {
     })
   }, [])
 
-  const post = async (path: string, key: string) => {
+  // once — покупка постройки: у неё на сервере есть токен идемпотентности,
+  // поэтому оборванный ответ можно переспросить, не купив вторую
+  const post = async (path: string, key: string, once = false) => {
     try {
       await flushClicks() // сервер должен знать про все тапы до проверки цены
-      const f = await api.post(path, { key })
+      const f = once ? await api.postOnce(path, { key }) : await api.post(path, { key })
       setFarm(f)
       sfxBuy()
       refresh()
@@ -109,7 +111,7 @@ export default function FarmTab() {
             </div>
             {b.unlocked ? (
               <button className="claim-chip" disabled={liveBalance < b.cost}
-                      onClick={() => post('/api/farm/buy_building', b.key)}>
+                      onClick={() => post('/api/farm/buy_building', b.key, true)}>
                 🍪 {fmt(b.cost)}
               </button>
             ) : (

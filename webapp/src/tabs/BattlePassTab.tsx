@@ -30,7 +30,7 @@ export default function BattlePassTab() {
 
   const claim = async (level: number, track: 'free' | 'premium') => {
     try {
-      const r = await api.post('/api/battlepass/claim', { level, track })
+      const r = await api.postOnce('/api/battlepass/claim', { level, track })
       hapticSuccess()
       sfxBuy()
       toast(`+${fmt(r.reward.cookies)} 🍪`)

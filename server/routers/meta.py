@@ -5,9 +5,11 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
 from server.auth import tg_user
+from server.deps import op_token
 from server.game_logic import db
 
 router = APIRouter(prefix="/api")
@@ -216,7 +218,12 @@ class BPClaim(BaseModel):
 
 
 @router.post("/battlepass/claim")
-async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user)):
+async def bp_claim(body: BPClaim, tg: dict = Depends(tg_user),
+                   op: str = Depends(op_token)):
+    return economy.replayable(op, tg["id"], "bp_claim", lambda: _bp_claim(body, tg))
+
+
+def _bp_claim(body: "BPClaim", tg: dict) -> dict:
     # сезон приводим к текущему ДО чтения: иначе клейм на границе сезонов мог
     # уйти в старый season_id, и после сброса тот же уровень забирался снова
     user = gl.ensure_user_season(tg["id"])

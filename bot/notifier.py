@@ -13,6 +13,7 @@ import time
 
 from aiogram.exceptions import TelegramForbiddenError
 
+from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
 from server.game_logic import db
@@ -99,6 +100,12 @@ def _backup_db():
         log.info("бэкап базы: %s", path)
 
 
+def _prune_ops():
+    """TTL токенов идемпотентности: строка с сохранённым ответом пишется на
+    каждый клейм и каждую покупку, а нужна ровно на время ретраев."""
+    economy.prune_ops(cfg.OPS_TTL_DAYS)
+
+
 def _prune_boosts():
     """Истёкшие бусты не удалялись никогда, а строка добавляется на каждую
     золотую печеньку. active_boosts читается из click_multiplier на КАЖДЫЙ
@@ -129,6 +136,7 @@ async def run_notifier(bot):
         # уведомлению и увидит несброшенный сезонный прогресс
         for name, job in (("season rollover", _rollover_seasons),
                           ("events prune", _prune_events),
+                          ("ops prune", _prune_ops),
                           ("boosts prune", _prune_boosts),
                           ("db backup", _backup_db)):
             try:

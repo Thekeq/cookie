@@ -4,10 +4,11 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
 from server.auth import tg_user
-from server.deps import require_revision
+from server.deps import op_token, require_revision
 from server.game_logic import db
 
 router = APIRouter(prefix="/api")
@@ -47,15 +48,19 @@ async def daily(tg: dict = Depends(tg_user)):
 
 
 @router.post("/daily/claim")
-async def daily_claim(tg: dict = Depends(tg_user)):
+async def daily_claim(tg: dict = Depends(tg_user), op: str = Depends(op_token)):
     user = _ensure_user(tg)
-    try:
-        r = gl.claim_daily(user)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    r["cookies"] = db.get_user(tg["id"])["cookies"]
-    r["daily"] = gl.daily_state(db.get_user(tg["id"]))
-    return r
+
+    def run():
+        try:
+            r = gl.claim_daily(user)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        r["cookies"] = db.get_user(tg["id"])["cookies"]
+        r["daily"] = gl.daily_state(db.get_user(tg["id"]))
+        return r
+
+    return economy.replayable(op, tg["id"], "daily_claim", run)
 
 
 # ---------- ежедневные задания ----------
@@ -527,16 +532,21 @@ async def order_abandon(body: OrderRef | None = None, tg: dict = Depends(tg_user
 
 
 @router.post("/orders/claim")
-async def order_claim(body: OrderRef | None = None, tg: dict = Depends(tg_user)):
+async def order_claim(body: OrderRef | None = None, tg: dict = Depends(tg_user),
+                      op: str = Depends(op_token)):
     user = _ensure_user(tg)
     ref = body or OrderRef()
-    try:
-        r = gl.claim_order(user, ref.id, ref.version)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    r["cookies"] = db.get_user(tg["id"])["cookies"]
-    r["orders"] = gl.orders_state(db.get_user(tg["id"]))
-    return r
+
+    def run():
+        try:
+            r = gl.claim_order(user, ref.id, ref.version)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        r["cookies"] = db.get_user(tg["id"])["cookies"]
+        r["orders"] = gl.orders_state(db.get_user(tg["id"]))
+        return r
+
+    return economy.replayable(op, tg["id"], "order_claim", run)
 
 
 # ---------- стартовый чеклист ----------

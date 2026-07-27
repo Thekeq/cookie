@@ -71,7 +71,7 @@ function noteRevision(data: any) {
 }
 
 async function request(method: string, path: string, body?: unknown,
-                       withRevision = false) {
+                       withRevision = false, opId = '') {
   const initData: string = getInitData()
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -80,6 +80,7 @@ async function request(method: string, path: string, body?: unknown,
     'X-Lang': localStorage.getItem('lang') || 'en',
   }
   if (withRevision && boardRevision >= 0) headers['X-Board-Revision'] = String(boardRevision)
+  if (opId) headers['X-Op-Id'] = opId
   const res = await fetch(path, {
     method,
     headers,
@@ -96,11 +97,36 @@ async function request(method: string, path: string, body?: unknown,
   return data
 }
 
+function opId(): string {
+  const c: any = window.crypto
+  return c?.randomUUID ? c.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+// Денежное действие: один токен на одно нажатие.
+//
+// Мобильная сеть теряет ОТВЕТ чаще, чем запрос: награда выдана, до телефона
+// не доехала. Без токена повтор упирается в err_claimed, и для игрока это
+// выглядит как «награду съели». С токеном сервер отдаёт ровно тот ответ,
+// который потерялся, поэтому повторяем сами и молча — но только когда fetch
+// умер на сети. Ответ сервера (любой код) — это результат, его не повторяем.
+async function postOnce(path: string, body?: unknown) {
+  const op = opId()
+  try {
+    return await request('POST', path, body, false, op)
+  } catch (e) {
+    if (e instanceof ApiError) throw e
+    return await request('POST', path, body, false, op)
+  }
+}
+
 export const api = {
   get: (path: string) => request('GET', path),
   post: (path: string, body?: unknown) => request('POST', path, body),
   /** Ход по доске: отправляется вместе с версией раскладки. */
   postBoard: (path: string, body?: unknown) => request('POST', path, body, true),
+  /** Награда или покупка: повтор не начисляет второй раз (см. postOnce). */
+  postOnce,
 }
 
 export function initTelegram() {

@@ -163,11 +163,47 @@ def begin_op(operation_id: str, user_id: int, kind: str) -> dict | None:
 
 
 def finish_op(operation_id: str, response: dict) -> dict:
-    """Запоминает ответ, чтобы ретрай получил ровно его."""
+    """Запоминает ответ, чтобы ретрай получил ровно его.
+
+    default=str — страховка, а не вольность: несериализуемое поле в ответе
+    иначе рвало бы транзакцию уже ПОСЛЕ выдачи награды, и игрок вместо
+    печенек видел бы 500."""
     db.exec("UPDATE economy_ops SET status = 'done', response = ? "
             "WHERE operation_id = ? AND status = 'open'",
-            (json.dumps(response, ensure_ascii=False), operation_id))
+            (json.dumps(response, ensure_ascii=False, default=str), operation_id))
     return response
+
+
+def replayable(operation_id: str, user_id: int, kind: str, fn):
+    """Выполняет fn ровно один раз на токен; повтор получает тот же ответ.
+
+    Зачем именно ответ, а не просто «не начислять дважды». Мобильная сеть
+    теряет ОТВЕТ чаще, чем запрос: награда выдана, до телефона не доехала.
+    Игрок жмёт ещё раз и без токена получает err_claimed — то есть выглядит
+    это как «награду съело», и это худший из возможных исходов для удержания.
+    С токеном второе нажатие отдаёт ровно тот ответ, который потерялся.
+
+    Токена нет — просто выполняем: сборки Mini App живут в чатах вечно, и
+    старые обязаны работать ровно как раньше.
+
+    fn выполняется ВНУТРИ транзакции вместе с записью токена, поэтому она
+    обязана быть синхронной: await внутри db.tx() пустил бы в открытую
+    транзакцию соседнюю корутину — соединение у потока одно на всех."""
+    if not operation_id:
+        return fn()
+    with db.tx():
+        seen = begin_op(operation_id, user_id, kind)
+        if seen is not None:
+            return seen
+        return finish_op(operation_id, fn())
+
+
+def prune_ops(ttl_days: float) -> int:
+    """Токены — расходник: они нужны ровно на время ретраев, а строка пишется
+    на каждый клейм и каждую покупку. Без TTL таблица растёт вечно, причём
+    вместе с сохранёнными ответами (килобайты на строку)."""
+    return db.exec("DELETE FROM economy_ops WHERE created_at < ?",
+                   (time.time() - ttl_days * 86400,))
 
 
 # ---------- входящие остатки ----------

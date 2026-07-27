@@ -2,9 +2,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
 from server.auth import tg_user
+from server.deps import op_token
 from server.game_logic import db
 
 router = APIRouter(prefix="/api/farm")
@@ -22,6 +24,12 @@ async def farm_state(tg: dict = Depends(tg_user)):
     # единственный путь к сбору дохода, у которого не было лимитера вовсе.
     # От двойного начисления защищает CAS в collect_farm, это второй слой
     gl.check_rate_limit(tg["id"], "farm", cfg.STATE_PER_MINUTE, 60)
+    return _farm_payload(tg)
+
+
+def _farm_payload(tg: dict) -> dict:
+    """Экран фермы отдельно от ручки и синхронно: покупка заворачивается в
+    replayable, а там нельзя await — ответ считается внутри транзакции."""
     user = _user(tg)
     collected = gl.collect_farm(user)
     counts = gl.farm_counts(tg["id"])
@@ -80,7 +88,13 @@ class KeyIn(BaseModel):
 
 
 @router.post("/buy_building")
-async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
+async def buy_building(body: KeyIn, tg: dict = Depends(tg_user),
+                       op: str = Depends(op_token)):
+    return economy.replayable(op, tg["id"], "buy_building",
+                              lambda: _buy_building(body, tg))
+
+
+def _buy_building(body: "KeyIn", tg: dict) -> dict:
     user = _user(tg)
     b = cfg.FARM_BUILDINGS.get(body.key)
     if not b:
@@ -107,7 +121,7 @@ async def buy_building(body: KeyIn, tg: dict = Depends(tg_user)):
         gl.order_progress(tg["id"], "buildings", 1, spent=cost)
     if not owned and not gl.farm_counts(tg["id"]).keys() - {body.key}:
         gl.track(tg["id"], "first_building")
-    return await farm_state(tg)
+    return _farm_payload(tg)
 
 
 @router.post("/buy_upgrade")

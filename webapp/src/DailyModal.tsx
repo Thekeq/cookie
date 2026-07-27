@@ -16,7 +16,7 @@ export default function DailyModal({ daily, onClose }: { daily: DailyState; onCl
     if (busy) return
     setBusy(true)
     try {
-      const r = await api.post('/api/daily/claim')
+      const r = await api.postOnce('/api/daily/claim')
       hapticSuccess()
       sfxFanfare()
       toast(r.freeze_used ? t('streak_frozen') : t('daily_got', { d: r.streak, n: fmt(r.reward) }))
