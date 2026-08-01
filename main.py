@@ -1,7 +1,12 @@
-"""Один процесс: FastAPI (API + раздача Mini App) + aiogram-бот на polling."""
+"""Точка входа: FastAPI (API + раздача Mini App) и aiogram-бот.
+
+Что именно поднимает процесс, решают две переменные: ROLE (api / scheduler /
+all) и BOT_MODE (polling / webhook). Дефолт остался прежним — всё в одном
+процессе на поллинге."""
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -9,8 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from bot import webhook
 from bot.loader import bot, dp
-from bot.handlers import start, payments
 from bot.notifier import run_notifier
 from server import settings
 from server.economy import ConflictError
@@ -39,10 +44,34 @@ for noisy in ("aiogram.event", "aiogram.dispatcher", "uvicorn.access", "httpx"):
 # В проде docs/openapi не нужны: схема выдаёт наружу все ручки, включая
 # /api/admin/*, вместе с формой тел запросов — удобная карта для перебора
 DEBUG = settings.DEBUG
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    """Регистрация webhook'а — после того, как сервер начал слушать.
+
+    Порядок важен: `setWebhook` разрешает Telegram присылать апдейты немедленно,
+    и сделай мы это до старта uvicorn — первые апдейты пришли бы в закрытый
+    порт. Здесь же процесс уже принимает запросы.
+
+    На выходе webhook НЕ снимаем. Рестарт — это норма (деплой, systemd), а
+    снятый webhook означает, что за время перезапуска бот молчит, вместо того
+    чтобы получить накопленное сразу после подъёма."""
+    if settings.BOT_MODE == "webhook":
+        try:
+            logging.info("webhook: %s", await webhook.ensure_registered(bot))
+        except Exception:
+            # Не роняем API: Mini App отдаётся и без бота, а Telegram мы
+            # переспросим по расписанию (job webhook_check)
+            logging.exception("webhook: зарегистрировать не удалось")
+    yield
+
+
 app = FastAPI(title="Cookie Merge API",
               docs_url="/docs" if DEBUG else None,
               redoc_url=None,
-              openapi_url="/openapi.json" if DEBUG else None)
+              openapi_url="/openapi.json" if DEBUG else None,
+              lifespan=lifespan)
 
 # Источники ограничиваем WEBAPP_URL: allow_origins=["*"] позволял любому сайту
 # дёргать API из браузера жертвы. Сама initData при этом остаётся защитой от
@@ -109,6 +138,9 @@ app.include_router(meta.router)
 app.include_router(game.router)
 app.include_router(admin.router)
 app.include_router(farm.router)
+# webhook — до монтирования статики в корень (Mount("/") совпадает с любым
+# путём) и только при BOT_MODE=webhook; сам маршрут живёт в bot/webhook.py
+webhook.install(app)
 
 
 @app.get("/healthz")
@@ -138,8 +170,14 @@ if os.path.isdir(DIST):
 
 
 async def run_bot():
-    dp.include_router(start.router)
-    dp.include_router(payments.router)
+    """Поллинг. Поднимается только при BOT_MODE=polling — см. tasks_for_role.
+
+    delete_webhook обязателен: с зарегистрированным webhook'ом Telegram не
+    отдаёт апдейты через getUpdates вовсе, и бот молчал бы без единой ошибки.
+    Обратная сторона того же — запуск локальной копии на поллинге снимает
+    БОЕВОЙ webhook, поэтому в webhook-режиме есть задача, которая его
+    возвращает (webhook_check)."""
+    webhook.setup_dispatcher()
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
@@ -180,11 +218,16 @@ def tasks_for_role() -> list:
 
     Поллинг тянет только ROLE=all: физически его может вести один процесс, и
     settings.problems() отказывается стартовать с ROLE=api/scheduler на
-    поллинге, чтобы апдейты не остались без читателя молча."""
+    поллинге, чтобы апдейты не остались без читателя молча.
+
+    В webhook-режиме отдельной задачи под бота нет: апдейты приходят обычными
+    HTTP-запросами в run_api. Раньше run_bot поднимался всегда и внутри всё
+    равно вызывал delete_webhook — то есть BOT_MODE=webhook в конфиге ничего не
+    менял, кроме проверок при старте."""
     jobs = []
     if settings.ROLE in ("all", "api"):
         jobs.append(run_api())
-    if settings.ROLE == "all":
+    if settings.ROLE == "all" and settings.BOT_MODE == "polling":
         jobs.append(run_bot())
     if settings.ROLE in ("all", "scheduler"):
         jobs.append(run_notifier(bot))

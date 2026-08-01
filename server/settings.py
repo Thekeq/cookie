@@ -159,6 +159,11 @@ def problems() -> list[tuple[str, bool]]:
         # из них его не поднимает, и апдейты молча остаются непрочитанными
         out.append((f"ROLE={ROLE} при BOT_MODE=polling: апдейты не будет тянуть "
                     "никто — для разделённых ролей нужен BOT_MODE=webhook", True))
+    if BOT_MODE == "webhook" and not WEBHOOK_PATH.startswith("/"):
+        # маршрут регистрируется при импорте main: без слеша это падение на
+        # старте с трейсбеком из Starlette вместо понятной причины
+        out.append((f"WEBHOOK_PATH={WEBHOOK_PATH!r} — путь должен начинаться "
+                    "со слеша", True))
     if BOT_MODE == "webhook" and not WEBHOOK_BASE.startswith("https://"):
         # Telegram шлёт апдейты только на https и только на публичный адрес
         out.append(("BOT_MODE=webhook, но WEBHOOK_BASE/WEBAPP_URL не https-адрес "

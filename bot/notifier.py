@@ -13,6 +13,7 @@ import time
 
 from aiogram.exceptions import TelegramForbiddenError
 
+from bot import webhook
 from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
@@ -153,14 +154,21 @@ JOBS: tuple[tuple[str, float, float, object], ...] = (
 # на 72 тысячи пушей, поэтому ttl взят с запасом на порядок больше остальных.
 NOTIFY_TTL = 4 * 3600
 
+# Проверка webhook'а — тоже async (запрос к Telegram) и только в webhook-режиме.
+# Раз в час: адрес сбивается снаружи. Достаточно кому-то поднять копию бота на
+# поллинге — delete_webhook снимет боевой, и прод замолчит, не написав в свой
+# лог ни строчки. Такое молчание находится только по жалобам игроков.
+WEBHOOK_CHECK_INTERVAL = 3600
+
 
 async def run_notifier(bot):
     """Фоновые задачи процесса. Владелец каждой — один на кластер (scheduler).
 
     Раньше здесь не было ни владельца, ни расписания: цикл будил все задачи
     каждые 15 минут, и второй процесс просто делал ту же работу второй раз."""
-    log.info("планировщик запущен: role=%s owner=%s задач=%d",
-             settings.ROLE, scheduler.OWNER, len(JOBS) + 1)
+    log.info("планировщик запущен: role=%s bot=%s owner=%s задач=%d",
+             settings.ROLE, settings.BOT_MODE, scheduler.OWNER,
+             len(JOBS) + (2 if settings.BOT_MODE == "webhook" else 1))
     while True:
         for key, interval, ttl, work in JOBS:
             try:
@@ -169,6 +177,15 @@ async def run_notifier(bot):
                         work()
             except Exception:
                 log.exception("%s failed", key)
+        if settings.BOT_MODE == "webhook":
+            try:
+                with scheduler.job("webhook_check",
+                                   WEBHOOK_CHECK_INTERVAL, 300) as mine:
+                    if mine:
+                        log.info("webhook: %s",
+                                 await webhook.ensure_registered(bot))
+            except Exception:
+                log.exception("webhook check failed")
         try:
             with scheduler.job("notify_pass", CHECK_INTERVAL, NOTIFY_TTL) as mine:
                 if mine:

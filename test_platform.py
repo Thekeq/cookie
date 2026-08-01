@@ -188,6 +188,13 @@ s = reload_settings(BOT_TOKEN="123:AAA", WEBHOOK_SECRET="explicit-secret")
 check("5.5 явный секрет уважается", s.WEBHOOK_SECRET == "explicit-secret")
 check("5.6 секрет в сводку не попадает",
       "explicit-secret" not in s.summary())
+# маршрут вешается при импорте main: без слеша это трейсбек из Starlette на
+# старте вместо внятной причины
+s = reload_settings(BOT_MODE="webhook", WEBHOOK_BASE="https://prod.example.com",
+                    WEBHOOK_PATH="tg/webhook")
+check("5.7 WEBHOOK_PATH без слеша — отказ",
+      any("WEBHOOK_PATH" in t for t in fatals(s)))
+s = reload_settings(WEBHOOK_PATH=None, BOT_MODE="polling", WEBHOOK_BASE=None)
 
 print("\n=== 6. Один источник правды ===")
 # смысл шага: ни одного os.getenv вне settings. Иначе у ключа снова окажется
@@ -507,18 +514,18 @@ from fastapi.testclient import TestClient
 import main as main_module
 
 
-def role_tasks(role: str) -> list[str]:
-    """Какие задачи поднял бы процесс с этой ролью.
+def role_tasks(role: str, mode: str = "polling") -> list[str]:
+    """Какие задачи поднял бы процесс с этой ролью и этим режимом бота.
 
     Корутины закрываем сразу: запускать здесь ни поллинг, ни uvicorn не нужно —
     проверяется только состав."""
-    saved = _settings.ROLE
-    _settings.ROLE = role
+    saved = (_settings.ROLE, _settings.BOT_MODE)
+    _settings.ROLE, _settings.BOT_MODE = role, mode
     try:
         jobs = main_module.tasks_for_role()
         names = sorted(j.cr_code.co_name for j in jobs)
     finally:
-        _settings.ROLE = saved
+        _settings.ROLE, _settings.BOT_MODE = saved
     for j in jobs:
         j.close()
     return names
@@ -530,12 +537,193 @@ check("13.1 ROLE=all — бот, API и планировщик в одном п�
 check("13.2 ROLE=api — только HTTP", role_tasks("api") == ["run_api"])
 check("13.3 ROLE=scheduler — только фоновые задачи",
       role_tasks("scheduler") == ["run_notifier"])
+# в webhook-режиме отдельной задачи под бота нет: апдейты приходят обычными
+# запросами в API. Раньше поллинг поднимался всегда и внутри звал
+# delete_webhook — то есть BOT_MODE=webhook в конфиге ничего не менял
+check("13.6 BOT_MODE=webhook — поллинг не поднимается",
+      role_tasks("all", "webhook") == ["run_api", "run_notifier"])
 
 _r = TestClient(main_module.app).get("/healthz")
 _j = _r.json()
 check("13.4 /healthz отвечает 200", _r.status_code == 200 and _j["ok"] is True)
 check("13.5 в /healthz видно роль, кеш и планировщик",
       _j["role"] and "backend" in _j["cache"] and "jobs" in _j["scheduler"])
+
+print("\n=== 14. Webhook: маршрут, секрет, регистрация ===")
+import asyncio
+import pathlib as _pathlib
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+
+from bot import webhook
+
+UPDATE = {"update_id": 77,
+          "message": {"message_id": 1, "date": 0,
+                      "chat": {"id": 5, "type": "private"},
+                      "from": {"id": 5, "is_bot": False, "first_name": "T"},
+                      "text": "/start"}}
+
+
+class FakeDp:
+    """Диспетчер-заглушка: проверяем маршрут, а не игровые хендлеры."""
+
+    def __init__(self, boom=False):
+        self.seen = []
+        self.boom = boom
+
+    def include_router(self, router):
+        pass
+
+    def resolve_used_update_types(self):
+        return ["message", "pre_checkout_query"]
+
+    async def feed_update(self, bot, update):
+        self.seen.append(update.update_id)
+        if self.boom:
+            raise RuntimeError("хендлер сломался")
+
+
+class FakeBot:
+    """Telegram-заглушка: что именно бот у него спросил и что установил."""
+
+    def __init__(self, url=""):
+        self.info_url = url
+        self.calls = []
+
+    async def get_webhook_info(self):
+        return SimpleNamespace(url=self.info_url)
+
+    async def set_webhook(self, url, **kw):
+        self.calls.append((url, kw))
+        self.info_url = url
+
+
+def hook_app(mode="webhook", path="/tg/test-hook", secret="s3cret"):
+    """Приложение с одним маршрутом webhook'а и подменённым диспетчером."""
+    _settings.BOT_MODE = mode
+    _settings.WEBHOOK_PATH = path
+    _settings.WEBHOOK_SECRET = secret
+    app = FastAPI()
+    added = webhook.install(app)
+    return app, added
+
+
+_saved_hook = (_settings.BOT_MODE, _settings.WEBHOOK_PATH,
+               _settings.WEBHOOK_SECRET, _settings.WEBHOOK_BASE, webhook.dp)
+
+# на поллинге ручки быть не должно: открытый маршрут, кормящий диспетчер,
+# не нужен там, где апдейты забирает сам бот
+_app, _added = hook_app(mode="polling")
+check("14.1 при BOT_MODE=polling маршрут не регистрируется",
+      _added is False
+      and not any(getattr(r, "path", "") == "/tg/test-hook"
+                  for r in _app.routes))
+
+_app, _added = hook_app()
+_fake = FakeDp()
+webhook.dp = _fake
+_client = TestClient(_app)
+check("14.2 при BOT_MODE=webhook маршрут появился", _added is True)
+
+# Секрет — единственная настоящая защита: путь утекает в логи прокси, а по
+# подделанному successful_payment бот выдал бы товар бесплатно
+_r = _client.post("/tg/test-hook", json=UPDATE)
+check("14.3 без секретного заголовка — 403",
+      _r.status_code == 403 and _fake.seen == [])
+_r = _client.post("/tg/test-hook", json=UPDATE,
+                  headers={"X-Telegram-Bot-Api-Secret-Token": "s3cret-almost"})
+check("14.4 с чужим секретом — 403", _r.status_code == 403 and _fake.seen == [])
+check("14.5 ответ 403 не подсказывает, чем секрет не подошёл",
+      "s3cret" not in _r.text and "secret" not in _r.json()["detail"].lower())
+
+_hdr = {"X-Telegram-Bot-Api-Secret-Token": "s3cret"}
+_r = _client.post("/tg/test-hook", json=UPDATE, headers=_hdr)
+check("14.6 со своим секретом апдейт доходит до диспетчера",
+      _r.status_code == 200 and _fake.seen == [77])
+
+# Ненулевой код = Telegram присылает тот же апдейт снова. На кривом теле это
+# был бы бесконечный поток повторов, а разбирать его всё равно нечем
+_r = _client.post("/tg/test-hook", content=b"{not json", headers=_hdr)
+check("14.7 мусор в теле — 200, но диспетчеру не отдан",
+      _r.status_code == 200 and _fake.seen == [77])
+_r = _client.post("/tg/test-hook", json={"no_update_id": 1}, headers=_hdr)
+check("14.8 апдейт без update_id — 200 и не отдан",
+      _r.status_code == 200 and _fake.seen == [77])
+
+webhook.dp = FakeDp(boom=True)
+_r = _client.post("/tg/test-hook", json=UPDATE, headers=_hdr)
+check("14.9 упавший хендлер не превращается в поток повторов",
+      _r.status_code == 200)
+
+# compare_digest("", "") пропускает ЛЮБОЙ запрос — пустой секрет обязан
+# закрывать ручку, а не открывать её всем
+_app2, _ = hook_app(path="/tg/test-hook2", secret="")
+webhook.dp = FakeDp()
+_r = TestClient(_app2).post("/tg/test-hook2", json=UPDATE)
+check("14.10 пустой секрет закрывает ручку, а не открывает",
+      _r.status_code == 503 and webhook.dp.seen == [])
+
+print("\n=== 15. Webhook: адрес и регистрация в Telegram ===")
+_settings.WEBHOOK_PATH = "/tg/hook"
+_settings.WEBHOOK_BASE = "https://prod.example.com/"
+check("15.1 адрес собирается без двойного слеша",
+      webhook.url() == "https://prod.example.com/tg/hook")
+_settings.WEBHOOK_BASE = ""
+check("15.2 без адреса регистрировать нечего", webhook.url() == "")
+_settings.WEBHOOK_BASE = "https://prod.example.com"
+_settings.WEBHOOK_SECRET = "s3cret"
+webhook.dp = FakeDp()
+
+_b = FakeBot(url="")
+check("15.3 адрес не выставлен — регистрируем",
+      asyncio.run(webhook.ensure_registered(_b)) == "установлен"
+      and len(_b.calls) == 1)
+_url, _kw = _b.calls[0]
+check("15.4 setWebhook получает адрес и секрет",
+      _url == "https://prod.example.com/tg/hook"
+      and _kw["secret_token"] == "s3cret")
+# за время деплоя игрок мог нажать /start или оплатить — терять это нельзя
+check("15.5 накопленные апдейты не сбрасываются",
+      _kw["drop_pending_updates"] is False)
+# список типов берётся у диспетчера: руками его пришлось бы править на каждый
+# новый хендлер, и забытая правка ломает бота МОЛЧА
+check("15.6 типы апдейтов берутся у диспетчера",
+      set(_kw["allowed_updates"]) == {"message", "pre_checkout_query"})
+
+check("15.7 уже настроенный webhook не переустанавливается",
+      asyncio.run(webhook.ensure_registered(_b)) == "уже настроен"
+      and len(_b.calls) == 1)
+# чужой адрес = либо старый деплой, либо кто-то поднял копию бота на поллинге и
+# снял боевой webhook. Такое молчание находится только по жалобам игроков
+_b2 = FakeBot(url="https://old.example.com/tg/hook")
+check("15.8 сбитый адрес возвращается на место",
+      asyncio.run(webhook.ensure_registered(_b2)) == "установлен"
+      and _b2.calls[0][0] == "https://prod.example.com/tg/hook")
+_settings.WEBHOOK_BASE = ""
+check("15.9 без адреса не зовём setWebhook вслепую",
+      asyncio.run(webhook.ensure_registered(FakeBot())) == "нет адреса")
+
+# Настоящий диспетчер должен знать про оба типа апдейтов, которые есть у бота:
+# на заглушках этого не видно, а без pre_checkout_query не пройдёт ни один
+# платёж — Telegram просто не пришлёт запрос
+webhook.dp = _saved_hook[4]
+webhook.setup_dispatcher()
+_types = set(webhook.dp.resolve_used_update_types())
+check(f"15.10 реальный диспетчер просит нужные типы ({sorted(_types)})",
+      {"message", "pre_checkout_query"} <= _types)
+webhook.setup_dispatcher()          # второй вызов не должен падать
+check("15.11 повторная регистрация хендлеров идемпотентна", True)
+
+# Starlette проверяет маршруты по порядку регистрации, а Mount("/") совпадает с
+# любым путём: install ниже монтирования статики означает 404 на все апдейты
+_main_src = _pathlib.Path("main.py").read_text(encoding="utf-8")
+check("15.12 webhook.install идёт до монтирования статики в корень",
+      0 < _main_src.index("webhook.install(app)")
+      < _main_src.index('app.mount("/"'))
+
+(_settings.BOT_MODE, _settings.WEBHOOK_PATH, _settings.WEBHOOK_SECRET,
+ _settings.WEBHOOK_BASE, webhook.dp) = _saved_hook
 
 use_fallback()
 importlib.reload(_settings)
