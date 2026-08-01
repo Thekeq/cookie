@@ -6,6 +6,7 @@ import random
 import time
 import uuid
 
+from server import cache
 from server import economy
 from server import game_config as cfg
 
@@ -15,36 +16,21 @@ db = economy.db
 
 
 # ---------- лимитер запросов ----------
-# Живёт в памяти процесса: игра работает одним процессом (бот + API + notifier
-# в общем event loop), внешнего Redis нет и заводить его ради этого не стоит.
 # Смысл — не пустить перебор промокодов и не дать одному игроку выжечь тяжёлые
 # ручки: /api/state делает под сотню SQL-запросов, а SQLite синхронный и
 # блокирует весь процесс, включая поллинг бота.
-_rate_buckets: dict[tuple[int, str], list[float]] = {}
-_RATE_GC_EVERY = 500
-_rate_calls = 0
+#
+# Само окно переехало в server.cache: пока процесс один, оно по-прежнему живёт
+# в памяти, но с несколькими воркерами лимит на общей памяти становился
+# N-кратным — восемь воркеров означали восьмикратный перебор промокодов.
 
 
 def check_rate_limit(user_id: int, bucket: str, limit: int, window: float):
     """Кидает HTTP 429, если за window секунд было больше limit обращений."""
-    global _rate_calls
     from fastapi import HTTPException
-    now = time.time()
-    key = (user_id, bucket)
-    hits = [t for t in _rate_buckets.get(key, ()) if now - t < window]
-    if len(hits) >= limit:
-        hits.append(now)
-        _rate_buckets[key] = hits
+    allowed, _ = cache.incr_window(f"{bucket}:{user_id}", limit, window)
+    if not allowed:
         raise HTTPException(429, "err_too_fast")
-    hits.append(now)
-    _rate_buckets[key] = hits
-
-    # периодическая уборка: без неё словарь растёт по одному ключу на игрока
-    _rate_calls += 1
-    if _rate_calls % _RATE_GC_EVERY == 0:
-        for k, ts in list(_rate_buckets.items()):
-            if not ts or now - ts[-1] > 3600:
-                _rate_buckets.pop(k, None)
 
 
 # ---------- аналитика ----------

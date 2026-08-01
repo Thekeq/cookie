@@ -10,10 +10,15 @@ import importlib
 import os
 import sys
 import tempfile
+import time
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
-os.environ["DATABASE_PATH"] = os.path.join(tempfile.gettempdir(),
-                                           "cookie_platform_test.db")
+DB_PATH = os.path.join(tempfile.gettempdir(),
+                       f"cookie_platform_test_{os.getpid()}.db")
+for _suffix in ("", "-wal", "-shm"):
+    if os.path.exists(DB_PATH + _suffix):
+        os.remove(DB_PATH + _suffix)
+os.environ["DATABASE_PATH"] = DB_PATH
 
 import dotenv
 
@@ -206,8 +211,194 @@ check("6.2 dotenv загружается ровно в одном месте",
           for p in pathlib.Path(".").rglob("*.py")
           if "__pycache__" not in p.parts and not p.name.startswith("test_")) == 1)
 
-# возвращаем модуль к настоящему окружению: следующие тесты в этом процессе
-# должны видеть его, а не остатки подмены
+# возвращаем модуль к настоящему окружению: дальше работаем с ним
+importlib.reload(_settings)
+
+# ======================================================================
+# Общее состояние: лимитер и владение задачей
+# ======================================================================
+import threading
+
+from server import cache
+
+# Один и тот же набор проверок прогоняется ДВА раза: на фолбэке в памяти и на
+# Redis. Смысл слоя именно в том, что снаружи он ведёт себя одинаково — если
+# поведение расходится, то на проде включение Redis тихо поменяет правила игры.
+try:
+    import fakeredis
+except ImportError:
+    fakeredis = None
+
+
+def use_fallback():
+    cache._reset_for_tests()
+    _settings.REDIS_URL = ""
+    cache._connect = cache.__dict__["_connect"]
+
+
+def use_fake_redis():
+    """Redis-путь на эмуляторе в процессе.
+
+    Настоящего сервера в CI может не быть, а проверять надо именно то, что
+    отправляется в Redis: порядок команд в пайплайне, семантику zcard и сверку
+    токена при снятии замка."""
+    cache._reset_for_tests()
+    _settings.REDIS_URL = "redis://fake"
+    fake = fakeredis.FakeRedis(decode_responses=True)
+    cache._connect = lambda: fake
+    return fake
+
+
+def limiter_suite(tag: str):
+    cache.reset_all_windows()
+    key = f"t:{tag}"
+    got = [cache.incr_window(key, 3, 60) for _ in range(5)]
+    check(f"7.{tag}.1 первые три вызова разрешены",
+          [a for a, _ in got[:3]] == [True, True, True])
+    check(f"7.{tag}.2 четвёртый отбит", got[3][0] is False)
+    # свой вызов считается даже за лимитом: иначе тот, кто продолжает долбить
+    # ручку, освобождал бы себе окно, просто получая 429
+    check(f"7.{tag}.3 счётчик растёт и после отказа", got[4][1] == 5)
+
+    # окно скользящее: через window всё забывается
+    cache.reset_window(key)
+    check(f"7.{tag}.4 сброс окна возвращает право на запрос",
+          cache.incr_window(key, 3, 60)[0] is True)
+
+    # короткое окно реально истекает
+    short = f"t:{tag}:short"
+    cache.reset_window(short)
+    cache.incr_window(short, 1, 0.3)
+    check(f"7.{tag}.5 второй вызов в окне отбит",
+          cache.incr_window(short, 1, 0.3)[0] is False)
+    time.sleep(0.35)
+    check(f"7.{tag}.6 после истечения окна снова можно",
+          cache.incr_window(short, 1, 0.3)[0] is True)
+
+    # ключи не путаются между игроками
+    cache.reset_all_windows()
+    cache.incr_window(f"state:{tag}:1", 1, 60)
+    check(f"7.{tag}.7 окна разных ключей независимы",
+          cache.incr_window(f"state:{tag}:2", 1, 60)[0] is True)
+
+
+def lock_suite(tag: str):
+    name = f"job:{tag}"
+    with cache.lock(name, 60) as first:
+        with cache.lock(name, 60) as second:
+            check(f"8.{tag}.1 замок берёт только один", first and not second)
+    with cache.lock(name, 60) as after:
+        check(f"8.{tag}.2 после выхода замок свободен", after is True)
+
+    # ttl — страховка от смерти владельца: убитый процесс не должен заблокировать
+    # задачу навсегда. Входим/выходим вручную, потому что проверяется как раз
+    # ПОРЯДОК: старый владелец выходит из блока уже ПОСЛЕ того, как замок забрал
+    # новый, и не должен утащить чужой замок за собой
+    holder = f"job:{tag}:ttl"
+    a = cache.lock(holder, 1)
+    a_mine = a.__enter__()
+    time.sleep(1.15)                      # ttl истёк, владелец «умер»
+    b = cache.lock(holder, 60)
+    b_mine = b.__enter__()
+    check(f"8.{tag}.3 просроченный замок переходит другому", a_mine and b_mine)
+    a.__exit__(None, None, None)          # опоздавший выход прежнего владельца
+    with cache.lock(holder, 60) as third:
+        check(f"8.{tag}.4 чужой замок не снят прежним владельцем",
+              third is False)
+    b.__exit__(None, None, None)
+    with cache.lock(holder, 60) as fourth:
+        check(f"8.{tag}.5 после выхода настоящего владельца замок свободен",
+              fourth is True)
+
+    # параллельная гонка: ровно один победитель
+    winners = []
+    barrier = threading.Barrier(8)
+    race_name = f"job:{tag}:race"
+
+    def try_take():
+        barrier.wait()
+        with cache.lock(race_name, 30) as mine:
+            if mine:
+                winners.append(1)
+                time.sleep(0.05)
+
+    threads = [threading.Thread(target=try_take) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(f"8.{tag}.6 из восьми потоков задачу берёт один", len(winners) == 1)
+
+
+print("\n=== 7. Лимитер (фолбэк в памяти) ===")
+use_fallback()
+check("7.0 без REDIS_URL работаем на памяти процесса", not cache.enabled())
+check("7.0b health честно говорит про фолбэк",
+      cache.health() == {"backend": "in-process"})
+limiter_suite("mem")
+
+print("\n=== 8. Владение задачей (фолбэк в памяти) ===")
+lock_suite("mem")
+
+if fakeredis is None:
+    print("\n=== 7b/8b. Redis-путь ПРОПУЩЕН: нет fakeredis "
+          "(pip install fakeredis) ===")
+else:
+    print("\n=== 7b. Лимитер (Redis) ===")
+    use_fake_redis()
+    check("7b.0 с REDIS_URL работаем на общем состоянии", cache.enabled())
+    check("7b.0b health показывает redis", cache.health()["backend"] == "redis")
+    limiter_suite("redis")
+    print("\n=== 8b. Владение задачей (Redis) ===")
+    lock_suite("redis")
+
+    print("\n=== 9. Деградация Redis ===")
+
+    class Broken:
+        """Redis, который отвечает ошибкой на всё."""
+
+        def __getattr__(self, name):
+            def boom(*a, **k):
+                raise ConnectionError("redis is down")
+            return boom
+
+    cache._reset_for_tests()
+    _settings.REDIS_URL = "redis://fake"
+    cache._connect = lambda: Broken()
+    # лимитер — fail open: моргнувший Redis не должен закрыть игру ВСЕМ
+    # игрокам сразу. Пропустить лишний запрос дешевле массового 429
+    allowed, _ = cache.incr_window("t:down", 5, 60)
+    check("9.1 упавший Redis не блокирует игру (fail open)", allowed is True)
+    # ...но лимит при этом продолжает работать на памяти процесса, а не
+    # исчезает вовсе
+    for _ in range(5):
+        last = cache.incr_window("t:down", 5, 60)
+    check("9.2 на фолбэке лимит всё равно считается", last[0] is False)
+    # замок — fail closed: единственность владельца проверить нечем, а
+    # ролловер сезона, запущенный дважды, стоит пересчёта всем игрокам
+    with cache.lock("job:down", 60) as mine:
+        check("9.3 упавший Redis не выдаёт замок (fail closed)", mine is False)
+    check("9.4 health показывает, что Redis лежит",
+          cache.health().get("redis", "").startswith("down"))
+
+    print("\n=== 10. Redis без EVAL ===")
+
+    class NoEval(fakeredis.FakeRedis):
+        """Managed-Redis с урезанным набором команд: EVAL запрещён."""
+
+        def eval(self, *a, **k):
+            raise Exception("ERR unknown command 'EVAL'")
+
+    cache._reset_for_tests()
+    _settings.REDIS_URL = "redis://fake"
+    cache._connect = lambda: NoEval(decode_responses=True)
+    with cache.lock("job:noeval", 60) as mine:
+        check("10.1 замок берётся", mine is True)
+    with cache.lock("job:noeval", 60) as again:
+        check("10.2 и снимается без EVAL (иначе он не снялся бы никогда)",
+              again is True)
+
+use_fallback()
 importlib.reload(_settings)
 
 print(f"\n{passed} passed, {failed} failed")

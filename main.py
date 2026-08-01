@@ -113,11 +113,18 @@ app.include_router(farm.router)
 
 @app.get("/healthz")
 async def healthz():
-    """Живость процесса + доступность БД (для мониторинга/оркестрации)."""
+    """Живость процесса + доступность БД и общего состояния.
+
+    Про Redis отвечаем 200 даже когда он лежит: лимитер уходит на фолбэк и игра
+    продолжает работать, а вот планировщик — нет. Оркестратору незачем
+    перезапускать по такому поводу рабочий процесс, но в ответе это видно, и
+    мониторинг может отдельно смотреть на поле cache."""
     import time as _time
+    from server import cache
     from server.game_logic import db
     db.q1("SELECT 1 AS ok")
-    return {"ok": True, "ts": _time.time()}
+    return {"ok": True, "ts": _time.time(), "role": settings.ROLE,
+            "cache": cache.health()}
 
 
 # собранный фронт (webapp/dist) раздаём как статику с корня
