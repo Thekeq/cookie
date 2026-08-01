@@ -8,10 +8,15 @@ import time
 from urllib.parse import urlencode
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
-# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается
+# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается. Файл сносится
+# на старте: имя завязано на PID, а система переиспользует PID'ы, и строки от
+# прошлого запуска давали «раз в N запусков» падения на пустом месте
 import tempfile
-os.environ["DATABASE_PATH"] = os.path.join(
-    tempfile.gettempdir(), f"cookie_test_{os.getpid()}.db")
+DB_PATH = os.path.join(tempfile.gettempdir(), f"cookie_test_{os.getpid()}.db")
+for _suffix in ("", "-wal", "-shm"):
+    if os.path.exists(DB_PATH + _suffix):
+        os.remove(DB_PATH + _suffix)
+os.environ["DATABASE_PATH"] = DB_PATH
 
 from fastapi.testclient import TestClient
 
@@ -19,6 +24,7 @@ from main import app
 from server.game_logic import db
 import server.game_logic as gl
 import server.game_config as cfg
+from server import cache
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
@@ -639,22 +645,22 @@ r = c.post("/api/auth", headers={"Authorization": "tma hash=deadbeef&user=notjso
 check("garbage initData -> 401", r.status_code == 401, str(r.status_code))
 
 # --- промокоды: единый код ошибки и лимит попыток ---
-gl._rate_buckets.clear()
+cache.reset_all_windows()
 r = c.post("/api/promo/redeem", json={"code": "NOSUCHCODE1"}, headers=H(UID))
 check("promo error is generic", r.json()["detail"] == "err_promo_invalid", r.text[:80])
 for _ in range(cfg.PROMO_ATTEMPTS_PER_HOUR + 2):
     last = c.post("/api/promo/redeem", json={"code": "NOSUCHCODE2"}, headers=H(UID))
 check("promo brute force rate limited", last.status_code == 429, str(last.status_code))
-gl._rate_buckets.clear()
+cache.reset_all_windows()
 
 # --- тяжёлая ручка ограничена по частоте ---
 for _ in range(cfg.STATE_PER_MINUTE + 2):
     last = c.get("/api/state", headers=H(UID))
 check("state endpoint rate limited", last.status_code == 429, str(last.status_code))
-gl._rate_buckets.clear()
+cache.reset_all_windows()
 
 # --- батл-пасс: награда забирается строкой, а не json-списком ---
-gl._rate_buckets.clear()
+cache.reset_all_windows()
 db.exec("DELETE FROM bp_claims WHERE user_id = ?", (UID,))
 db.update_user(UID, bp_xp=cfg.bp_total_xp(3), bp_premium=0)
 

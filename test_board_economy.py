@@ -7,10 +7,16 @@ import time
 from urllib.parse import urlencode
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
-# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается
+# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается. Файл сносится
+# на старте: имя завязано на PID, а система переиспользует PID'ы, и строки от
+# прошлого запуска ломали тесты «раз в N запусков» — покупка с тем же
+# tg_payment_id падала на UNIQUE ещё до первой проверки
 import tempfile
-os.environ["DATABASE_PATH"] = os.path.join(
-    tempfile.gettempdir(), f"cookie_test_be_{os.getpid()}.db")
+DB_PATH = os.path.join(tempfile.gettempdir(), f"cookie_test_be_{os.getpid()}.db")
+for _suffix in ("", "-wal", "-shm"):
+    if os.path.exists(DB_PATH + _suffix):
+        os.remove(DB_PATH + _suffix)
+os.environ["DATABASE_PATH"] = DB_PATH
 
 from fastapi.testclient import TestClient
 
@@ -661,11 +667,18 @@ check("recipe burns past the window",
       gl.recipe_status(db.get_user(UID))["state"] == "burnt")
 
 # --- множитель применяется к оффлайн-доходу фермы ровно один раз ---
+# Отметки сборов ниже разнесены на целые секунды НАМЕРЕННО. Начало интервала
+# входит в operation_id с точностью до миллисекунды, а начисление по токену
+# идемпотентно. Когда все три отметки ставились как time.time() - 3600, две
+# соседние иногда укладывались в одну миллисекунду (между ними всего несколько
+# запросов к базе) — тогда третий сбор законно отказывался платить второй раз
+# по уже записанному токену, и тест падал раз в несколько запусков. В проде
+# такого не бывает: отметка только растёт, к оплаченному значению не возвращается.
 db.exec("DELETE FROM farm WHERE user_id = ?", (UID,))
 db.exec("INSERT INTO farm (user_id, building_key, count) VALUES (?, 'cursor', 10)", (UID,))
 db.update_user(UID, cookies=0, recipe_key="classic",
                recipe_started_at=time.time() - _r["hours"] * 3600 - 60,
-               farm_collected_at=time.time() - 3600)
+               farm_collected_at=time.time() - 3601)
 _got = gl.collect_farm(db.get_user(UID))
 _plain = gl.farm_cps(UID) * 3600
 check("ready recipe multiplies offline farm income",
@@ -674,7 +687,7 @@ check("recipe is consumed after collect",
       gl.recipe_status(db.get_user(UID))["state"] == "none")
 # рано вернулся — множителя нет и закваска НЕ тратится
 db.update_user(UID, recipe_key="classic", recipe_started_at=time.time() - 60,
-               farm_collected_at=time.time() - 3600)
+               farm_collected_at=time.time() - 3602)
 _got = gl.collect_farm(db.get_user(UID))
 check("early return gives no bonus", abs(_got - _plain) < _plain * 0.02, f"{_got:.0f}")
 check("early return keeps the dough",
@@ -698,7 +711,7 @@ gl.invalidate_income(UID)
 # /api/state, /api/auth, /api/farm и каждый батч кликов зовут сбор, и раньше оба
 # видели один интервал и оба его оплачивали
 _now = time.time()
-_prev = _now - 3600
+_prev = _now - 3603          # своя секунда — см. комментарий про токены выше
 db.update_user(UID, cookies=0, farm_collected_at=_prev, passive_collected_at=_prev)
 _stale = db.get_user(UID)
 # «сейчас» тоже одно на оба вызова: у настоящих параллельных запросов оно

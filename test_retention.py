@@ -8,10 +8,15 @@ import time
 from urllib.parse import urlencode
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAtestTOKENtestTOKENtestTOKENtest12")
-# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается
+# тесты живут во ВРЕМЕННОЙ базе — рабочая data.db не трогается. Файл сносится
+# на старте: имя завязано на PID, а система переиспользует PID'ы, и строки от
+# прошлого запуска давали «раз в N запусков» падения на пустом месте
 import tempfile
-os.environ["DATABASE_PATH"] = os.path.join(
-    tempfile.gettempdir(), f"cookie_test_{os.getpid()}.db")
+DB_PATH = os.path.join(tempfile.gettempdir(), f"cookie_test_{os.getpid()}.db")
+for _suffix in ("", "-wal", "-shm"):
+    if os.path.exists(DB_PATH + _suffix):
+        os.remove(DB_PATH + _suffix)
+os.environ["DATABASE_PATH"] = DB_PATH
 
 from fastapi.testclient import TestClient
 
