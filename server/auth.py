@@ -3,18 +3,15 @@ import hashlib
 import hmac
 import json
 import time
-import os
 from urllib.parse import parse_qsl
 
 from fastapi import Header, HTTPException
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+from server import settings
 
-# initData внутри открытого Mini App не обновляется, поэтому TTL должен
-# покрывать долгую сессию — сутки. Уменьшать нельзя: игрок с открытым
-# приложением начнёт получать 401 посреди игры.
-AUTH_MAX_AGE = int(os.getenv("AUTH_MAX_AGE", str(60 * 60 * 24)))
+BOT_TOKEN = settings.BOT_TOKEN
+ADMIN_ID = settings.ADMIN_ID
+AUTH_MAX_AGE = settings.AUTH_MAX_AGE
 MAX_INIT_DATA = 4096  # реальная initData ~300-600 байт
 
 # secret_key зависит только от токена — считаем один раз, а не на каждый запрос

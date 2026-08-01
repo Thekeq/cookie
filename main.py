@@ -12,13 +12,14 @@ from fastapi.staticfiles import StaticFiles
 from bot.loader import bot, dp
 from bot.handlers import start, payments
 from bot.notifier import run_notifier
+from server import settings
 from server.economy import ConflictError
 from server.routers import game, meta, admin, farm
 
 # Логи: раньше был только basicConfig(WARNING) в stdout, то есть про поломку
 # владелец узнавал от игроков. Теперь INFO с ротацией в файл — журнал платежей,
 # ролловеров и бэкапов сохраняется между рестартами.
-LOG_FILE = os.getenv("LOG_FILE", "cookie.log")
+LOG_FILE = settings.LOG_FILE
 _handlers: list[logging.Handler] = [logging.StreamHandler()]
 try:
     from logging.handlers import RotatingFileHandler
@@ -37,7 +38,7 @@ for noisy in ("aiogram.event", "aiogram.dispatcher", "uvicorn.access", "httpx"):
 
 # В проде docs/openapi не нужны: схема выдаёт наружу все ручки, включая
 # /api/admin/*, вместе с формой тел запросов — удобная карта для перебора
-DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+DEBUG = settings.DEBUG
 app = FastAPI(title="Cookie Merge API",
               docs_url="/docs" if DEBUG else None,
               redoc_url=None,
@@ -46,14 +47,14 @@ app = FastAPI(title="Cookie Merge API",
 # Источники ограничиваем WEBAPP_URL: allow_origins=["*"] позволял любому сайту
 # дёргать API из браузера жертвы. Сама initData при этом остаётся защитой от
 # подделки запроса, но светить API всему интернету незачем.
-_origin = os.getenv("WEBAPP_URL", "").rstrip("/")
-ALLOWED_ORIGINS = [_origin] if _origin and not DEBUG else ["*"]
+ALLOWED_ORIGINS = ([settings.WEBAPP_URL]
+                   if settings.WEBAPP_URL and not DEBUG else ["*"])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type", "X-Lang",
-                   "X-User-Revision", "X-Board-Revision"],
+                   "X-User-Revision", "X-Board-Revision", "X-Op-Id"],
 )
 
 
@@ -133,7 +134,7 @@ async def run_bot():
 
 
 async def run_api():
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")),
+    config = uvicorn.Config(app, host=settings.HOST, port=settings.PORT,
                             log_level="warning")
     await uvicorn.Server(config).serve()
 
@@ -141,24 +142,21 @@ async def run_api():
 def preflight():
     """Проверка окружения ДО старта: молчаливо кривой конфиг обходится дороже
     падения. Раньше отсутствующий BOT_TOKEN превращался в 500 на каждый
-    запрос, а незаданный ADMIN_ID молча закрывал админку от самого владельца."""
-    problems = []
-    if not os.getenv("BOT_TOKEN"):
-        problems.append("BOT_TOKEN не задан — подпись initData проверить нечем")
-    if not int(os.getenv("ADMIN_ID", "0") or 0):
-        problems.append("ADMIN_ID не задан — админка будет закрыта для всех")
-    webapp_url = os.getenv("WEBAPP_URL", "")
-    if webapp_url.startswith("https://") and os.getenv("DEV_MODE", "") == "1":
-        problems.append("DEV_MODE=1 на боевом домене: бот публикует в чат "
-                        "рабочую ссылку с подписанной initData")
+    запрос, а незаданный ADMIN_ID молча закрывал админку от самого владельца.
+
+    Сами правила живут в server.settings.problems() — там же, где значения.
+    Здесь остаётся только то, что про этот конкретный процесс: собранный фронт
+    он раздаёт сам, и без webapp/dist игрок увидит пустую страницу."""
+    found = settings.problems()
     if not os.path.isdir(DIST):
-        problems.append(f"нет собранного фронта в {DIST} — "
-                        f"выполни: cd webapp && npm run build")
-    for p in problems:
-        logging.error("КОНФИГ: %s", p)
-    fatal = [p for p in problems if p.startswith(("BOT_TOKEN", "DEV_MODE"))]
+        found.append((f"нет собранного фронта в {DIST} — "
+                      f"выполни: cd webapp && npm run build", False))
+    for text, _ in found:
+        logging.error("КОНФИГ: %s", text)
+    fatal = [text for text, is_fatal in found if is_fatal]
     if fatal:
         raise SystemExit("Старт отменён:\n  " + "\n  ".join(fatal))
+    logging.info("%s", settings.summary())
 
 
 async def main():

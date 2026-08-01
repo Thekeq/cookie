@@ -1,5 +1,4 @@
 """Админка: промокоды, source-ссылки, статистика. Только для ADMIN_ID."""
-import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,10 +8,9 @@ from server.auth import tg_admin
 from server import game_config as cfg
 from server import game_logic as gl
 from server.game_logic import db
+from server.settings import BOT_USERNAME
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(tg_admin)])
-
-BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 
 
 # ---------- промокоды ----------

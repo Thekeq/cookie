@@ -1,5 +1,3 @@
-import os
-
 from aiogram import Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -8,11 +6,9 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, Message,
 from bot.loader import ADMIN_ID, WEBAPP_URL
 from server.game_logic import db
 from server.i18n import norm_lang, tr
+from server.settings import DEV_MODE, DEV_URL
 
 router = Router()
-
-DEV_MODE = os.getenv("DEV_MODE", "0") == "1"
-DEV_URL = os.getenv("DEV_URL", "http://127.0.0.1:8000")
 
 
 def user_lang(message: Message) -> str:

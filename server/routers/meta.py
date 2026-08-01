@@ -1,5 +1,4 @@
 """Мета: авторизация/регистрация, рефералка, промокоды, батл-пасс, магазин."""
-import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +10,7 @@ from server import game_logic as gl
 from server.auth import tg_user
 from server.deps import op_token
 from server.game_logic import db
+from server.settings import CHANNEL_USERNAME
 
 router = APIRouter(prefix="/api")
 
@@ -400,9 +400,6 @@ async def leaderboard(tg: dict = Depends(tg_user)):
 
 
 # ---------- подписка на канал ----------
-
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").lstrip("@")
-
 
 @router.get("/channel")
 async def channel(tg: dict = Depends(tg_user)):
