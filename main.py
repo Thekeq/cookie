@@ -118,13 +118,17 @@ async def healthz():
     Про Redis отвечаем 200 даже когда он лежит: лимитер уходит на фолбэк и игра
     продолжает работать, а вот планировщик — нет. Оркестратору незачем
     перезапускать по такому поводу рабочий процесс, но в ответе это видно, и
-    мониторинг может отдельно смотреть на поле cache."""
+    мониторинг может отдельно смотреть на поле cache.
+
+    Планировщик показан отдельным полем потому, что при ROLE=api он живёт в
+    ДРУГОМ процессе: у отвечающего на /healthz фоновых задач нет вовсе, и без
+    этой строки «бэкапов нет уже неделю» выглядело бы снаружи как здоровье."""
     import time as _time
-    from server import cache
+    from server import cache, scheduler
     from server.game_logic import db
     db.q1("SELECT 1 AS ok")
     return {"ok": True, "ts": _time.time(), "role": settings.ROLE,
-            "cache": cache.health()}
+            "cache": cache.health(), "scheduler": scheduler.health()}
 
 
 # собранный фронт (webapp/dist) раздаём как статику с корня
@@ -166,13 +170,34 @@ def preflight():
     logging.info("%s", settings.summary())
 
 
+def tasks_for_role() -> list:
+    """Что именно поднимает ЭТОТ процесс.
+
+    ROLE=all — как было: бот, API и фоновые задачи в одном процессе. Разделение
+    нужно, когда воркеров становится несколько: API масштабируется копиями, а
+    планировщик — нет, ему нужен ровно один процесс (владельца задач всё равно
+    сторожит scheduler, но платить N процессами за одну работу незачем).
+
+    Поллинг тянет только ROLE=all: физически его может вести один процесс, и
+    settings.problems() отказывается стартовать с ROLE=api/scheduler на
+    поллинге, чтобы апдейты не остались без читателя молча."""
+    jobs = []
+    if settings.ROLE in ("all", "api"):
+        jobs.append(run_api())
+    if settings.ROLE == "all":
+        jobs.append(run_bot())
+    if settings.ROLE in ("all", "scheduler"):
+        jobs.append(run_notifier(bot))
+    return jobs
+
+
 async def main():
     preflight()
-    print("🚀 Cookie Merge: bot + API starting...")
-    # без return_exceptions: падение любой из трёх задач роняет процесс,
+    print(f"🚀 Cookie Merge starting (role={settings.ROLE})...")
+    # без return_exceptions: падение любой из задач роняет процесс,
     # и systemd (Restart=always) поднимает его заново. Продолжать жить с
     # мёртвым поллингом хуже — снаружи это выглядит как рабочий сервис
-    await asyncio.gather(run_bot(), run_api(), run_notifier(bot))
+    await asyncio.gather(*tasks_for_role())
 
 
 if __name__ == "__main__":

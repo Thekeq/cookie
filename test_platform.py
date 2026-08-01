@@ -161,6 +161,11 @@ check(f"4.4 воркеры + Postgres + webhook + Redis — чисто ({texts(s
       not s.problems())
 check("4.5 в сводке видно движок базы, но не пароль",
       "db=postgres" in s.summary() and "p@localhost" not in s.summary())
+# разделение ролей и поллинг несовместимы: поллинг поднимает только ROLE=all,
+# иначе апдейты остаются без читателя, и снаружи это выглядит как «бот молчит»
+s = reload_settings(ROLE="api", BOT_MODE="polling", BOT_TOKEN="123:AAA")
+check("4.6 ROLE=api на поллинге — отказ (апдейты не тянет никто)",
+      any("polling" in t for t in fatals(s)))
 
 print("\n=== 5. Webhook ===")
 s = reload_settings(BOT_MODE="webhook", WEBAPP_URL="http://127.0.0.1:8000",
@@ -397,6 +402,140 @@ else:
     with cache.lock("job:noeval", 60) as again:
         check("10.2 и снимается без EVAL (иначе он не снялся бы никогда)",
               again is True)
+
+# ======================================================================
+# Планировщик: у каждой фоновой задачи один владелец и общее расписание
+# ======================================================================
+print("\n=== 11. Планировщик: расписание в БД, владелец один ===")
+use_fallback()
+
+import db as db_module
+
+from server import scheduler
+
+scheduler.reset()
+took = []
+for _ in range(3):
+    with scheduler.job("t:job", 0.4, 60) as mine:
+        took.append(mine)
+check("11.1 первый запуск сразу, внутри интервала — отказ",
+      took == [True, False, False])
+time.sleep(0.45)
+with scheduler.job("t:job", 0.4, 60) as mine:
+    check("11.2 после интервала работа снова выдаётся", mine is True)
+
+# Главный случай, ради которого нужен замок, а не только отметка в БД:
+# пуш-проход спит 0.05 с на игрока, и на сотне тысяч аккаунтов один проход
+# переживает свой же интервал. Интервал уже прошёл, но работа ещё идёт —
+# начинать вторую нельзя, иначе игрок получит два сообщения.
+scheduler.reset()
+with scheduler.job("t:job:slow", 0.1, 60) as outer:
+    time.sleep(0.15)
+    with scheduler.job("t:job:slow", 0.1, 60) as inner:
+        check("11.3 пока работа идёт, вторую не начинают",
+              outer is True and inner is False)
+
+# Отметка живёт в БД, а не в памяти: у бэкапа она была модульной переменной, и
+# цикл перезапусков снимал полную копию базы на каждом старте
+scheduler.reset()
+with scheduler.job("t:job:restart", 60, 60) as mine:
+    check("11.4 задача отработала", mine is True)
+cache._reset_for_tests()          # «рестарт»: память процесса чистая
+use_fallback()
+with scheduler.job("t:job:restart", 60, 60) as mine:
+    check("11.5 расписание переживает рестарт", mine is False)
+
+# Падение задачи не должно выглядеть как успех: вызывающий обязан узнать, а в
+# кластере лог мог остаться в уже сменившемся процессе — поэтому ещё и в БД
+scheduler.reset()
+try:
+    with scheduler.job("t:job:boom", 60, 60) as mine:
+        if mine:
+            raise RuntimeError("сломалось")
+    check("11.6 исключение из задачи не глотается", False)
+except RuntimeError:
+    check("11.6 исключение из задачи не глотается", True)
+_row = db_module.shared().q1(
+    "SELECT fails, last_error, last_ok_at FROM job_runs WHERE job_key = ?",
+    ("t:job:boom",))
+check("11.7 падение записано в журнал задач",
+      _row["fails"] == 1 and "сломалось" in _row["last_error"]
+      and _row["last_ok_at"] == 0)
+
+# Реальное расписание нотификатора, один проход целиком: юнит-проверки
+# примитива не видят опечатку в самом списке задач (ключ, период, функция), а
+# заметить её на проде можно только по тому, что работа не делается.
+from bot import notifier
+
+scheduler.reset()
+_done = []
+for _key, _interval, _ttl, _work in notifier.JOBS:
+    with scheduler.job(_key, _interval, _ttl) as mine:
+        if mine:
+            _work()
+            _done.append(_key)
+check(f"11.8 весь список задач нотификатора проходит тик ({len(_done)} шт.)",
+      _done == [k for k, *_ in notifier.JOBS])
+check("11.9 после тика ни одна задача не в ошибке",
+      "failing" not in scheduler.health())
+# бэкап реально снял копию временной базы — уносим её за собой
+_backups = os.path.join(os.path.dirname(DB_PATH), "backups")
+for _name in os.listdir(_backups) if os.path.isdir(_backups) else []:
+    if _name.startswith(os.path.basename(DB_PATH)):
+        os.remove(os.path.join(_backups, _name))
+
+print("\n=== 12. Здоровье планировщика видно снаружи ===")
+scheduler.reset()
+check("12.1 пустое расписание не притворяется рабочим",
+      scheduler.health()["jobs"] == 0)
+with scheduler.job("t:h", 60, 60):
+    pass
+_h = scheduler.health()
+check("12.2 отработавшая задача попадает в сводку",
+      _h["jobs"] == 1 and _h["last_ok_age"] < 5)
+check("12.3 свежая задача не считается просроченной", "stale" not in _h)
+db_module.shared().exec(
+    "UPDATE job_runs SET last_ok_at = ? WHERE job_key = ?",
+    (time.time() - 400, "t:h"))
+check("12.4 молчащая задача видна как stale (иначе «бэкапов нет неделю» "
+      "выглядит как здоровье)", scheduler.health().get("stale") == ["t:h"])
+scheduler.reset()
+
+print("\n=== 13. Роль решает, что поднимает процесс ===")
+from fastapi.testclient import TestClient
+
+import main as main_module
+
+
+def role_tasks(role: str) -> list[str]:
+    """Какие задачи поднял бы процесс с этой ролью.
+
+    Корутины закрываем сразу: запускать здесь ни поллинг, ни uvicorn не нужно —
+    проверяется только состав."""
+    saved = _settings.ROLE
+    _settings.ROLE = role
+    try:
+        jobs = main_module.tasks_for_role()
+        names = sorted(j.cr_code.co_name for j in jobs)
+    finally:
+        _settings.ROLE = saved
+    for j in jobs:
+        j.close()
+    return names
+
+
+check("13.1 ROLE=all — бот, API и планировщик в одном процессе",
+      role_tasks("all") == ["run_api", "run_bot", "run_notifier"])
+# воркер API не должен вести фоновые задачи: их владелец один на кластер
+check("13.2 ROLE=api — только HTTP", role_tasks("api") == ["run_api"])
+check("13.3 ROLE=scheduler — только фоновые задачи",
+      role_tasks("scheduler") == ["run_notifier"])
+
+_r = TestClient(main_module.app).get("/healthz")
+_j = _r.json()
+check("13.4 /healthz отвечает 200", _r.status_code == 200 and _j["ok"] is True)
+check("13.5 в /healthz видно роль, кеш и планировщик",
+      _j["role"] and "backend" in _j["cache"] and "jobs" in _j["scheduler"])
 
 use_fallback()
 importlib.reload(_settings)

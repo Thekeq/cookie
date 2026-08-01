@@ -16,6 +16,8 @@ from aiogram.exceptions import TelegramForbiddenError
 from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
+from server import scheduler
+from server import settings
 from server.game_logic import db
 from server.i18n import tr
 
@@ -83,19 +85,20 @@ def _prune_events():
             (time.time() - cfg.EVENTS_TTL_DAYS * 86400,))
 
 
-_last_backup = 0.0
-
-
 def _backup_db():
     """Ежедневный горячий снимок базы. Бэкапов не было вообще: единственная
     копия создавалась один раз перед dedup-миграцией, и любое повреждение
-    файла означало потерю всего прогресса всех игроков."""
-    global _last_backup
-    now = time.time()
-    if now - _last_backup < cfg.BACKUP_INTERVAL_H * 3600:
+    файла означало потерю всего прогресса всех игроков.
+
+    Периодичность больше не считается здесь: отметка последнего снимка жила в
+    модульной переменной, то есть в памяти процесса, и цикл перезапусков снимал
+    полную копию базы на каждом старте. Теперь этим занят scheduler (отметка в
+    БД), а тут остаётся сама работа."""
+    if settings.DATABASE_URL:
+        # sqlite3.backup умеет только SQLite; у Postgres за снимки отвечает
+        # pg_dump/провайдер, и делать вид, что бэкап есть, — хуже, чем не делать
         return
     path = db.snapshot(keep=cfg.BACKUP_KEEP)
-    _last_backup = now
     if path:
         log.info("бэкап базы: %s", path)
 
@@ -130,21 +133,46 @@ def _rollover_seasons():
             return                # не двигается — дальше крутиться бессмысленно
 
 
+# Расписание: (ключ, период, ttl замка, работа). Порядок важен — сначала
+# домалываем сезон, потом всё остальное: иначе игрок придёт по уведомлению и
+# увидит несброшенный сезонный прогресс.
+#
+# Чистилки переехали с «каждый тик» на раз в час. Ходят они по всей таблице, а
+# смысла удалять только что созданные строки шестнадцать раз за час нет: под
+# сотней тысяч игроков это ровно тот фоновый писатель, который мешает горячим
+# ручкам. TTL замка — запас на самую долгую работу, а не на среднюю.
+JOBS: tuple[tuple[str, float, float, object], ...] = (
+    ("season_rollover", CHECK_INTERVAL, 30 * 60, _rollover_seasons),
+    ("events_prune", 3600, 15 * 60, _prune_events),
+    ("ops_prune", 3600, 15 * 60, _prune_ops),
+    ("boosts_prune", 3600, 15 * 60, _prune_boosts),
+    ("db_backup", cfg.BACKUP_INTERVAL_H * 3600, 60 * 60, _backup_db),
+)
+
+# Пуш-проход отдельно: он async и он самый долгий. 0.05 с на игрока — это час
+# на 72 тысячи пушей, поэтому ttl взят с запасом на порядок больше остальных.
+NOTIFY_TTL = 4 * 3600
+
+
 async def run_notifier(bot):
+    """Фоновые задачи процесса. Владелец каждой — один на кластер (scheduler).
+
+    Раньше здесь не было ни владельца, ни расписания: цикл будил все задачи
+    каждые 15 минут, и второй процесс просто делал ту же работу второй раз."""
+    log.info("планировщик запущен: role=%s owner=%s задач=%d",
+             settings.ROLE, scheduler.OWNER, len(JOBS) + 1)
     while True:
-        # сначала домалываем сезон, потом пуши: иначе игрок придёт по
-        # уведомлению и увидит несброшенный сезонный прогресс
-        for name, job in (("season rollover", _rollover_seasons),
-                          ("events prune", _prune_events),
-                          ("ops prune", _prune_ops),
-                          ("boosts prune", _prune_boosts),
-                          ("db backup", _backup_db)):
+        for key, interval, ttl, work in JOBS:
             try:
-                job()
+                with scheduler.job(key, interval, ttl) as mine:
+                    if mine:
+                        work()
             except Exception:
-                log.exception("%s failed", name)
+                log.exception("%s failed", key)
         try:
-            await _notify_pass(bot)
+            with scheduler.job("notify_pass", CHECK_INTERVAL, NOTIFY_TTL) as mine:
+                if mine:
+                    await _notify_pass(bot)
         except Exception:
             log.exception("notifier pass failed")
         await asyncio.sleep(CHECK_INTERVAL)

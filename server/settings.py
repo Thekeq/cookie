@@ -154,6 +154,11 @@ def problems() -> list[tuple[str, bool]]:
         out.append((f"BOT_MODE={BOT_MODE!r} — допустимо polling или webhook", True))
     if ROLE not in ("all", "api", "scheduler"):
         out.append((f"ROLE={ROLE!r} — допустимо all, api или scheduler", True))
+    if ROLE in ("api", "scheduler") and BOT_MODE == "polling":
+        # поллинг ведёт только процесс с ROLE=all: при разделении ролей ни один
+        # из них его не поднимает, и апдейты молча остаются непрочитанными
+        out.append((f"ROLE={ROLE} при BOT_MODE=polling: апдейты не будет тянуть "
+                    "никто — для разделённых ролей нужен BOT_MODE=webhook", True))
     if BOT_MODE == "webhook" and not WEBHOOK_BASE.startswith("https://"):
         # Telegram шлёт апдейты только на https и только на публичный адрес
         out.append(("BOT_MODE=webhook, но WEBHOOK_BASE/WEBAPP_URL не https-адрес "

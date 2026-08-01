@@ -375,6 +375,16 @@ class DataBase:
                 'season_earned': 'REAL NOT NULL DEFAULT 0',
                 'captured_at': 'REAL NOT NULL DEFAULT 0',
             },
+            'job_runs': {  # расписание фоновых задач, общее для всех процессов
+                'job_key': 'TEXT PRIMARY KEY',
+                'last_run_at': 'REAL NOT NULL DEFAULT 0',   # когда взяли в работу
+                'last_ok_at': 'REAL NOT NULL DEFAULT 0',    # когда дошли до конца
+                'interval_s': 'REAL NOT NULL DEFAULT 0',    # ожидаемый период
+                'runs': 'INTEGER NOT NULL DEFAULT 0',
+                'fails': 'INTEGER NOT NULL DEFAULT 0',
+                'owner': 'TEXT',                            # host:pid последнего запуска
+                'last_error': 'TEXT',
+            },
             'season_results': {  # снапшот топа прошедших сезонов + выданные награды
                 'id': 'INTEGER PRIMARY KEY',
                 'season_id': 'INTEGER',
