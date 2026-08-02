@@ -25,6 +25,14 @@ from server.routers import game, meta, admin, farm
 # владелец узнавал от игроков. Теперь INFO с ротацией в файл — журнал платежей,
 # ролловеров и бэкапов сохраняется между рестартами.
 LOG_FILE = settings.LOG_FILE
+if settings.WEB_CONCURRENCY > 1:
+    # Ротация — это rename + создание нового файла. Когда в один и тот же файл
+    # пишут N процессов, каждый ротирует его сам и по своему счётчику: часть
+    # воркеров продолжает писать в уже переименованный файл, а cookie.log.1
+    # перезаписывается следующим. Своё имя на процесс дороже при чтении, но
+    # логи хотя бы не теряются.
+    root, ext = os.path.splitext(LOG_FILE)
+    LOG_FILE = f"{root}.{os.getpid()}{ext}"
 _handlers: list[logging.Handler] = [logging.StreamHandler()]
 try:
     from logging.handlers import RotatingFileHandler
@@ -183,9 +191,42 @@ async def run_bot():
 
 
 async def run_api():
+    """HTTP-сервер этого процесса.
+
+    Один воркер — обычный asyncio-сервер рядом с остальными задачами процесса.
+    Несколько воркеров — это уже не задача, а мастер-процесс (см. serve_api_
+    workers), и сюда управление не доходит: main() разводит эти два случая до
+    создания цикла событий."""
     config = uvicorn.Config(app, host=settings.HOST, port=settings.PORT,
                             log_level="warning")
     await uvicorn.Server(config).serve()
+
+
+def serve_api_workers():
+    """Мастер-процесс: N воркеров uvicorn на ОДНОМ слушающем сокете.
+
+    Сокет открывает мастер и передаёт детям, поэтому порт занят один раз, а
+    ядро само раскладывает соединения по воркерам — ни балансировщика, ни
+    отдельных портов не нужно.
+
+    Приложение передаётся СТРОКОЙ "main:app", а не объектом: дети создаются
+    через fork/spawn и на Windows (spawn) объект приложения не переживает
+    сериализацию. Строку каждый ребёнок импортирует у себя сам.
+
+    Функция блокирующая и своего цикла событий не заводит — asyncio живёт
+    внутри каждого ребёнка. Фоновых задач здесь нет вовсе: их несёт отдельный
+    процесс с ROLE=scheduler, и settings.problems() не даст запуститься с
+    несколькими воркерами в любой другой роли."""
+    from uvicorn.supervisors import Multiprocess
+
+    config = uvicorn.Config("main:app", host=settings.HOST, port=settings.PORT,
+                            workers=settings.WEB_CONCURRENCY,
+                            log_level="warning")
+    sock = config.bind_socket()
+    try:
+        Multiprocess(config, sockets=[sock]).run()
+    finally:
+        sock.close()
 
 
 def preflight():
@@ -235,7 +276,6 @@ def tasks_for_role() -> list:
 
 
 async def main():
-    preflight()
     print(f"🚀 Cookie Merge starting (role={settings.ROLE})...")
     # без return_exceptions: падение любой из задач роняет процесс,
     # и systemd (Restart=always) поднимает его заново. Продолжать жить с
@@ -243,8 +283,24 @@ async def main():
     await asyncio.gather(*tasks_for_role())
 
 
+def run():
+    """Развилка «один процесс» / «мастер с воркерами».
+
+    Она здесь, а не внутри main(), потому что мастер-процесс НЕ асинхронный:
+    Multiprocess вешает обработчики сигналов и ждёт детей в главном потоке, и
+    заворачивать его в задачу asyncio значило бы ставить блокирующий цикл
+    рядом с событийным."""
+    preflight()
+    if settings.WEB_CONCURRENCY > 1:
+        print(f"🚀 Cookie Merge starting (role={settings.ROLE}, "
+              f"воркеров {settings.WEB_CONCURRENCY})...")
+        serve_api_workers()
+        return
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        run()
     except KeyboardInterrupt:
         print("Stopped")

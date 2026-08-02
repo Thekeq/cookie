@@ -166,6 +166,19 @@ check("4.5 в сводке видно движок базы, но не паро�
 s = reload_settings(ROLE="api", BOT_MODE="polling", BOT_TOKEN="123:AAA")
 check("4.6 ROLE=api на поллинге — отказ (апдейты не тянет никто)",
       any("polling" in t for t in fatals(s)))
+# Мастер-процесс только следит за детьми, а дети поднимают ТОЛЬКО ASGI —
+# tasks_for_role не выполняется ни в одном из них. С ROLE=all это означает,
+# что бэкапа, ролловера и пушей нет нигде, и снаружи сервис выглядит здоровым
+s = reload_settings(WEB_CONCURRENCY="4", ROLE="all", BOT_MODE="webhook",
+                    REDIS_URL="redis://localhost:6379/0",
+                    DATABASE_URL="postgresql://u:p@localhost/cookie",
+                    WEBAPP_URL="https://prod.example.com", BOT_TOKEN="123:AAA")
+check("4.7 воркеры при ROLE=all — отказ (фоновые задачи не выполнит никто)",
+      any("ROLE=all" in t and "фоновые" in t for t in fatals(s)))
+s = reload_settings(WEB_CONCURRENCY="4", ROLE="scheduler", BOT_MODE="webhook",
+                    REDIS_URL="redis://localhost:6379/0")
+check("4.8 воркеры при ROLE=scheduler — тоже отказ",
+      any("ROLE=scheduler" in t for t in fatals(s)))
 
 print("\n=== 5. Webhook ===")
 s = reload_settings(BOT_MODE="webhook", WEBAPP_URL="http://127.0.0.1:8000",
@@ -724,6 +737,125 @@ check("15.12 webhook.install идёт до монтирования статик
 
 (_settings.BOT_MODE, _settings.WEBHOOK_PATH, _settings.WEBHOOK_SECRET,
  _settings.WEBHOOK_BASE, webhook.dp) = _saved_hook
+
+print("\n=== 16. Воркеры API и отдельный планировщик ===")
+
+# Мастер-процесс блокирующий: Multiprocess вешает обработчики сигналов и ждёт
+# детей в главном потоке. Поэтому развилка стоит ДО asyncio.run, а не внутри
+# задачи — иначе блокирующий цикл встал бы рядом с событийным.
+_seen = {}
+
+
+def _fake_workers():
+    _seen["workers"] = True
+
+
+def _fake_asyncio_run(coro):
+    _seen["asyncio"] = True
+    coro.close()
+
+
+_saved_run = (main_module.serve_api_workers, main_module.asyncio.run,
+              main_module.preflight, _settings.WEB_CONCURRENCY)
+main_module.serve_api_workers = _fake_workers
+main_module.asyncio.run = _fake_asyncio_run
+main_module.preflight = lambda: None
+try:
+    _settings.WEB_CONCURRENCY = 1
+    main_module.run()
+    check("16.1 один воркер — обычный процесс с задачами роли",
+          _seen == {"asyncio": True})
+    _seen.clear()
+    _settings.WEB_CONCURRENCY = 4
+    main_module.run()
+    check("16.2 несколько воркеров — мастер-процесс вместо цикла задач",
+          _seen == {"workers": True})
+finally:
+    (main_module.serve_api_workers, main_module.asyncio.run,
+     main_module.preflight, _settings.WEB_CONCURRENCY) = _saved_run
+
+# Дети создаются fork/spawn, и объект приложения такого не переживает: на
+# spawn-платформах его пришлось бы сериализовать. Строку каждый ребёнок
+# импортирует у себя сам.
+_cfg = {}
+_real_config = main_module.uvicorn.Config
+
+
+class _FakeSock:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeConfig:
+    def __init__(self, app, **kw):
+        _cfg["app"], _cfg["kw"] = app, kw
+        self.workers = kw.get("workers")
+        self.sock = _FakeSock()
+
+    def bind_socket(self):
+        return self.sock
+
+
+class _FakeMulti:
+    def __init__(self, config, sockets):
+        _cfg["sockets"] = sockets
+
+    def run(self):
+        _cfg["ran"] = True
+
+
+import uvicorn.supervisors as _sup
+
+_saved_multi = _sup.Multiprocess
+main_module.uvicorn.Config = _FakeConfig
+_sup.Multiprocess = _FakeMulti
+_saved_conc = _settings.WEB_CONCURRENCY
+try:
+    _settings.WEB_CONCURRENCY = 4
+    main_module.serve_api_workers()
+finally:
+    main_module.uvicorn.Config = _real_config
+    _sup.Multiprocess = _saved_multi
+    _settings.WEB_CONCURRENCY = _saved_conc
+
+check("16.3 приложение передаётся строкой импорта, а не объектом",
+      _cfg["app"] == "main:app")
+check(f"16.4 число воркеров берётся из настроек ({_cfg['kw'].get('workers')})",
+      _cfg["kw"]["workers"] == 4)
+# Сокет открывает мастер и раздаёт детям: порт занят один раз, соединения
+# раскладывает ядро — ни второго порта, ни балансировщика не нужно
+check("16.5 все воркеры слушают ОДИН сокет мастера",
+      _cfg["ran"] and len(_cfg["sockets"]) == 1)
+check("16.6 сокет закрывается после остановки мастера",
+      _cfg["sockets"][0].closed)
+
+# Ротация — это переименование файла. N процессов ротируют его каждый по
+# своему счётчику, и часть записей уходит в уже переименованный файл.
+_main_src = _pathlib.Path("main.py").read_text(encoding="utf-8")
+check("16.7 при нескольких воркерах у каждого процесса свой файл лога",
+      "WEB_CONCURRENCY > 1" in _main_src and "os.getpid()" in _main_src
+      and _main_src.index("LOG_FILE = settings.LOG_FILE")
+      < _main_src.index("os.getpid()"))
+
+_units = {name: _pathlib.Path("deploy", name).read_text(encoding="utf-8")
+          for name in ("cookie-api.service", "cookie-scheduler.service")}
+check("16.8 юнит API объявляет ROLE=api",
+      "Environment=ROLE=api" in _units["cookie-api.service"])
+# планировщик обязан быть один: .env общий на оба юнита, и WEB_CONCURRENCY из
+# него утёк бы сюда, а с ним старт отменяется правилом 4.8
+check("16.9 юнит планировщика объявляет ROLE=scheduler и один воркер",
+      "Environment=ROLE=scheduler" in _units["cookie-scheduler.service"]
+      and "Environment=WEB_CONCURRENCY=1" in _units["cookie-scheduler.service"])
+check("16.10 оба юнита перезапускаются сами (падение задачи роняет процесс)",
+      all("Restart=always" in u for u in _units.values()))
+check("16.11 оба юнита работают не от root",
+      all("User=cookie" in u for u in _units.values()))
+# на остановке может идти pg_dump или проход пушей — их нельзя рубить по
+# дефолтным 90 секундам молча
+check("16.12 у планировщика запас на остановку больше, чем у API",
+      "TimeoutStopSec=120" in _units["cookie-scheduler.service"])
 
 use_fallback()
 importlib.reload(_settings)

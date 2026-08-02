@@ -1,0 +1,38 @@
+[Unit]
+# Фоновые задачи: ролловер сезона, бэкап, чистки, пуши, проверка webhook'а.
+# Процесс ровно один. Второй данные не испортит — владельца каждой задачи
+# сторожит server/scheduler.py через отметки в job_runs, — но и пользы не
+# принесёт, только займёт соединения к базе.
+Description=Cookie Merge — планировщик
+After=network-online.target cookie-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cookie
+Group=cookie
+WorkingDirectory=/opt/cookie
+EnvironmentFile=/opt/cookie/.env
+Environment=ROLE=scheduler
+Environment=BOT_MODE=webhook
+# Воркеры — свойство API, а не планировщика: с WEB_CONCURRENCY > 1 в этой роли
+# settings.problems() откажется стартовать, а .env общий на оба юнита.
+Environment=WEB_CONCURRENCY=1
+ExecStart=/opt/cookie/venv/bin/python main.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+# Дольше, чем у API: на остановке может идти pg_dump или проход пушей.
+TimeoutStopSec=120
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cookie
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

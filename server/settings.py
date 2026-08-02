@@ -175,6 +175,15 @@ def problems() -> list[tuple[str, bool]]:
         out.append(("WEB_CONCURRENCY > 1 без REDIS_URL: лимит запросов станет "
                     f"{WEB_CONCURRENCY}-кратным, фоновые задачи запустятся в "
                     "каждом воркере", True))
+    if WEB_CONCURRENCY > 1 and ROLE != "api":
+        # При нескольких воркерах главный процесс только следит за детьми, а
+        # дети поднимают ТОЛЬКО ASGI-приложение — до tasks_for_role не доходит
+        # ни один из них. То есть с ROLE=all фоновые задачи не запустятся
+        # нигде: ни бэкапа, ни ролловера сезона, ни пушей, и наружу это
+        # выглядит как совершенно здоровый сервис.
+        out.append((f"WEB_CONCURRENCY > 1 при ROLE={ROLE}: воркеры поднимают "
+                    "только API, фоновые задачи не выполнит никто — нужен "
+                    "ROLE=api здесь и отдельный процесс с ROLE=scheduler", True))
     if WEB_CONCURRENCY > 1 and BOT_MODE == "polling":
         out.append(("WEB_CONCURRENCY > 1 при BOT_MODE=polling: апдейты будет "
                     "тянуть каждый воркер, Telegram отдаст их случайному", True))

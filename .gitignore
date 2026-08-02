@@ -26,4 +26,6 @@ webapp/dist/
 # служебное: локальные скрипты аудита/дампов базы
 temp_*.py
 cookie.log*
+# при WEB_CONCURRENCY > 1 каждый процесс пишет в свой файл: cookie.<pid>.log
+cookie.*.log
 backups/

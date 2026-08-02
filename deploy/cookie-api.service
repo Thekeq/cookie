@@ -1,0 +1,40 @@
+[Unit]
+# HTTP: API и раздача Mini App. Копий столько, сколько задано в
+# WEB_CONCURRENCY — фоновых задач этот процесс не несёт вовсе, их ведёт
+# cookie-scheduler.service.
+Description=Cookie Merge — API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cookie
+Group=cookie
+WorkingDirectory=/opt/cookie
+EnvironmentFile=/opt/cookie/.env
+# Роль и режим бота задаются здесь, а не в .env: .env общий для обоих юнитов,
+# и роль — единственное, чем они отличаются. Environment= сильнее файла,
+# потому что settings.py читает .env с override=False.
+Environment=ROLE=api
+Environment=BOT_MODE=webhook
+ExecStart=/opt/cookie/venv/bin/python main.py
+# Падение задачи роняет процесс намеренно (см. main.main): жить с мёртвым
+# компонентом хуже, чем перезапуститься. 5 секунд, чтобы цикл падений не
+# превратился в нагрузку сам по себе.
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Песочница. Процесс пишет только в свой каталог: база, логи, снимки.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cookie
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
