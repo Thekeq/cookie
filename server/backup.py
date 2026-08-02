@@ -182,12 +182,17 @@ def _folder() -> str:
 
 
 def latest(suffix: str = "") -> str | None:
-    """Самый свежий снимок. Метка времени в имени сортируемая, поэтому
-    лексикографический порядок и есть хронологический."""
+    """Самый свежий снимок — по времени файла, а не по имени.
+
+    Метка времени в имени сортируемая, но идёт ПОСЛЕ имени базы, поэтому
+    лексикографический порядок совпадает с хронологическим только пока имя
+    базы не менялось никогда. Стоит переехать с `data.db` на что-то другое — и
+    «самым свежим» навсегда останется снимок с алфавитно старшим именем, то
+    есть учения будут разворачивать прошлогодний файл и рапортовать успех."""
     folder = _folder()
-    names = sorted(f for f in os.listdir(folder)
-                   if f.endswith(suffix) and not f.endswith(".sha256"))
-    return os.path.join(folder, names[-1]) if names else None
+    paths = [os.path.join(folder, f) for f in os.listdir(folder)
+             if f.endswith(suffix) and not f.endswith(".sha256")]
+    return max(paths, key=os.path.getmtime) if paths else None
 
 
 def _prune_orphan_sums():

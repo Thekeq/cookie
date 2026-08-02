@@ -24,6 +24,7 @@ DO NOTHING`, `RETURNING`, `UPDATE ... WHERE <guard>` + rowcount, шимы
 max_connections сервера.
 """
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -36,6 +37,8 @@ from contextlib import contextmanager
 # Только счётчики. server.obs не тянет ни db, ни игровую логику — специально,
 # чтобы измеряемое можно было импортировать из измеряющего без кольца.
 from server import obs
+
+log = logging.getLogger(__name__)
 
 # сколько раз повторить BEGIN IMMEDIATE, если база занята другим писателем
 TX_RETRIES = 5
@@ -1200,10 +1203,52 @@ class DataBase:
             yield
             self.connection.commit()
         except BaseException:
-            self.connection.rollback()
+            try:
+                self.connection.rollback()
+            except sqlite3.Error:
+                pass          # соединение добьёт _drop_dirty_connection ниже
             raise
         finally:
             self._tx_depth = 0
+            self._drop_dirty_connection()
+
+    def _drop_dirty_connection(self):
+        """Выбросить соединение потока, если на нём осталась открытая транзакция.
+
+        Соединения живут по потоку и переиспользуются. Транзакция, которую не
+        удалось ни закоммитить, ни откатить (COMMIT упал по busy, а следом упал
+        и ROLLBACK), остаётся открытой НАВСЕГДА — и дальше это соединение
+        читает снапшот на момент её начала. Снаружи это выглядит не как ошибка,
+        а как путешествие во времени: игрок, который только что
+        зарегистрировался, получает `err_no_user`, а его клики уходят в никуда.
+        Плюс открытая транзакция держит блокировку писателя, то есть один
+        застрявший поток тормозит всех остальных.
+
+        Поэтому: не чиним — выбрасываем. Следующее обращение из этого потока
+        поднимет чистое соединение, а закрытие снимет и транзакцию, и
+        блокировку."""
+        if self.DIALECT != "sqlite":
+            return
+        conn = getattr(self._local, "conn", None)
+        if conn is None or not conn.in_transaction:
+            return
+        obs.inc("db_dirty_connections_total")
+        log.error("соединение потока осталось в транзакции — выбрасываем его")
+        # in-memory база живёт ровно в одном соединении: закрыть его — значит
+        # стереть всю базу. Там остаётся последняя попытка отката
+        if self.db_file == ":memory:":
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            return
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        self._local.conn = None
+        self._local.cur = None
+        self._local.depth = 0
 
     @staticmethod
     @contextmanager

@@ -33,6 +33,7 @@ SUITES = (
     "test_new_features.py",   # ручки API и админка
     "test_platform.py",       # конфиг, разделяемое состояние, роли, метрики
     "test_retention.py",      # удержание: цели, дейлики, возвраты
+    "test_chaos.py",          # отказы: Redis, база, диск, Telegram, планировщик
 )
 
 
