@@ -6,7 +6,6 @@ from pydantic import BaseModel, Field
 
 from server.auth import tg_admin
 from server import game_config as cfg
-from server import game_logic as gl
 from server.game_logic import db
 from server.settings import BOT_USERNAME
 

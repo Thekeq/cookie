@@ -470,7 +470,7 @@ gl.quest_progress(UID, metric, 5)
 check("claimed quests do not advance",
       all(r["progress"] == 7 for r in
           db.q("SELECT progress FROM daily_quests WHERE user_id = ? AND day = ? "
-               "AND quest_key IN (%s)" % ", ".join("?" * len(hit)),
+               "AND quest_key IN (" + ", ".join("?" * len(hit)) + ")",
                (UID, day, *[r["quest_key"] for r in hit]))))
 
 

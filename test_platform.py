@@ -1103,6 +1103,65 @@ check("17.42 остановка ждёт добитые запросы (GRACEFUL
       _main_src.count("timeout_graceful_shutdown=settings.GRACEFUL_TIMEOUT") == 2)
 check("17.43 sentry не включается без DSN", obs.init_sentry() is False)
 
+print("\n=== 18. CI: прогон проверок, линтер, поиск секретов ===")
+sys.path.insert(0, "tools")
+import check_secrets as _sec
+
+import run_tests as _runner
+
+# Набор, забытый в списке, — это набор, который в CI не запускается вовсе.
+# Проверка не «список непустой», а «список совпадает с тем, что лежит рядом»
+_suite_files = sorted(p.name for p in _pathlib.Path(".").glob("test_*.py"))
+check("18.1 в прогоне перечислены ВСЕ наборы проверок",
+      sorted(_runner.SUITES) == _suite_files)
+_runner_src = _pathlib.Path("run_tests.py").read_text(encoding="utf-8")
+# каждый набор подменяет окружение до импорта db: в общем процессе первый
+# импорт зафиксировал бы базу для всех остальных
+check("18.2 наборы идут отдельными процессами",
+      "subprocess.call" in _runner_src and "sys.executable" in _runner_src)
+check("18.3 из окружения прогона вычищается боевая база",
+      'env.pop("DATABASE_URL"' in _runner_src)
+
+_ci = _pathlib.Path(".github", "workflows", "ci.yml")
+check("18.4 есть workflow на пуш и на pull request", _ci.exists())
+_ci_src = _ci.read_text(encoding="utf-8")
+for _need, _what in (("python run_tests.py", "18.5 CI гоняет все наборы"),
+                     ("ruff check", "18.6 CI гоняет линтер"),
+                     ("npm run build", "18.7 CI собирает фронт (tsc + vite)"),
+                     ("postgres:16", "18.8 CI поднимает живой PostgreSQL"),
+                     ("check_secrets.py", "18.9 CI ищет секреты в индексе"),
+                     ("migrate_to_postgres.py", "18.10 CI прогоняет переезд базы")):
+    check(_what, _need in _ci_src)
+# без этого второй пуш встаёт в очередь за устаревшим прогоном
+check("18.11 новый пуш отменяет предыдущий прогон", "cancel-in-progress" in _ci_src)
+check("18.12 у прогонов есть предел по времени", "timeout-minutes" in _ci_src)
+
+check("18.13 конфиг линтера в репозитории",
+      _pathlib.Path("ruff.toml").exists())
+
+# Сканер обязан ЛОВИТЬ, а не молча проходить: правило, которое ничего не
+# находит, выглядит в CI ровно так же, как правило, которое работает
+_caught = lambda s: any(rx.search(s) for rx, _ in _sec.PATTERNS)  # noqa: E731
+check("18.14 ловит настоящий токен бота",
+      _caught("BOT_TOKEN=7712345678:AAH9xKk2LmNoPqRsTuVwXyZ0123456789abc"))  # secret-scan-ok
+check("18.15 ловит приватный ключ и токены сервисов",
+      _caught("-----BEGIN RSA PRIVATE KEY-----")  # secret-scan-ok
+      and _caught("ghp_abcdefghijklmnopqrstuvwxyz0123456789")  # secret-scan-ok
+      and _caught("AKIAIOSFODNN7EXAMPLE"))  # secret-scan-ok
+check("18.16 ловит пароль в строке подключения и боевой DSN",
+      _caught("postgresql://cookie:Sup3rSecret@db.prod.internal:5432/c")  # secret-scan-ok
+      and _caught("https://1234@o99.ingest.sentry.io/5"))  # secret-scan-ok
+# ложные срабатывания опаснее, чем кажется: с ними правило выключают целиком
+check("18.17 не ругается на тестовый токен и примеры",
+      not _caught("123456789:AAtestTOKENtestTOKENtestTOKENtest12")
+      and not _caught("postgresql://user:pass@localhost/cookie_test"))
+check("18.18 боевая база и .env числятся запрещёнными в индексе",
+      ".env" in _sec.FORBIDDEN_NAMES and "data.db" in _sec.FORBIDDEN_NAMES
+      and ".db" in _sec.FORBIDDEN_SUFFIXES)
+check("18.19 сканер смотрит индекс git, а не рабочий каталог",
+      "git" in _pathlib.Path("tools", "check_secrets.py").read_text(
+          encoding="utf-8") and _sec.main() == 0)
+
 use_fallback()
 importlib.reload(_settings)
 

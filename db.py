@@ -1136,17 +1136,17 @@ class DataBase:
 
     @property
     def cursor(self):
-        self.connection          # гарантирует, что соединение потока поднято
+        _ = self.connection      # гарантирует, что соединение потока поднято
         return self._local.cur
 
     @property
     def _tx_depth(self) -> int:
-        self.connection
+        _ = self.connection
         return self._local.depth
 
     @_tx_depth.setter
     def _tx_depth(self, value: int):
-        self.connection
+        _ = self.connection
         self._local.depth = value
 
     # ---------- универсальные хелперы ----------

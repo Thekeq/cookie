@@ -1,0 +1,146 @@
+# Проверки на каждый пуш и каждый PR.
+#
+# Зачем. Проверок в репозитории восемь наборов и почти тысяча утверждений, но
+# запускались они РУКАМИ и на одной машине. Это ровно тот режим, в котором
+# «у меня всё зелёно» перестаёт что-либо значить: забыли прогнать — узнали от
+# игроков. Здесь всё то же самое идёт автоматически, на чистой машине и в обоих
+# диалектах базы.
+#
+# Задачи независимы и идут параллельно: линтер не ждёт фронт, фронт не ждёт
+# PostgreSQL. Падает любая — сборка красная.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Новый пуш в ту же ветку отменяет предыдущий прогон: держать очередь из
+# устаревших сборок незачем, а раннеры общие.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Тесты поднимают свои временные базы, но settings требует токен на импорте
+  BOT_TOKEN: "123456789:AAtestTOKENtestTOKENtestTOKENtest12"
+
+jobs:
+  lint:
+    name: Линтер и компиляция
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.14.5
+      - name: ruff
+        run: ruff check --output-format github .
+      # Синтаксис проверяем отдельно: модуль, который не импортируется, до
+      # тестов не доживёт, но и сообщение об этом хочется внятное
+      - name: Компиляция всех модулей
+        run: python -m compileall -q bot server *.py
+
+  tests:
+    name: Тесты (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # Один вход, один код возврата. Каждый набор — отдельный процесс: файлы
+      # подменяют окружение до импорта db, и в общем процессе половина проверок
+      # ушла бы работать в чужую базу
+      - name: Все наборы проверок
+        run: python run_tests.py
+
+  postgres:
+    name: Тесты (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cookie
+          POSTGRES_PASSWORD: cookie
+          POSTGRES_DB: cookie_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://cookie:cookie@localhost:5432/cookie_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # Схема написана на типах SQLite, а перевод (INTEGER PRIMARY KEY ->
+      # BIGSERIAL, триггеры -> PL/pgSQL) делает db.py. Без живой базы проверяется
+      # только текст перевода — а падает он на настоящем сервере
+      - name: Перевод схемы на живом PostgreSQL
+        run: python test_dialect.py
+      # Переезд боевых данных — операция, которую делают один раз и под нагрузкой
+      # первого дня. Прогоняем её на пустой базе: скрипт обязан пройти схему,
+      # журнал миграций и последовательности, а не упасть на третьей таблице
+      - name: Перенос данных вхолостую
+        env:
+          DATABASE_PATH: ci_source.db
+        run: |
+          python -c "import db; db.shared(); print('исходная база создана')"
+          python migrate_to_postgres.py --sqlite ci_source.db \
+            --url "$TEST_DATABASE_URL" --dry-run
+      # Схема на боевом движке должна не только СОЗДАТЬСЯ, но и принять запись:
+      # часть переводов (BIGSERIAL, триггеры, DOUBLE PRECISION) падает не на
+      # CREATE TABLE, а на первом INSERT
+      - name: Боевой старт на PostgreSQL
+        env:
+          DATABASE_URL: postgresql://cookie:cookie@localhost:5432/cookie_test
+        run: |
+          python -c "
+          from server.game_logic import db
+          user, created = db.create_user(777, 'ci', 'CI')
+          print('игрок заведён:', user['user_id'], 'новый:', created)
+          db.update_user(777, cookies=1234.5)
+          print('запись читается обратно:', db.get_user(777)['cookies'])
+          print('всего игроков:', db.q1('SELECT COUNT(*) c FROM users')['c'])
+          "
+
+  frontend:
+    name: "Фронт: типы и сборка"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - run: npm ci
+        working-directory: webapp
+      # npm run build = tsc -b + vite build, то есть проверка типов и сборка
+      # одним шагом. Ошибка типов здесь — это белый экран у игрока
+      - run: npm run build
+        working-directory: webapp
+
+  secrets:
+    name: Секреты и мусор в репозитории
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Токен бота в истории git — это чужой доступ к боту навсегда: удалить
+      # файл следующим коммитом уже поздно. Проверка своя, а не сторонним
+      # действием: она должна работать и на форке, и без лицензии
+      - name: Ни .env, ни базы, ни ключей в индексе
+        run: python tools/check_secrets.py

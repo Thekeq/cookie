@@ -264,7 +264,6 @@ async def shop(tg: dict = Depends(tg_user)):
     персональную сумму — покупатель видит, сколько получит именно он."""
     from server.i18n import tr
     income = gl.hourly_income(tg["id"])
-    user = db.get_user(tg["id"])
     items = []
     for k, (_t, _d, s, effect) in cfg.SHOP_ITEMS.items():
         blocked = gl.purchase_blocked(tg["id"], k)

@@ -121,7 +121,7 @@ class Sim:
         self.db = db
         self.gl = gl
         self.cfg = cfg
-        self._players: dict[int, "Player"] = {}
+        self._players: dict[int, Player] = {}
         self._base_uid = 950_000_000 + (os.getpid() % 10_000) * 100
 
     # --- время ---

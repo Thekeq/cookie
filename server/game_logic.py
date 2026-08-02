@@ -40,7 +40,7 @@ def track(user_id: int, event: str, value: float = 0):
     try:
         db.exec("INSERT INTO events (user_id, event, value, created_at) "
                 "VALUES (?, ?, ?, ?)", (user_id, event, value, time.time()))
-    except Exception:
+    except Exception:  # noqa: S110 — аналитика не имеет права ронять игру
         pass
 
 
@@ -2485,7 +2485,6 @@ def full_state(user_id: int) -> dict:
     db.update_user(user_id, last_seen_at=time.time())
     board = db.q("SELECT cell, item_level FROM board WHERE user_id = ? ORDER BY cell", (user_id,))
     items_count = len(board)
-    income = hourly_income(user_id)          # награды масштабируются от дохода
     board_income = board_base_income(user_id)  # цены спавна — только от доски
     base_income = income_base(user_id)        # сила клика — от фермы и доски
     nxt = user["level"] + 1

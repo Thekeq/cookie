@@ -25,7 +25,6 @@ import hashlib
 import hmac
 import json
 import os
-import random
 import subprocess
 import sys
 import tempfile
