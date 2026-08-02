@@ -857,6 +857,252 @@ check("16.11 оба юнита работают не от root",
 check("16.12 у планировщика запас на остановку больше, чем у API",
       "TimeoutStopSec=120" in _units["cookie-scheduler.service"])
 
+print("\n=== 17. Наблюдаемость: корреляция, метрики, живость/готовность ===")
+import json as _json
+import logging as _logging
+
+from server import obs
+
+# --- конфиг ---
+s = reload_settings(LOG_JSON="1", METRICS_TOKEN="x" * 32, SENTRY_DSN="https://k@o.io/1",
+                    GRACEFUL_TIMEOUT="35")
+check("17.1 новые ключи читаются",
+      s.LOG_JSON is True and s.GRACEFUL_TIMEOUT == 35
+      and s.METRICS_TOKEN == "x" * 32)
+check("17.2 в сводке видно режим логов, метрики и sentry",
+      "logs=json" in s.summary() and "metrics=on" in s.summary()
+      and "sentry=on" in s.summary())
+# токен и DSN — такие же секреты, как BOT_TOKEN: сводка печатается в лог на
+# старте, и попадание их туда равносильно публикации
+check("17.3 токен метрик и DSN не печатаются целиком",
+      "x" * 32 not in s.summary() and "https://k@o.io/1" not in s.summary()
+      and "METRICS_TOKEN" in s._SECRET_KEYS and "SENTRY_DSN" in s._SECRET_KEYS)
+# короткий токен подбирается перебором, а за ним обороты валюты и список ручек
+check("17.4 короткий METRICS_TOKEN — фатальная ошибка конфига",
+      any("METRICS_TOKEN" in t for t in fatals(reload_settings(METRICS_TOKEN="short"))))
+check("17.5 пустой METRICS_TOKEN претензий не вызывает",
+      not any("METRICS_TOKEN" in t for t in texts(reload_settings(METRICS_TOKEN=None))))
+importlib.reload(_settings)
+
+# --- идентификатор запроса ---
+check("17.6 свой идентификатор выдаётся, когда чужого нет",
+      len(obs.new_request_id("")) == 16 and obs.new_request_id() != obs.new_request_id())
+check("17.7 чужой идентификатор берётся как есть",
+      obs.new_request_id("abc-123.XY") == "abc-123.XY")
+# идентификатор идёт в строку лога: перевод строки в нём — это подделка
+# соседней записи в журнале, а пробел с кавычкой — подделка поля
+check("17.8 из чужого идентификатора вычищается всё, кроме безопасного",
+      obs.new_request_id('a b"\nc') == "abc"
+      and len(obs.new_request_id("z" * 200)) == 64)
+
+_tok = obs.bind_request("rq-1", 0)
+obs.bind_user(555)
+_rec = _logging.LogRecord("t", _logging.INFO, "f", 1, "привет %s", ("мир",), None)
+obs.ContextFilter().filter(_rec)
+check("17.9 фильтр подставляет запрос, игрока, роль и pid",
+      _rec.req_id == "rq-1" and _rec.user_id == 555
+      and _rec.role == _settings.ROLE and _rec.pid == os.getpid())
+_line = _json.loads(obs.JsonFormatter().format(_rec))
+check("17.10 JSON-лог: одна строка — один объект с сообщением и контекстом",
+      _line["msg"] == "привет мир" and _line["req_id"] == "rq-1"
+      and _line["user_id"] == 555 and _line["level"] == "INFO")
+try:
+    raise ValueError("бум")
+except ValueError:
+    _rec2 = _logging.LogRecord("t", _logging.ERROR, "f", 1, "упало", (),
+                               sys.exc_info())
+obs.ContextFilter().filter(_rec2)
+check("17.11 трейсбек попадает в JSON отдельным полем",
+      "ValueError: бум" in _json.loads(obs.JsonFormatter().format(_rec2))["exc"])
+obs.reset_request(_tok)
+_rec3 = _logging.LogRecord("t", 20, "f", 1, "x", (), None)
+obs.ContextFilter().filter(_rec3)
+# contextvar без сброса живёт до конца задачи, и фоновая строка ушла бы в лог
+# с идентификатором чужого запроса — хуже, чем совсем без него
+check("17.12 после сброса контекст не течёт в фоновые строки",
+      obs.current_request_id() == "" and _rec3.req_id == ""
+      and _rec3.user_id == 0
+      and "req_id" not in _json.loads(obs.JsonFormatter().format(_rec3)))
+
+# --- арифметика метрик ---
+use_fallback()
+obs.reset_shared()
+obs.inc("http_requests_total", method="GET", path="/api/state", status=200)
+obs.inc("http_requests_total", 2, method="GET", path="/api/state", status=200)
+obs.inc("http_requests_total", method="GET", path="/api/state", status=500)
+_txt = obs.render()
+check("17.13 счётчик складывается по одинаковым меткам",
+      'http_requests_total{method="GET",path="/api/state",status="200"} 3' in _txt)
+check("17.14 разные метки — разные ряды",
+      'http_requests_total{method="GET",path="/api/state",status="500"} 1' in _txt)
+check("17.15 в выгрузке есть HELP и TYPE",
+      "# HELP http_requests_total" in _txt
+      and "# TYPE http_requests_total counter" in _txt)
+check("17.16 метрика без наблюдений в выгрузку не попадает",
+      "notifications_total" not in _txt)
+
+obs.reset_shared()
+for _v in (0.001, 0.03, 7.0, 60.0):
+    obs.observe("http_request_duration_seconds", _v, method="GET", path="/x")
+_txt = obs.render()
+_b = {}
+for _l in _txt.splitlines():
+    _m = _l.startswith("http_request_duration_seconds_bucket")
+    if _m:
+        _b[_l.split('le="')[1].split('"')[0]] = float(_l.rsplit(" ", 1)[1])
+# корзины накопительные: наблюдение попадает во все границы не меньше себя,
+# иначе p99 в Prometheus считается по мусору
+check("17.17 корзины гистограммы накопительные",
+      _b["0.005"] == 1 and _b["0.05"] == 2 and _b["10"] == 3 and _b["+Inf"] == 4)
+check("17.18 сумма и число наблюдений сходятся",
+      "http_request_duration_seconds_count{method=\"GET\",path=\"/x\"} 4" in _txt
+      and "_sum{method=\"GET\",path=\"/x\"} 67.031" in _txt)
+
+obs.reset_shared()
+obs.add_gauge("http_requests_in_flight", 1)
+obs.add_gauge("http_requests_in_flight", 1)
+obs.add_gauge("http_requests_in_flight", -1)
+check("17.19 датчик ходит в обе стороны",
+      "http_requests_in_flight 1" in obs.render())
+obs.set_gauge("http_requests_in_flight", 0)
+
+# --- сведение по процессам ---
+if fakeredis:
+    _fake = use_fake_redis()
+    obs.reset_shared()
+    obs.inc("notifications_total", 5, result="sent")
+    obs.observe("db_query_seconds", 0.2, op="read")
+    check("17.20 первая досылка уходит в redis", obs.flush() is True)
+    check("17.21 повторная досылка не дублирует прирост",
+          obs.flush() is True
+          and "notifications_total{result=\"sent\"} 5" in obs.render())
+    # второй процесс: своя память, тот же redis. Именно ради этого метрики и
+    # сводятся — scrape приходит в случайный воркер из шести
+    _mem_c, _mem_h = dict(obs._counters), dict(obs._hists)
+    _sent_c, _sent_h = dict(obs._sent_counters), dict(obs._sent_hists)
+    obs._counters.clear(), obs._hists.clear()
+    obs._sent_counters.clear(), obs._sent_hists.clear()
+    obs.inc("notifications_total", 3, result="sent")
+    obs.observe("db_query_seconds", 0.3, op="read")
+    _txt = obs.render()
+    check("17.22 /metrics отдаёт сумму по всем процессам, а не 1/N",
+          'notifications_total{result="sent"} 8' in _txt)
+    check("17.23 гистограммы тоже складываются между процессами",
+          'db_query_seconds_count{op="read"} 2' in _txt
+          and 'db_query_seconds_sum{op="read"} 0.5' in _txt)
+    # моргнувший redis не должен съедать прирост навсегда: он не списывается,
+    # пока не подтверждён
+    obs.reset_shared()
+    obs.inc("notifications_total", 4, result="failed")
+    _real_pipe = _fake.pipeline
+
+    def _boom(*a, **k):
+        raise RuntimeError("redis лёг")
+
+    _fake.pipeline = _boom
+    check("17.24 отказ redis не роняет процесс и виден как False",
+          obs.flush() is False)
+    _fake.pipeline = _real_pipe
+    check("17.25 после возвращения redis потерянный прирост доезжает",
+          obs.flush() is True
+          and 'notifications_total{result="failed"} 4' in obs.render())
+    obs.reset_shared()
+    obs._counters.update(_mem_c), obs._hists.update(_mem_h)
+    obs._sent_counters.update(_sent_c), obs._sent_hists.update(_sent_h)
+    use_fallback()
+else:
+    print("  --  17.20-17.25 пропущены: нет fakeredis")
+
+# --- ручки ---
+obs.reset_shared()
+_c = TestClient(main_module.app)
+_r = _c.get("/livez")
+check("17.26 /livez отвечает 200 и называет процесс",
+      _r.status_code == 200 and _r.json()["pid"] == os.getpid())
+_r = _c.get("/readyz")
+check("17.27 /readyz отвечает 200 при живой базе",
+      _r.status_code == 200 and _r.json()["db"] == "up")
+
+_saved_q1 = db_module.DataBase.q1
+db_module.DataBase.q1 = lambda self, *a, **k: (_ for _ in ()).throw(
+    RuntimeError("нет соединения"))
+try:
+    _r = _c.get("/readyz")
+finally:
+    db_module.DataBase.q1 = _saved_q1
+# 503 обязан быть КОДОМ: балансировщик читает код, «200 {ok: false}» для него
+# здоровый процесс
+check("17.28 упавшая база — это 503, а не 200 с полем",
+      _r.status_code == 503 and _r.json()["ok"] is False)
+check("17.29 после возвращения базы готовность возвращается",
+      _c.get("/readyz").status_code == 200)
+
+_saved_token = _settings.METRICS_TOKEN
+try:
+    _settings.METRICS_TOKEN = ""
+    # 404, а не 401: «сюда нужен пароль» подтверждает, что тут есть что смотреть
+    check("17.30 без токена в конфиге ручки метрик нет вовсе",
+          _c.get("/metrics").status_code == 404)
+    _settings.METRICS_TOKEN = "t" * 32
+    check("17.31 чужой токен отбивается",
+          _c.get("/metrics", headers={"Authorization": "Bearer wrong"}
+                 ).status_code == 401)
+    check("17.32 без заголовка вовсе — тоже отказ",
+          _c.get("/metrics").status_code == 401)
+    _r = _c.get("/metrics", headers={"Authorization": "Bearer " + "t" * 32})
+    check("17.33 с токеном отдаётся текст в формате Prometheus",
+          _r.status_code == 200
+          and _r.headers["content-type"].startswith("text/plain")
+          and "# TYPE http_requests_total counter" in _r.text)
+finally:
+    _settings.METRICS_TOKEN = _saved_token
+
+# --- проводка ---
+check("17.34 у каждого ответа есть свой идентификатор в заголовке",
+      _c.get("/livez").headers.get("X-Request-Id")
+      != _c.get("/livez").headers.get("X-Request-Id"))
+check("17.35 присланный идентификатор возвращается тем же",
+      _c.get("/livez", headers={"X-Request-Id": "trace-9"}
+             ).headers["X-Request-Id"] == "trace-9")
+_txt = obs.render()
+# метка пути — ШАБЛОН маршрута, а не сам путь: иначе /api/user/123 заводит по
+# ряду на игрока, и хранилище метрик ложится раньше базы
+check("17.36 запросы считаются по шаблону маршрута",
+      'path="/livez"' in _txt and 'method="GET"' in _txt)
+check("17.37 время запроса пишется в гистограмму",
+      "http_request_duration_seconds_count" in _txt)
+check("17.38 запросы к базе тоже посчитаны",
+      'db_queries_total{op="read"}' in _txt)
+
+# «когда последний раз проходил бэкап» — первый вопрос после инцидента, и
+# отвечать на него /metrics обязан сам, а не через чтение чужого лога
+with scheduler.job("t:metrics", 60, 60):
+    pass
+obs.refresh_gauges()
+_txt = obs.render()
+check("17.39 состояние фоновых задач видно в метриках",
+      'job_last_ok_age_seconds{job="t:metrics"}' in _txt
+      and 'job_runs_total{job="t:metrics"} 1' in _txt
+      and "cache_backend_up" in _txt)
+scheduler.reset()
+
+# Значение метки может содержать что угодно (маршрут, причина операции), и
+# незакавыченная кавычка в нём ломает разбор всей выгрузки
+obs.reset_shared()
+obs.inc("http_requests_total", method='G"T', path="a\\b", status=200)
+check("17.40 кавычки и слеши в значениях меток экранируются",
+      'method="G\\"T"' in obs.render() and 'path="a\\\\b"' in obs.render())
+
+obs.reset_shared()
+_notifier_src = _pathlib.Path("bot", "notifier.py").read_text(encoding="utf-8")
+# у планировщика своего /metrics нет — HTTP он не поднимает вовсе, и без
+# досылки пуши и бэкапы не были бы видны в мониторинге ни одной цифрой
+check("17.41 планировщик досылает свои метрики сам",
+      "obs.flush" in _notifier_src)
+check("17.42 остановка ждёт добитые запросы (GRACEFUL_TIMEOUT)",
+      _main_src.count("timeout_graceful_shutdown=settings.GRACEFUL_TIMEOUT") == 2)
+check("17.43 sentry не включается без DSN", obs.init_sentry() is False)
+
 use_fallback()
 importlib.reload(_settings)
 

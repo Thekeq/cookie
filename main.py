@@ -4,20 +4,22 @@
 all) и BOT_MODE (polling / webhook). Дефолт остался прежним — всё в одном
 процессе на поллинге."""
 import asyncio
+import hmac
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from bot import webhook
 from bot.loader import bot, dp
 from bot.notifier import run_notifier
-from server import settings
+from server import obs, settings
 from server.economy import ConflictError
 from server.routers import game, meta, admin, farm
 
@@ -40,11 +42,16 @@ try:
                                          backupCount=3, encoding="utf-8"))
 except OSError:
     pass  # нет прав на запись — работаем только в stdout, но не падаем
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=_handlers,
-)
+# Идентификатор запроса подставляется в КАЖДУЮ строку — фильтром на handler'е, а
+# не полем в вызовах log.info: строки пишут и модули, которые про HTTP не знают.
+# В текстовом формате он идёт префиксом [req], в JSON — отдельным полем.
+_LOG_FORMAT = ("%(asctime)s %(levelname)s %(name)s [%(req_id)s]: %(message)s"
+               if not settings.LOG_JSON else "")
+for _h in _handlers:
+    _h.addFilter(obs.ContextFilter())
+    _h.setFormatter(obs.JsonFormatter() if settings.LOG_JSON
+                    else logging.Formatter(_LOG_FORMAT))
+logging.basicConfig(level=logging.INFO, handlers=_handlers, force=True)
 # aiogram/uvicorn на INFO слишком болтливы — оставляем им WARNING
 for noisy in ("aiogram.event", "aiogram.dispatcher", "uvicorn.access", "httpx"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -52,6 +59,29 @@ for noisy in ("aiogram.event", "aiogram.dispatcher", "uvicorn.access", "httpx"):
 # В проде docs/openapi не нужны: схема выдаёт наружу все ручки, включая
 # /api/admin/*, вместе с формой тел запросов — удобная карта для перебора
 DEBUG = settings.DEBUG
+
+
+METRICS_FLUSH_S = 10.0
+
+
+async def _metrics_flusher():
+    """Досылать метрики в Redis раз в METRICS_FLUSH_S секунд.
+
+    Почему не на каждый запрос: это лишний сетевой вызов в горячем пути ради
+    чисел, которые всё равно читают раз в 15 секунд. Почему вообще фоном, а не
+    только перед выгрузкой: scrape приходит в ОДИН случайный воркер, и без
+    периодической досылки метрики остальных попадали бы в сумму только когда
+    очередь дойдёт до них.
+
+    Redis не настроен — задача сама уходит: метрики остаются в памяти, и при
+    одном процессе этого достаточно."""
+    if not settings.REDIS_URL:
+        return
+    while True:
+        await asyncio.sleep(METRICS_FLUSH_S)
+        # to_thread: клиент Redis синхронный, и вызов из цикла событий подвесил
+        # бы на время сетевой операции все запросы этого воркера
+        await asyncio.to_thread(obs.flush)
 
 
 @asynccontextmanager
@@ -65,6 +95,8 @@ async def lifespan(_app):
     На выходе webhook НЕ снимаем. Рестарт — это норма (деплой, systemd), а
     снятый webhook означает, что за время перезапуска бот молчит, вместо того
     чтобы получить накопленное сразу после подъёма."""
+    obs.init_sentry()
+    flusher = asyncio.create_task(_metrics_flusher())
     if settings.BOT_MODE == "webhook":
         try:
             logging.info("webhook: %s", await webhook.ensure_registered(bot))
@@ -72,7 +104,20 @@ async def lifespan(_app):
             # Не роняем API: Mini App отдаётся и без бота, а Telegram мы
             # переспросим по расписанию (job webhook_check)
             logging.exception("webhook: зарегистрировать не удалось")
-    yield
+    try:
+        yield
+    finally:
+        # Остановка: сначала снимаем фоновую досылку, потом досылаем сами.
+        # Без последнего flush метрики последних METRICS_FLUSH_S секунд перед
+        # деплоем терялись бы — а это ровно те секунды, на которые смотрят,
+        # когда деплой пошёл не так.
+        flusher.cancel()
+        try:
+            await flusher
+        except asyncio.CancelledError:
+            pass
+        await asyncio.to_thread(obs.flush)
+        logging.info("остановка: role=%s pid=%s", settings.ROLE, os.getpid())
 
 
 app = FastAPI(title="Cookie Merge API",
@@ -106,6 +151,53 @@ async def limit_body_size(request, call_next):
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse({"detail": "Payload too large"}, status_code=413)
     return await call_next(request)
+
+
+# Медленным считаем ответ дольше двух секунд: игрок в этот момент смотрит на
+# крутилку, и такой запрос обязан оставить след поимённо, а не только в
+# гистограмме.
+SLOW_REQUEST_S = 2.0
+
+
+@app.middleware("http")
+async def observe_request(request: Request, call_next):
+    """Идентификатор запроса, метрики и след для медленных и упавших.
+
+    Регистрируется ПОСЛЕ limit_body_size и потому оказывается снаружи него
+    (Starlette кладёт новое middleware в начало цепочки): 413 — такой же ответ,
+    как остальные, и в метриках он должен быть виден.
+
+    Метка маршрута берётся из ШАБЛОНА (`/api/user/{uid}`), а не из пути. С
+    сырым путём каждая новая ссылка заводила бы отдельный ряд метрик, и на
+    сотне тысяч игроков Prometheus сложился бы от кардинальности — это самый
+    типичный способ уронить мониторинг собственными руками."""
+    req_id = obs.new_request_id(request.headers.get("x-request-id", ""))
+    tokens = obs.bind_request(req_id)
+    obs.add_gauge("http_requests_in_flight", 1)
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-Id"] = req_id
+        return response
+    finally:
+        took = time.perf_counter() - started
+        route = request.scope.get("route")
+        # маршрута нет у 404 и у статики — иначе меткой стал бы путь к файлу
+        path = getattr(route, "path", None) or "other"
+        obs.add_gauge("http_requests_in_flight", -1)
+        obs.inc("http_requests_total", method=request.method, path=path,
+                status=status)
+        obs.observe("http_request_duration_seconds", took,
+                    method=request.method, path=path)
+        if status >= 500:
+            logging.warning("%s %s -> %s за %.3f с", request.method, path,
+                            status, took)
+        elif took > SLOW_REQUEST_S:
+            logging.info("медленный ответ: %s %s -> %s за %.3f с",
+                         request.method, path, status, took)
+        obs.reset_request(tokens)
 
 
 @app.exception_handler(ConflictError)
@@ -163,12 +255,67 @@ async def healthz():
     Планировщик показан отдельным полем потому, что при ROLE=api он живёт в
     ДРУГОМ процессе: у отвечающего на /healthz фоновых задач нет вовсе, и без
     этой строки «бэкапов нет уже неделю» выглядело бы снаружи как здоровье."""
-    import time as _time
     from server import cache, scheduler
     from server.game_logic import db
     db.q1("SELECT 1 AS ok")
-    return {"ok": True, "ts": _time.time(), "role": settings.ROLE,
+    return {"ok": True, "ts": time.time(), "role": settings.ROLE,
             "cache": cache.health(), "scheduler": scheduler.health()}
+
+
+@app.get("/livez")
+async def livez():
+    """Живость: процесс отвечает. Ни базы, ни Redis здесь нет намеренно.
+
+    По этой ручке ПЕРЕЗАПУСКАЮТ. Проверь она базу — упавшая на минуту база
+    перезапустила бы разом все воркеры: базу это не чинит, а принятые запросы
+    и прогретые соединения теряет. Живость отвечает ровно на один вопрос —
+    не завис ли цикл событий."""
+    return {"ok": True, "role": settings.ROLE, "pid": os.getpid()}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Готовность: можно ли давать этому процессу трафик.
+
+    По этой ручке ВЫВОДЯТ ИЗ БАЛАНСИРОВКИ, поэтому здесь и проверяется то, без
+    чего запрос игрока всё равно закончится пятисоткой, — база. Redis в отказ
+    не превращается: без него лимитер уходит на фолбэк, а игра работает.
+
+    Про 503: он обязан быть именно кодом, а не полем в теле. Балансировщик
+    читает код, и «200 {ok: false}» для него — здоровый процесс."""
+    from server import cache
+    from server.game_logic import db
+    try:
+        db.q1("SELECT 1 AS ok")
+    except Exception as e:
+        logging.warning("readyz: база недоступна: %s", e)
+        return JSONResponse(status_code=503,
+                            content={"ok": False, "db": f"down: {e}"[:200]})
+    return {"ok": True, "role": settings.ROLE, "db": "up",
+            "cache": cache.health()}
+
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    """Выгрузка для Prometheus. Закрыта токеном, без токена ручки нет вовсе.
+
+    404, а не 401, когда METRICS_TOKEN пуст: отвечать «сюда нужен пароль» —
+    значит подтвердить, что здесь есть что смотреть. А смотреть есть что:
+    список маршрутов, обороты валюты и состояние фоновых задач.
+
+    Сравнение токена постоянное по времени (compare_digest): обычное ==
+    выходит на первом несовпавшем байте, и по времени ответа токен
+    подбирается посимвольно."""
+    token = settings.METRICS_TOKEN
+    if not token:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    sent = request.headers.get("authorization", "")
+    sent = sent[7:] if sent.lower().startswith("bearer ") else sent
+    if not hmac.compare_digest(sent, token):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    obs.refresh_gauges()
+    return PlainTextResponse(obs.render(),
+                             media_type="text/plain; version=0.0.4")
 
 
 # собранный фронт (webapp/dist) раздаём как статику с корня
@@ -196,9 +343,15 @@ async def run_api():
     Один воркер — обычный asyncio-сервер рядом с остальными задачами процесса.
     Несколько воркеров — это уже не задача, а мастер-процесс (см. serve_api_
     workers), и сюда управление не доходит: main() разводит эти два случая до
-    создания цикла событий."""
+    создания цикла событий.
+
+    timeout_graceful_shutdown: по SIGTERM сервер перестаёт принимать новые
+    соединения, но уже принятым даёт доработать. Без этого деплой обрывал бы
+    запросы на середине — а половина из них денежные, и игрок увидел бы не
+    ошибку сети, а пропавшую награду."""
     config = uvicorn.Config(app, host=settings.HOST, port=settings.PORT,
-                            log_level="warning")
+                            log_level="warning",
+                            timeout_graceful_shutdown=settings.GRACEFUL_TIMEOUT)
     await uvicorn.Server(config).serve()
 
 
@@ -221,7 +374,8 @@ def serve_api_workers():
 
     config = uvicorn.Config("main:app", host=settings.HOST, port=settings.PORT,
                             workers=settings.WEB_CONCURRENCY,
-                            log_level="warning")
+                            log_level="warning",
+                            timeout_graceful_shutdown=settings.GRACEFUL_TIMEOUT)
     sock = config.bind_socket()
     try:
         Multiprocess(config, sockets=[sock]).run()

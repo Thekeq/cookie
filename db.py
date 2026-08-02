@@ -33,6 +33,10 @@ import time
 import urllib.parse
 from contextlib import contextmanager
 
+# Только счётчики. server.obs не тянет ни db, ни игровую логику — специально,
+# чтобы измеряемое можно было импортировать из измеряющего без кольца.
+from server import obs
+
 # сколько раз повторить BEGIN IMMEDIATE, если база занята другим писателем
 TX_RETRIES = 5
 
@@ -1189,6 +1193,7 @@ class DataBase:
                     raise
                 if attempt == TX_RETRIES - 1:
                     raise
+                obs.inc("db_tx_retries_total")
                 time.sleep(0.02 * (2 ** attempt))
         self._tx_depth = 1
         try:
@@ -1200,17 +1205,35 @@ class DataBase:
         finally:
             self._tx_depth = 0
 
+    @staticmethod
+    @contextmanager
+    def _measure(op: str):
+        """Время одного обращения к базе.
+
+        Метка — только read/write, без самого SQL: текст запроса в метке дал бы
+        по ряду на каждый вариант, а их здесь сотни. Какой именно запрос
+        тормозит, отвечает не метрика, а лог медленных запросов на стороне
+        самой базы (`log_min_duration_statement`)."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            obs.inc("db_queries_total", op=op)
+            obs.observe("db_query_seconds", time.perf_counter() - started, op=op)
+
     def q(self, sql, params=()):
         """SELECT: список dict"""
         cur = self.cursor
-        cur.execute(self._sql(sql), params)
-        return [dict(r) for r in cur.fetchall()]
+        with self._measure("read"):
+            cur.execute(self._sql(sql), params)
+            return [dict(r) for r in cur.fetchall()]
 
     def q1(self, sql, params=()):
         """SELECT: одна строка dict или None"""
         cur = self.cursor
-        cur.execute(self._sql(sql), params)
-        row = cur.fetchone()
+        with self._measure("read"):
+            cur.execute(self._sql(sql), params)
+            row = cur.fetchone()
         return dict(row) if row else None
 
     def exec(self, sql, params=()) -> int:
@@ -1222,7 +1245,8 @@ class DataBase:
         немедленно — любой следующий стейтмент сбрасывает его в -1.
         Вне tx() — автокоммит; внутри tx() коммитит внешний блок."""
         cur = self.cursor
-        cur.execute(self._sql(sql), params)
+        with self._measure("write"):
+            cur.execute(self._sql(sql), params)
         rc = cur.rowcount
         # lastrowid есть только у sqlite3: в psycopg его нет вовсе, и обращение
         # к нему уронило бы КАЖДУЮ запись. Кому нужен выданный id — просит его
@@ -1239,8 +1263,9 @@ class DataBase:
         INSERT ушёл в ON CONFLICT DO NOTHING) — то есть тот же сигнал, что и
         rowcount == 0, но вместе с данными строки, за одно обращение."""
         cur = self.cursor
-        cur.execute(self._sql(sql), params)
-        row = cur.fetchone()
+        with self._measure("write"):
+            cur.execute(self._sql(sql), params)
+            row = cur.fetchone()
         if not self._tx_depth:
             self.connection.commit()
         return dict(row) if row else None

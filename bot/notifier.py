@@ -17,6 +17,7 @@ from bot import webhook
 from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
+from server import obs
 from server import scheduler
 from server import settings
 from server.game_logic import db
@@ -71,10 +72,13 @@ async def _notify_pass(bot):
         try:
             await bot.send_message(user["user_id"], text)
             db.update_user(user["user_id"], last_notified_at=now)
+            obs.inc("notifications_total", result="sent")
         except TelegramForbiddenError:
             db.exec("UPDATE users SET notify_blocked = 1 WHERE user_id = ?",
                     (user["user_id"],))
+            obs.inc("notifications_total", result="blocked")
         except Exception as e:
+            obs.inc("notifications_total", result="failed")
             log.warning("notify %s failed: %s", user["user_id"], e)
         await asyncio.sleep(0.05)
 
@@ -191,4 +195,8 @@ async def run_notifier(bot):
                     await _notify_pass(bot)
         except Exception:
             log.exception("notifier pass failed")
+        # Метрики этого процесса — в общую копилку. Своего /metrics у него нет
+        # (HTTP он не поднимает вовсе), и без досылки пуши и бэкапы не были бы
+        # видны в мониторинге ни одной цифрой.
+        await asyncio.to_thread(obs.flush)
         await asyncio.sleep(CHECK_INTERVAL)

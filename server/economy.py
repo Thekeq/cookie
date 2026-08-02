@@ -23,6 +23,7 @@ import time
 import uuid
 
 from db import shared
+from server import obs
 
 db = shared()
 
@@ -138,6 +139,17 @@ def record(user_id: int, currency: str, amount: float, reason: str,
             (user_id, operation_id, seq, currency, amount, reason, ref_type,
              ref_id, balance_after, counts_earned, season_id,
              1 if currency in EXTERNAL else 0, time.time()))
+    # Считаем ПОСЛЕ выхода из транзакции: строка, откатившаяся вместе с
+    # эффектом, ничего не начислила, и в метрике её быть не должно. Метка —
+    # только валюта: причин в коде несколько десятков, и меткой они дали бы по
+    # ряду на каждую, а вопрос, ради которого метрика заведена, звучит
+    # «сколько печенек в игре печатается и сколько сгорает».
+    if reason.startswith(("refund_", "stars_refund")):
+        obs.inc("economy_refunded_total", abs(amount), currency=currency)
+    elif amount >= 0:
+        obs.inc("economy_minted_total", amount, currency=currency)
+    else:
+        obs.inc("economy_spent_total", -amount, currency=currency)
 
 
 def begin_op(operation_id: str, user_id: int, kind: str) -> dict | None:
@@ -152,11 +164,17 @@ def begin_op(operation_id: str, user_id: int, kind: str) -> dict | None:
                "created_at) VALUES (?, ?, ?, 'open', ?) "
                "ON CONFLICT (operation_id) DO NOTHING",
                (operation_id, user_id, kind, time.time())) == 1:
+        obs.inc("economy_ops_total", result="new")
         return None
     row = db.q1("SELECT status, response FROM economy_ops WHERE operation_id = ?",
                 (operation_id,))
     if row and row["status"] == "done" and row["response"]:
+        # Повтор — это НОРМА, а не ошибка: мобильная сеть теряет ответ. Но
+        # доля повторов в общем числе операций — как раз тот показатель, по
+        # которому видно, что сеть или клиент начали терять ответы массово.
+        obs.inc("economy_ops_total", result="replay")
         return json.loads(row["response"])
+    obs.inc("economy_ops_total", result="conflict")
     # 'open' виден только на PostgreSQL и только если первый запрос ещё не
     # закоммитился: на SQLite BEGIN IMMEDIATE сериализует писателей
     raise ConflictError(user_id, operation_id)

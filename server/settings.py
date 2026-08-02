@@ -98,10 +98,23 @@ ROLE = _s("ROLE", "all").lower()
 # Сколько процессов поднимать под API.
 WEB_CONCURRENCY = _i("WEB_CONCURRENCY", 1)
 
-# ---------- Логи ----------
+# ---------- Логи и наблюдаемость ----------
 LOG_FILE = _s("LOG_FILE", "cookie.log")
+# Одна строка — один JSON-объект. На дев-машине неудобно читать глазами,
+# поэтому по умолчанию выключено; в проде без этого не собрать запрос целиком.
+LOG_JSON = _b("LOG_JSON")
+# Токен на /metrics. Пусто — ручки нет вовсе: выгрузка показывает маршруты,
+# объёмы валюты и состояние задач, то есть карту сервиса для постороннего.
+METRICS_TOKEN = _s("METRICS_TOKEN")
+# Sentry (или совместимый приёмник). Пусто — не инициализируется.
+SENTRY_DSN = _s("SENTRY_DSN")
+# Сколько секунд дать уже принятым запросам доработать после SIGTERM/SIGINT.
+# Ноль отключил бы ожидание: игрок, чей клейм был в обработке, получил бы
+# обрыв соединения — то есть ровно тот случай, ради которого есть X-Op-Id.
+GRACEFUL_TIMEOUT = _i("GRACEFUL_TIMEOUT", 20)
 
-_SECRET_KEYS = ("BOT_TOKEN", "DATABASE_URL", "REDIS_URL", "WEBHOOK_SECRET")
+_SECRET_KEYS = ("BOT_TOKEN", "DATABASE_URL", "REDIS_URL", "WEBHOOK_SECRET",
+                "METRICS_TOKEN", "SENTRY_DSN")
 
 
 def redact(value: str) -> str:
@@ -125,6 +138,9 @@ def summary() -> str:
         f"port={PORT}", f"debug={int(DEBUG)}", f"dev={int(DEV_MODE)}",
         f"db={'postgres' if DATABASE_URL else DATABASE_PATH}",
         f"redis={'on' if REDIS_URL else 'off (in-process)'}",
+        f"logs={'json' if LOG_JSON else 'text'}",
+        f"metrics={'on' if METRICS_TOKEN else 'off'}",
+        f"sentry={'on' if SENTRY_DSN else 'off'}",
         f"webapp={WEBAPP_URL or '<не задан>'}",
         f"admin={ADMIN_ID or '<не задан>'}",
         f"token={redact(BOT_TOKEN)}",
@@ -196,4 +212,9 @@ def problems() -> list[tuple[str, bool]]:
     if WEB_CONCURRENCY > 1 and DATABASE_URL == "":
         out.append(("WEB_CONCURRENCY > 1 на SQLite: писатель в файле один, "
                     "воркеры будут ждать друг друга на блокировке", False))
+    if METRICS_TOKEN and len(METRICS_TOKEN) < 16:
+        # /metrics открыт в интернет вместе со всем остальным: короткий токен
+        # подбирается, а выгрузка показывает и обороты валюты, и состояние задач
+        out.append((f"METRICS_TOKEN длиной {len(METRICS_TOKEN)} символов — "
+                    "нужно хотя бы 16", True))
     return out

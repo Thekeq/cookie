@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl
 
 from fastapi import Header, HTTPException
 
-from server import settings
+from server import obs, settings
 
 BOT_TOKEN = settings.BOT_TOKEN
 ADMIN_ID = settings.ADMIN_ID
@@ -88,6 +88,10 @@ async def tg_user(authorization: str = Header(default=""),
     except (TypeError, ValueError):
         raise HTTPException(401, "Bad initData")
     lang = x_lang if x_lang in ("en", "uk", "ru") else "en"
+    # С этого места все строки лога этого запроса несут user_id. Раньше по
+    # жалобе «пропали печеньки» найти в логе именно этого игрока было нечем:
+    # ошибка пишется в одном модуле, а кто её вызвал — известно только здесь.
+    obs.bind_user(uid)
     return {
         "id": uid,
         # обрезаем: имя и username идут в БД и в текст сообщений бота,
