@@ -104,8 +104,20 @@ main.py               # бот (polling) + API (uvicorn) + notifier одним �
 
 ## Эксплуатация
 
-- **Бэкапы** — `notifier` раз в сутки делает горячий снимок через sqlite backup
-  API в `backups/`, хранит неделю (`BACKUP_INTERVAL_H`, `BACKUP_KEEP`).
+- **Бэкапы** — `notifier` раз в сутки делает горячий снимок в `backups/` и
+  хранит неделю (`BACKUP_INTERVAL_H`, `BACKUP_KEEP`). Движок выбирает
+  `db.snapshot`: sqlite backup API или `pg_dump --format=custom` (нужен
+  `postgresql-client` в PATH, иначе снимок пропускается с записью в лог).
+- **PostgreSQL** — второй диалект той же схемы. Включается заполненным
+  `DATABASE_URL` (`DATABASE_PATH` при этом игнорируется), нужен драйвер
+  `psycopg[binary]` из `requirements.txt`. Схема одна: она написана на типах
+  SQLite, а перевод (`INTEGER PRIMARY KEY` → `BIGSERIAL`, `REAL` → `DOUBLE
+  PRECISION`, триггеры → PL/pgSQL) делает `db.py`. Переезд:
+  `DATABASE_URL=postgresql://... python migrate_to_postgres.py --sqlite data.db
+  --dry-run`, затем без `--dry-run`. Скрипт открывает SQLite только на чтение,
+  требует пустой приёмник (иначе `--force`), переносит журнал `schema_migrations`
+  и догоняет последовательности. Перевод схемы проверяет `test_dialect.py`;
+  живые проверки включаются `TEST_DATABASE_URL`.
 - **Логи** — INFO с ротацией в `LOG_FILE` (по умолчанию `cookie.log`, 5 МБ x3).
 - **Preflight** — старт отменяется при отсутствующем `BOT_TOKEN` и при
   `DEV_MODE=1` на https-домене (бот публикует в чат рабочую подписанную ссылку).

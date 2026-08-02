@@ -16,7 +16,6 @@ import hmac
 import json
 import math
 import os
-import sqlite3
 import sys
 import time
 from urllib.parse import urlencode
@@ -39,6 +38,9 @@ import server.economy as ec
 import server.game_logic as gl
 import server.game_config as cfg
 from server.game_logic import db
+# исключения ловим через db.INTEGRITY_ERRORS, а не sqlite3.IntegrityError:
+# на PostgreSQL тот же отказ прилетает классом psycopg
+import db as dbmod
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 c = TestClient(app)
@@ -136,13 +138,13 @@ gl.add_cookies(U, 1000.0)
 before = db.get_user(U)["cookies"]
 
 raises("1.1 NaN в баланс не пролезает",
-       lambda: db.update_user(U, cookies=float("nan")), sqlite3.IntegrityError)
+       lambda: db.update_user(U, cookies=float("nan")), dbmod.INTEGRITY_ERRORS)
 raises("1.2 бесконечность не пролезает",
-       lambda: db.update_user(U, cookies=float("inf")), sqlite3.IntegrityError)
+       lambda: db.update_user(U, cookies=float("inf")), dbmod.INTEGRITY_ERRORS)
 raises("1.3 абсурдный плюс не пролезает",
-       lambda: db.update_user(U, cookies=1e20), sqlite3.IntegrityError)
+       lambda: db.update_user(U, cookies=1e20), dbmod.INTEGRITY_ERRORS)
 raises("1.4 абсурдный минус не пролезает",
-       lambda: db.update_user(U, cookies=-2e6), sqlite3.IntegrityError)
+       lambda: db.update_user(U, cookies=-2e6), dbmod.INTEGRITY_ERRORS)
 check("1.5 после отбитых записей баланс цел", db.get_user(U)["cookies"] == before)
 
 db.update_user(U, cookies=before)  # нормальная запись проходит
@@ -165,10 +167,10 @@ check("1.11 отбитые начисления не оставили следа
 rid = ledger(U, "cookies")[0]["id"]
 raises("2.1 строку книги нельзя изменить",
        lambda: db.exec("UPDATE economy_ledger SET amount = 0 WHERE id = ?", (rid,)),
-       sqlite3.IntegrityError, "append-only")
+       dbmod.INTEGRITY_ERRORS, "append-only")
 raises("2.2 строку книги нельзя удалить",
        lambda: db.exec("DELETE FROM economy_ledger WHERE id = ?", (rid,)),
-       sqlite3.IntegrityError, "append-only")
+       dbmod.INTEGRITY_ERRORS, "append-only")
 check("2.3 строка на месте и не тронута",
       len(ledger(U, "cookies")) == 1 and ledger(U, "cookies")[0]["amount"] == 1000.0)
 
@@ -180,7 +182,7 @@ db.create_user(R, "r", "R")
 op = "test-op-dup"
 ec.record(R, "cookies", 50, "unit", 50, op)
 raises("3.1 дубль (op, currency, seq) по умолчанию рвёт транзакцию",
-       lambda: ec.record(R, "cookies", 50, "unit", 50, op), sqlite3.IntegrityError)
+       lambda: ec.record(R, "cookies", 50, "unit", 50, op), dbmod.INTEGRITY_ERRORS)
 ec.record(R, "cookies", 50, "unit", 50, op, idempotent=True)
 check("3.1b с idempotent=True дубль гасится молча",
       len(ledger(R, "cookies")) == 1)
@@ -250,7 +252,7 @@ check("4.16 без токена два одинаковых начисления
 # дубль токена без предварительной проверки — рвёт транзакцию, а не молчит
 raises("4.17 record без idempotent на дубле падает, а не глушит",
        lambda: ec.record(A, "cookies", 1, "unit", 0, "fixed-op-1"),
-       sqlite3.IntegrityError)
+       dbmod.INTEGRITY_ERRORS)
 check("4.18 сверка цела и после отбитого дубля",
       abs(ec.reconcile(A)["cookies"]["drift"]) < 1e-6)
 

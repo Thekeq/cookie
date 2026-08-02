@@ -211,10 +211,10 @@ for path in pathlib.Path(".").rglob("*.py"):
     text = path.read_text(encoding="utf-8")
     for i, ln in enumerate(text.splitlines(), 1):
         if "os.getenv" in ln or "os.environ.get" in ln:
-            # DATABASE_PATH — единственное исключение: тесты и симуляторы
+            # Адрес базы — единственное исключение: тесты и симуляторы
             # подменяют его после импорта, снимок настроек был бы для них
             # путём к боевой базе
-            if "DATABASE_PATH" in ln:
+            if "DATABASE_PATH" in ln or "DATABASE_URL" in ln:
                 continue
             leaks.append(f"{path}:{i}")
 check(f"6.1 os.getenv только в settings.py (утечки: {leaks or 'нет'})", not leaks)

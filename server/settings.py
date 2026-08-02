@@ -178,6 +178,12 @@ def problems() -> list[tuple[str, bool]]:
     if WEB_CONCURRENCY > 1 and BOT_MODE == "polling":
         out.append(("WEB_CONCURRENCY > 1 при BOT_MODE=polling: апдейты будет "
                     "тянуть каждый воркер, Telegram отдаст их случайному", True))
+    if DATABASE_URL and not DATABASE_URL.startswith(
+            ("postgresql://", "postgres://")):
+        # опечатка вроде sqlite:///data.db в этом ключе не «включит SQLite», а
+        # уедет в драйвер PostgreSQL с невнятной ошибкой соединения
+        out.append(("DATABASE_URL заполнен, но это не postgresql://-строка — "
+                    "для файловой базы есть DATABASE_PATH", True))
     if WEB_CONCURRENCY > 1 and DATABASE_URL == "":
         out.append(("WEB_CONCURRENCY > 1 на SQLite: писатель в файле один, "
                     "воркеры будут ждать друг друга на блокировке", False))

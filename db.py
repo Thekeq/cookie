@@ -1,29 +1,111 @@
+"""Доступ к базе: один класс, два движка — SQLite (текущий прод) и PostgreSQL.
+
+Почему второй движок вообще нужен. В SQLite писатель ровно один на файл:
+пока идёт запись, остальные ждут. На одном процессе это честно и быстро
+(WAL + synchronous=NORMAL дают тысячи транзакций в секунду), но воркеры на
+одном файле начинают ждать друг друга на блокировке, а сеть между машинами
+файл вообще не отдаёт. PostgreSQL снимает и то, и другое.
+
+Весь SQL в коде писался легальным для обоих движков заранее: `ON CONFLICT
+DO NOTHING`, `RETURNING`, `UPDATE ... WHERE <guard>` + rowcount, шимы
+`GREATEST`/`LEAST`. Диалектных мест осталось ровно пять, и все они здесь:
+  * драйвер и прагмы соединения;
+  * генерация DDL (`INTEGER PRIMARY KEY` → `BIGSERIAL`, `REAL` → `DOUBLE
+    PRECISION`, `DEFAULT "en"` → `DEFAULT 'en'`);
+  * чтение списка колонок (`PRAGMA table_info` → `information_schema`);
+  * триггеры-инварианты (`RAISE(ABORT)` → PL/pgSQL `RAISE EXCEPTION`);
+  * снимок базы (sqlite backup API → `pg_dump`).
+
+Соединения — ПО ПОТОКАМ, а не через пул драйвера. Транзакция здесь живёт в
+`tx()` и охватывает несколько вызовов подряд, поэтому все они обязаны идти по
+одному соединению; пул с выдачей соединения на операцию это ломает. Верхнюю
+границу задаёт пул потоков FastAPI (синхронные хендлеры выполняются в нём), и
+на PostgreSQL за ним надо следить: воркеры × потоки не должны превышать
+max_connections сервера.
+"""
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
+import urllib.parse
 from contextlib import contextmanager
 
 # сколько раз повторить BEGIN IMMEDIATE, если база занята другим писателем
 TX_RETRIES = 5
 
+# Ошибки, на которые смотрит КОД (а не только человек в логе). Классы у
+# драйверов разные, решения по ним одинаковые, поэтому ловить надо кортеж, а не
+# sqlite3.IntegrityError напрямую — иначе на PostgreSQL нарушение инварианта
+# пролетело бы мимо обработчика и превратилось в 500.
+INTEGRITY_ERRORS: tuple = (sqlite3.IntegrityError,)
+# «база занята» — то, что имеет смысл повторить
+BUSY_ERRORS: tuple = (sqlite3.OperationalError,)
+
+
+def _register_postgres_errors():
+    """Дописать классы psycopg в кортежи ошибок (один раз на процесс)."""
+    global INTEGRITY_ERRORS, BUSY_ERRORS
+    try:
+        from psycopg import errors as pg
+    except ImportError as e:
+        # ImportError на первой строке старта — это полчаса чтения трейсбека
+        # ради одной забытой команды. Пишем сразу, что делать
+        raise SystemExit(
+            "DATABASE_URL задан, значит работаем на PostgreSQL, но драйвер не "
+            'установлен. Поставь: pip install "psycopg[binary]>=3.2,<4"') from e
+
+    # RaiseException — это наш собственный RAISE EXCEPTION из триггера
+    # (append-only книги, вменяемость баланса). Формально он не IntegrityError,
+    # но для вызывающего это ровно то же «база не дала записать».
+    INTEGRITY_ERRORS = tuple(dict.fromkeys(
+        INTEGRITY_ERRORS + (pg.IntegrityError, pg.RaiseException, pg.DataError)))
+    BUSY_ERRORS = tuple(dict.fromkeys(
+        BUSY_ERRORS + (pg.SerializationFailure, pg.DeadlockDetected,
+                       pg.LockNotAvailable)))
+
 
 class DataBase:
     # Диалект и два имени, которые расходятся между движками. Всё остальное в
     # новом SQL — общий синтаксис (ON CONFLICT DO NOTHING, RETURNING,
-    # UPDATE ... WHERE <guard>), так что переезд на PostgreSQL сведётся к смене
-    # DIALECT и драйвера соединения.
+    # UPDATE ... WHERE <guard>). Значения ниже — дефолт класса для SQLite;
+    # на PostgreSQL __init__ выставляет их экземпляру.
     DIALECT = "sqlite"
     GREATEST = "MAX"     # на postgres -> "GREATEST"
     LEAST = "MIN"        # на postgres -> "LEAST"
 
-    def __init__(self, db_file=None):
-        # Путь можно переопределить (тесты используют временную БД). Это
-        # единственный ключ, который читается ЖИВЫМ os.environ, а не через
-        # server.settings: тесты и симуляторы подменяют его уже после импорта
-        # модуля, и снимок, сделанный при загрузке настроек, был бы для них
-        # путём к боевой базе.
+    # Типы SQLite → типы PostgreSQL. INTEGER всегда BIGINT: user_id — это
+    # telegram id, он не влезает в 32 бита, и разнотипица между колонками
+    # (INT против BIGINT) ломала бы соединения по ним.
+    PG_TYPES = {"INTEGER": "BIGINT", "REAL": "DOUBLE PRECISION"}
+
+    # Предохранитель от зависшего стейтмента, мс. Минута — это заведомо больше
+    # любого нашего запроса (все они по индексу) и заведомо меньше, чем время,
+    # за которое залипший запрос успеет утопить базу блокировками.
+    PG_STATEMENT_TIMEOUT_MS = 60_000
+
+    # Журнал миграций: единственная таблица, которую создаём вручную, — на неё
+    # опирается всё остальное. Держим спекой, а не строкой, чтобы DDL для неё
+    # переводился тем же кодом, что и для остальных таблиц.
+    MIGRATIONS_SCHEMA = {"name": "TEXT PRIMARY KEY",
+                         "applied_at": "REAL NOT NULL DEFAULT 0"}
+
+    def __init__(self, db_file=None, url=None):
+        # Путь/строку подключения можно переопределить (тесты используют
+        # временную БД). Это единственные ключи, которые читаются ЖИВЫМ
+        # os.environ, а не через server.settings: тесты и симуляторы подменяют
+        # их уже после импорта модуля, и снимок, сделанный при загрузке
+        # настроек, был бы для них путём к боевой базе.
+        self.url = url if url is not None else os.environ.get("DATABASE_URL", "")
+        if self.url:
+            # Заполнен DATABASE_URL — работаем на PostgreSQL, DATABASE_PATH
+            # игнорируется (об этом же говорит .env.example)
+            self.DIALECT = "postgres"
+            self.GREATEST = "GREATEST"
+            self.LEAST = "LEAST"
+            _register_postgres_errors()
         db_file = db_file or os.environ.get("DATABASE_PATH", "data.db")
         self.db_file = db_file
         # соединение, курсор и глубина транзакции живут ПО ПОТОКАМ: один общий
@@ -36,8 +118,7 @@ class DataBase:
         # журнал применённых миграций. Создаётся ДО всего остального: на него
         # опирается и _auto_migrate (__after_create__), и дедуп
         self.cursor.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            "name TEXT PRIMARY KEY, applied_at REAL NOT NULL DEFAULT 0)")
+            self._create_table_sql("schema_migrations", self.MIGRATIONS_SCHEMA))
 
         self.tables_schema = {
             'users': {
@@ -341,24 +422,56 @@ class DataBase:
                 'season_id': 'INTEGER',
                 'external': 'INTEGER NOT NULL DEFAULT 0',  # валюта вне users (Stars)
                 'created_at': 'REAL NOT NULL DEFAULT 0',
-                # NaN: на SQLite он ложится как NULL и его ловит NOT NULL,
-                # на PostgreSQL NaN хранится честно — и его ловит CHECK
-                '__constraints__': [
-                    "CHECK (amount = amount)",
-                    "CHECK (balance_after = balance_after)",
-                    "CHECK (amount > -1e15 AND amount < 1e15)",
-                    "CHECK (balance_after > -1e15 AND balance_after < 1e15)",
-                ],
+                # NaN. На SQLite он ложится в базу как NULL, и его ловит NOT
+                # NULL; сравнение x = x — второй рубеж на случай, если движок
+                # однажды начнёт хранить его честно. На PostgreSQL так нельзя:
+                # там NaN = NaN истинно (NaN считается равным себе и большим
+                # любого числа), поэтому проверка «x = x» пропустила бы его, и
+                # ловить надо сравнением с самим значением 'NaN'.
+                '__constraints__': {
+                    "sqlite": [
+                        "CHECK (amount = amount)",
+                        "CHECK (balance_after = balance_after)",
+                    ],
+                    "postgres": [
+                        "CHECK (amount <> 'NaN'::double precision)",
+                        "CHECK (balance_after <> 'NaN'::double precision)",
+                    ],
+                    # диапазон одинаков; на PostgreSQL он же отсекает ±Infinity
+                    "*": [
+                        "CHECK (amount > -1e15 AND amount < 1e15)",
+                        "CHECK (balance_after > -1e15 AND balance_after < 1e15)",
+                    ],
+                },
                 # книга только дописывается: правка задним числом уничтожает
-                # весь смысл сверки
-                '__after_create__': [
-                    "CREATE TRIGGER IF NOT EXISTS trg_ledger_no_update "
-                    "BEFORE UPDATE ON economy_ledger "
-                    "BEGIN SELECT RAISE(ABORT, 'economy_ledger is append-only'); END",
-                    "CREATE TRIGGER IF NOT EXISTS trg_ledger_no_delete "
-                    "BEFORE DELETE ON economy_ledger "
-                    "BEGIN SELECT RAISE(ABORT, 'economy_ledger is append-only'); END",
-                ],
+                # весь смысл сверки. Текст ошибки на обоих движках ОДИН И ТОТ ЖЕ
+                # — по нему отличают запрет книги от любого другого отказа базы.
+                '__after_create__': {
+                    "sqlite": [
+                        "CREATE TRIGGER IF NOT EXISTS trg_ledger_no_update "
+                        "BEFORE UPDATE ON economy_ledger "
+                        "BEGIN SELECT RAISE(ABORT, 'economy_ledger is append-only'); END",
+                        "CREATE TRIGGER IF NOT EXISTS trg_ledger_no_delete "
+                        "BEFORE DELETE ON economy_ledger "
+                        "BEGIN SELECT RAISE(ABORT, 'economy_ledger is append-only'); END",
+                    ],
+                    # CREATE TRIGGER IF NOT EXISTS в PostgreSQL нет, поэтому
+                    # DROP + CREATE: так же идемпотентно, но без привязки к
+                    # версии сервера (OR REPLACE появился только в 14)
+                    "postgres": [
+                        "CREATE OR REPLACE FUNCTION cookie_ledger_append_only() "
+                        "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                        "RAISE EXCEPTION 'economy_ledger is append-only'; END $$",
+                        "DROP TRIGGER IF EXISTS trg_ledger_no_update ON economy_ledger",
+                        "CREATE TRIGGER trg_ledger_no_update BEFORE UPDATE "
+                        "ON economy_ledger FOR EACH ROW "
+                        "EXECUTE FUNCTION cookie_ledger_append_only()",
+                        "DROP TRIGGER IF EXISTS trg_ledger_no_delete ON economy_ledger",
+                        "CREATE TRIGGER trg_ledger_no_delete BEFORE DELETE "
+                        "ON economy_ledger FOR EACH ROW "
+                        "EXECUTE FUNCTION cookie_ledger_append_only()",
+                    ],
+                },
             },
             'economy_ops': {  # токен операции: ретрай не выдаёт награду второй раз
                 'id': 'INTEGER PRIMARY KEY',
@@ -396,6 +509,9 @@ class DataBase:
             },
         }
 
+        # DDL и разовые миграции идут без предохранителя по времени: создание
+        # уникального индекса по таблице игроков — законно долгая работа
+        self._set_statement_timeout(ms=0)
         self._auto_migrate()
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_board_user ON board(user_id)")
@@ -446,6 +562,7 @@ class DataBase:
         self._dedupe_and_unique(db_file)
         self._install_invariants()
         self.connection.commit()
+        self._set_statement_timeout(ms=self.PG_STATEMENT_TIMEOUT_MS)
 
     # Наборы колонок, которые обязаны быть уникальными; код и так это проверяет,
     # но параллельные запросы могли бы создать дубли — БД теперь не даст.
@@ -547,7 +664,20 @@ class DataBase:
         return False
 
     def _backup(self, db_file: str):
-        """Копия базы перед разрушительной миграцией (sqlite backup API)."""
+        """Копия базы перед разрушительной миграцией.
+
+        Дедуп УДАЛЯЕТ строки, поэтому копия обязательна. На PostgreSQL её
+        делает pg_dump, и если его нет — старт отменяется: удалять живые данные
+        без копии хуже, чем не подняться."""
+        if self.DIALECT == "postgres":
+            path = self.snapshot(keep=10 ** 6)
+            if not path:
+                raise RuntimeError(
+                    "Найдены дубли, нужен дедуп, но снимок сделать нечем "
+                    "(pg_dump не найден). Удалять строки без копии нельзя — "
+                    "поставь postgresql-client и запусти снова.")
+            print(f"[*] Миграция: найдены дубли, бэкап сохранён в {path}")
+            return
         path = f"{db_file}.pre-dedup-{int(time.time())}.bak"
         dest = sqlite3.connect(path)
         try:
@@ -556,17 +686,26 @@ class DataBase:
         finally:
             dest.close()
 
+    def _backups_folder(self) -> str:
+        """Куда складывать снимки. У PostgreSQL файла базы нет, поэтому папка
+        считается от рабочего каталога процесса — того же, где лежит лог."""
+        base = os.path.dirname(os.path.abspath(self.db_file))
+        folder = os.path.join(base, "backups")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
     def snapshot(self, keep: int = 7) -> str | None:
-        """Горячий бэкап базы через sqlite backup API.
+        """Горячий бэкап базы. Старые снимки чистим, оставляя последние `keep`.
 
         Никаких бэкапов не было вообще — единственная копия делалась один раз
-        перед dedup-миграцией. sqlite3.backup корректно работает на живой базе
-        в WAL-режиме, поэтому останавливать сервис не нужно.
-        Старые снимки чистим, оставляя последние `keep`."""
+        перед dedup-миграцией. На SQLite снимок делает backup API (корректно
+        работает на живой базе в WAL-режиме, останавливать сервис не нужно), на
+        PostgreSQL — pg_dump."""
+        if self.DIALECT == "postgres":
+            return self._snapshot_postgres(keep)
         if self.db_file == ":memory:":
             return None
-        folder = os.path.join(os.path.dirname(os.path.abspath(self.db_file)), "backups")
-        os.makedirs(folder, exist_ok=True)
+        folder = self._backups_folder()
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         path = os.path.join(folder, f"{os.path.basename(self.db_file)}.{stamp}.bak")
         dest = sqlite3.connect(path)
@@ -574,13 +713,113 @@ class DataBase:
             self.connection.backup(dest)
         finally:
             dest.close()
-        old = sorted(f for f in os.listdir(folder) if f.endswith(".bak"))
-        for name in old[:-keep]:
+        self._prune_snapshots(folder, ".bak", keep)
+        return path
+
+    @staticmethod
+    def _prune_snapshots(folder: str, suffix: str, keep: int):
+        # у всех снимков одинаковый префикс, а дальше идёт UTC-метка в
+        # сортируемом формате — поэтому лексикографический порядок и есть
+        # хронологический, отдельная сортировка по mtime не нужна
+        old = sorted(f for f in os.listdir(folder) if f.endswith(suffix))
+        for name in old[:-keep] if keep > 0 else old:
             try:
                 os.remove(os.path.join(folder, name))
             except OSError:
                 pass
+
+    def _snapshot_postgres(self, keep: int) -> str | None:
+        """Снимок через pg_dump в custom-формате (сжат, восстанавливается
+        pg_restore выборочно по таблицам).
+
+        Пароль передаётся ПЕРЕМЕННОЙ ОКРУЖЕНИЯ, а не в URL аргументом: argv
+        видно всей машине в ps, и строка подключения с паролем попала бы в
+        любой снимок процессов, включая тот, что приложат к тикету."""
+        exe = shutil.which("pg_dump")
+        if not exe:
+            print("[!] Бэкап пропущен: pg_dump не найден в PATH")
+            return None
+        p = urllib.parse.urlparse(self.url)
+        name = urllib.parse.unquote(p.path.lstrip("/")) or "postgres"
+        folder = self._backups_folder()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        path = os.path.join(folder, f"{name}.{stamp}.dump")
+        args = [exe, "--format=custom", "--no-owner", "--no-privileges",
+                "--file", path]
+        if p.hostname:
+            args += ["--host", p.hostname]
+        if p.port:
+            args += ["--port", str(p.port)]
+        if p.username:
+            args += ["--username", urllib.parse.unquote(p.username)]
+        args.append(name)
+        env = dict(os.environ)
+        if p.password:
+            env["PGPASSWORD"] = urllib.parse.unquote(p.password)
+        # timeout: снимок обязан закончиться, иначе задача планировщика
+        # держала бы замок и следующий бэкап не случился бы никогда
+        res = subprocess.run(args, env=env, capture_output=True, text=True,
+                             timeout=3600)
+        if res.returncode != 0:
+            # stderr pg_dump пароля не содержит — он не в argv и не в выводе
+            raise RuntimeError(
+                f"pg_dump вернул {res.returncode}: {res.stderr.strip()[:500]}")
+        self._prune_snapshots(folder, ".dump", keep)
         return path
+
+    # ---------- диалект: DDL ----------
+
+    def _ddl(self, col: str, spec: str) -> str:
+        """Объявление колонки в терминах текущего движка.
+
+        Схема выше написана на типах SQLite — это исходник, и переписывать её
+        под второй движок нельзя: тогда пришлось бы держать две схемы и следить,
+        чтобы они не разъехались. Перевод делается здесь, в одном месте."""
+        if self.DIALECT == "sqlite":
+            return f"{col} {spec}"
+        kind, _, rest = spec.partition(" ")
+        # DEFAULT "en": в SQLite двойные кавычки — строковый литерал, в
+        # PostgreSQL это ИМЯ ОБЪЕКТА, и такой DEFAULT падает с «column "en"
+        # does not exist». Одинарные кавычки понимают оба движка.
+        rest = rest.replace('"', "'")
+        if kind == "INTEGER" and rest.startswith("PRIMARY KEY") and col == "id":
+            # INTEGER PRIMARY KEY в SQLite — псевдоним rowid, то есть выданный
+            # базой автоинкремент; ближайший аналог — BIGSERIAL. Условие на
+            # имя колонки обязательно: economy_opening.user_id объявлен
+            # INTEGER PRIMARY KEY, но значение туда кладёт код (это telegram id),
+            # и последовательность там подставляла бы свои числа поверх чужих.
+            return f"{col} BIGSERIAL {rest}"
+        return f"{col} {self.PG_TYPES.get(kind, kind)} {rest}".rstrip()
+
+    def _create_table_sql(self, table: str, columns: dict,
+                          constraints=()) -> str:
+        parts = [self._ddl(col, spec) for col, spec in columns.items()]
+        parts += list(constraints)
+        return f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(parts)})"
+
+    def _columns(self, table: str) -> list[str]:
+        """Имена колонок существующей таблицы (пусто, если таблицы нет)."""
+        if self.DIALECT == "sqlite":
+            self.cursor.execute(f"PRAGMA table_info({table})")
+            return [row["name"] for row in self.cursor.fetchall()]
+        # current_schema(), а не 'public': база может лежать в своей схеме
+        # (search_path в строке подключения), и жёсткое 'public' нашло бы
+        # чужую таблицу того же имени или не нашло бы своей
+        return [r["column_name"] for r in self.q(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = ? AND table_schema = current_schema()", (table,))]
+
+    def _dialect_list(self, spec: dict, key: str) -> list[str]:
+        """Значение `__constraints__`/`__after_create__` для текущего движка.
+
+        Значением может быть список (годится обоим) или dict по диалектам с
+        необязательным ключом '*' для общей части."""
+        value = spec.get(key)
+        if not value:
+            return []
+        if isinstance(value, dict):
+            return list(value.get(self.DIALECT, ())) + list(value.get("*", ()))
+        return list(value)
 
     # ---------- миграции ----------
 
@@ -628,7 +867,7 @@ class DataBase:
                 self.cursor.execute(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
                     f"ON {table}({', '.join(cols)}){tail}")
-            except sqlite3.IntegrityError as e:
+            except INTEGRITY_ERRORS as e:
                 # дедуп уже отработал, значит дубли появились ПОСЛЕ него —
                 # это баг в коде, а не наследие. Молча удалять живые строки
                 # нельзя, поэтому старт отменяется
@@ -648,11 +887,32 @@ class DataBase:
         и небольшой минус тут не аварийная ситуация, а запас на округления."""
         if not self._migration("invariants:users_balance"):
             return
-        self.cursor.execute(
-            "CREATE TRIGGER IF NOT EXISTS trg_users_balance_sane "
-            "BEFORE UPDATE OF cookies ON users "
-            "WHEN NEW.cookies IS NULL OR NEW.cookies < -1e6 OR NEW.cookies > 1e15 "
-            "BEGIN SELECT RAISE(ABORT, 'balance_insane'); END")
+        if self.DIALECT == "sqlite":
+            self.cursor.execute(
+                "CREATE TRIGGER IF NOT EXISTS trg_users_balance_sane "
+                "BEFORE UPDATE OF cookies ON users "
+                "WHEN NEW.cookies IS NULL OR NEW.cookies < -1e6 OR NEW.cookies > 1e15 "
+                "BEGIN SELECT RAISE(ABORT, 'balance_insane'); END")
+        else:
+            # На PostgreSQL условие переезжает внутрь функции: WHEN там тоже
+            # есть, но NaN приходится проверять сравнением с 'NaN' — «x <> x»
+            # для него ложно, а вот «x = x» истинно, и обычная проверка на
+            # вменяемость его бы не заметила. Текст ошибки тот же —
+            # 'balance_insane', по нему тесты и обработчики отличают инвариант.
+            self.cursor.execute(
+                "CREATE OR REPLACE FUNCTION cookie_users_balance_sane() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                "IF NEW.cookies IS NULL "
+                "OR NEW.cookies = 'NaN'::double precision "
+                "OR NEW.cookies < -1e6 OR NEW.cookies > 1e15 THEN "
+                "RAISE EXCEPTION 'balance_insane'; END IF; "
+                "RETURN NEW; END $$")
+            self.cursor.execute(
+                "DROP TRIGGER IF EXISTS trg_users_balance_sane ON users")
+            self.cursor.execute(
+                "CREATE TRIGGER trg_users_balance_sane "
+                "BEFORE UPDATE OF cookies ON users FOR EACH ROW "
+                "EXECUTE FUNCTION cookie_users_balance_sane()")
         self._mark("invariants:users_balance")
 
     def _auto_migrate(self):
@@ -661,20 +921,20 @@ class DataBase:
             # ключи с двумя подчёркиваниями — не колонки: __constraints__
             # дописываются в CREATE TABLE, __after_create__ выполняется разово
             columns = {k: v for k, v in spec.items() if not k.startswith("__")}
-            parts = [f"{col} {ctype}" for col, ctype in columns.items()]
-            parts += list(spec.get("__constraints__", ()))
-            self.cursor.execute(
-                f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(parts)})")
+            self.cursor.execute(self._create_table_sql(
+                table_name, columns,
+                self._dialect_list(spec, "__constraints__")))
 
-            self.cursor.execute(f"PRAGMA table_info({table_name})")
-            existing_columns = [row['name'] for row in self.cursor.fetchall()]
+            existing_columns = self._columns(table_name)
 
             for col_name, col_type in columns.items():
                 if col_name not in existing_columns:
                     print(f"[*] Миграция: Добавлен новый столбец {col_name} в {table_name}")
-                    self.cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+                    self.cursor.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN "
+                        f"{self._ddl(col_name, col_type)}")
 
-            after = spec.get("__after_create__")
+            after = self._dialect_list(spec, "__after_create__")
             key = f"after_create:{table_name}"
             if after and self._migration(key):
                 for stmt in after:
@@ -802,6 +1062,8 @@ class DataBase:
 
         Прагмы, кроме journal_mode, действуют НА СОЕДИНЕНИЕ, поэтому ставятся
         здесь, а не один раз в __init__."""
+        if self.DIALECT == "postgres":
+            return self._connect_postgres()
         if self.db_file == ":memory:":
             # у in-memory базы каждое соединение — своя пустая база, поэтому
             # такое соединение одно на процесс (тесты и только они)
@@ -828,6 +1090,36 @@ class DataBase:
         if self.db_file == ":memory:":
             self._memory_conn = conn
         return conn
+
+    def _connect_postgres(self):
+        """Соединение PostgreSQL с теми же свойствами, что у SQLite-варианта.
+
+        autocommit=True — это НЕ «без транзакций», а ровно то же поведение, что
+        `isolation_level = None` у sqlite3: одиночный стейтмент коммитится сам,
+        многошаговые операции берутся в явную транзакцию в tx(). Без этого
+        psycopg открыл бы транзакцию на первом же SELECT и держал её до
+        commit(), а у нас соединение живёт всё время жизни потока — то есть
+        каждый воркер вечно висел бы в idle in transaction, блокируя VACUUM."""
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = psycopg.connect(self.url, autocommit=True, row_factory=dict_row,
+                               connect_timeout=10)
+        self._set_statement_timeout(conn, self.PG_STATEMENT_TIMEOUT_MS)
+        return conn
+
+    def _set_statement_timeout(self, conn=None, ms: int = 0):
+        """Предохранитель от зависшего стейтмента (только PostgreSQL).
+
+        Это не бюджет задержки, а именно предохранитель: у SQLite аналога нет
+        (там писатель один и его ждут), а на PostgreSQL один запрос по забытому
+        индексу способен держать блокировки строк, пока его кто-нибудь не
+        заметит. На время миграций снимается: CREATE UNIQUE INDEX по таблице
+        игроков законно идёт минуты, и убивать его по таймауту значит не дать
+        процессу подняться вообще."""
+        if self.DIALECT != "postgres":
+            return
+        (conn or self.connection).execute(f"SET statement_timeout = {int(ms)}")
 
     @property
     def connection(self):
@@ -870,6 +1162,19 @@ class DataBase:
                 yield
             finally:
                 self._tx_depth -= 1
+            return
+        if self.DIALECT == "postgres":
+            # BEGIN IMMEDIATE не переводится: он берёт ЕДИНСТВЕННУЮ на файл
+            # блокировку писателя, поэтому и нуждался в ретраях. PostgreSQL
+            # пишет параллельно и блокирует построчно — ждать здесь нечего, а
+            # редкий конфликт сериализации (40001) прилетает уже из тела
+            # транзакции и превращается в 409 обработчиком в main.py.
+            self._tx_depth = 1
+            try:
+                with self.connection.transaction():
+                    yield
+            finally:
+                self._tx_depth = 0
             return
         cur = self.cursor
         for attempt in range(TX_RETRIES):
@@ -919,7 +1224,10 @@ class DataBase:
         cur = self.cursor
         cur.execute(self._sql(sql), params)
         rc = cur.rowcount
-        self.last_insert_id = cur.lastrowid
+        # lastrowid есть только у sqlite3: в psycopg его нет вовсе, и обращение
+        # к нему уронило бы КАЖДУЮ запись. Кому нужен выданный id — просит его
+        # через RETURNING (q1w), это работает на обоих движках
+        self.last_insert_id = getattr(cur, "lastrowid", None)
         if not self._tx_depth:
             self.connection.commit()
         return rc
@@ -989,5 +1297,8 @@ def shared() -> DataBase:
     операций не переживает."""
     global _shared
     if _shared is None:
-        _shared = DataBase(os.environ.get("DATABASE_PATH", "data.db"))
+        # оба ключа читаются ЖИВЫМ окружением: тесты подменяют их после
+        # импорта модуля (см. комментарий в __init__)
+        _shared = DataBase(os.environ.get("DATABASE_PATH", "data.db"),
+                           os.environ.get("DATABASE_URL", ""))
     return _shared
