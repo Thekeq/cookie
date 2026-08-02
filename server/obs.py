@@ -158,6 +158,10 @@ META = {
     "job_fails_total": ("gauge", "Падений фоновой задачи всего"),
     "cache_backend_up": ("gauge", "1 — разделяемое состояние в Redis, 0 — в памяти"),
     "notifications_total": ("counter", "Пуши по исходу отправки"),
+    "backup_total": ("counter", "Бэкапы по исходу: ok/fail"),
+    "backup_size_bytes": ("gauge", "Размер последнего снимка"),
+    "backup_age_seconds": ("gauge", "Возраст самого свежего снимка"),
+    "backup_drill_total": ("counter", "Учения по восстановлению: ok/fail"),
 }
 
 _counters: dict[tuple, float] = {}
@@ -366,6 +370,18 @@ def refresh_gauges():
         set_gauge("job_last_ok_age_seconds", now - (r["last_ok_at"] or 0), job=job)
         set_gauge("job_runs_total", r["runs"] or 0, job=job)
         set_gauge("job_fails_total", r["fails"] or 0, job=job)
+
+    # Возраст снимка считается по ФАЙЛУ, а не по отметке задачи: задача может
+    # отчитаться об успехе, не создав ничего (нет pg_dump, кончилось место), и
+    # тогда единственный честный ответ на «что мы восстановим» — время файла.
+    try:
+        folder = db_module.shared()._backups_folder()
+        stamps = [os.path.getmtime(os.path.join(folder, f))
+                  for f in os.listdir(folder) if not f.endswith(".sha256")]
+        if stamps:
+            set_gauge("backup_age_seconds", now - max(stamps))
+    except OSError:
+        pass  # каталога нет — бэкапов не было ни одного, датчик не выставляем
 
 
 # ---------- Sentry ----------

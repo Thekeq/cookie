@@ -14,6 +14,7 @@ import time
 from aiogram.exceptions import TelegramForbiddenError
 
 from bot import webhook
+from server import backup
 from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
@@ -101,10 +102,36 @@ def _backup_db():
     БД), а тут остаётся сама работа.
 
     Движок здесь больше не проверяется: снимок умеет оба (sqlite backup API и
-    pg_dump), выбор делает db.snapshot."""
-    path = db.snapshot(keep=cfg.BACKUP_KEEP)
-    if path:
-        log.info("бэкап базы: %s", path)
+    pg_dump), выбор делает db.snapshot.
+
+    Сама работа уехала в server/backup.py: снимок — только первый шаг, за ним
+    контрольная сумма, шифрование и отправка с машины. Копия, лежащая на том
+    же диске, что и база, переживает лишь ошибочный запрос, а не потерю диска."""
+    try:
+        info = backup.run()
+    except backup.BackupError as e:
+        obs.inc("backup_total", result="fail")
+        # наружу пробрасываем: scheduler посчитает падение, и это увидит
+        # алерт по job_fails_total{job="db_backup"}
+        raise RuntimeError(f"бэкап не сделан: {e}") from e
+    log.info("бэкап базы: %s (%.1f МБ, шифрование=%s, отправлен=%s, %s с)",
+             info["path"], info["size"] / 1048576, info["encrypted"],
+             info["uploaded"], info["seconds"])
+
+
+def _backup_drill():
+    """Проверка восстановлением: раз в сутки поднять последний снимок.
+
+    Бэкап, который ни разу не разворачивали, — это предположение. Ломается всё
+    молча: файл побился на диске, ключ шифрования в конфиге сменили, pg_dump
+    записал пустышку. Каждая из этих поломок обнаруживается либо здесь, либо в
+    час аварии."""
+    try:
+        info = backup.drill()
+    except backup.BackupError as e:
+        obs.inc("backup_drill_total", result="fail")
+        raise RuntimeError(f"учения провалены: {e}") from e
+    log.info("учения по восстановлению: %s", info)
 
 
 def _prune_ops():
@@ -152,6 +179,13 @@ JOBS: tuple[tuple[str, float, float, object], ...] = (
     ("boosts_prune", 3600, 15 * 60, _prune_boosts),
     ("db_backup", cfg.BACKUP_INTERVAL_H * 3600, 60 * 60, _backup_db),
 )
+
+# Учения идут отдельным ключом, а не внутри бэкапа: у них своя периодичность и
+# свой смысл отказа. «Снимок сделан» и «снимок разворачивается» — разные
+# новости, и алерт должен уметь отличить одну от другой.
+if settings.BACKUP_DRILL_INTERVAL_H > 0:
+    JOBS += (("backup_drill", settings.BACKUP_DRILL_INTERVAL_H * 3600,
+              30 * 60, _backup_drill),)
 
 # Пуш-проход отдельно: он async и он самый долгий. 0.05 с на игрока — это час
 # на 72 тысячи пушей, поэтому ttl взят с запасом на порядок больше остальных.

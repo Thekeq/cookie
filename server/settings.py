@@ -15,6 +15,7 @@
 Секреты (`BOT_TOKEN`, `DATABASE_URL`, `REDIS_URL`, `WEBHOOK_SECRET`) НИКОГДА
 не печатаются целиком: для логов есть `redact()` и `summary()`.
 """
+import base64
 import hashlib
 import os
 
@@ -113,8 +114,20 @@ SENTRY_DSN = _s("SENTRY_DSN")
 # обрыв соединения — то есть ровно тот случай, ради которого есть X-Op-Id.
 GRACEFUL_TIMEOUT = _i("GRACEFUL_TIMEOUT", 20)
 
+# ---------- Бэкапы ----------
+# Команда, которой снимок уезжает с машины. Шаблон: {src} — полный путь,
+# {name} — имя файла. Пусто — копии наружу нет, и снимок переживёт ровно те
+# аварии, которые не трогают диск (то есть меньшую их часть).
+# Пример: rclone copyto {src} r2:cookie-backups/{name}
+BACKUP_UPLOAD_CMD = _s("BACKUP_UPLOAD_CMD")
+# Ключ шифрования снимка: 32 байта в base64 (`openssl rand -base64 32`).
+# Пусто — файл уезжает как есть, а в нём user_id, имена и история платежей.
+BACKUP_ENCRYPT_KEY = _s("BACKUP_ENCRYPT_KEY")
+# Раз во сколько часов проверять восстановлением. Ноль — не проверять.
+BACKUP_DRILL_INTERVAL_H = _i("BACKUP_DRILL_INTERVAL_H", 24)
+
 _SECRET_KEYS = ("BOT_TOKEN", "DATABASE_URL", "REDIS_URL", "WEBHOOK_SECRET",
-                "METRICS_TOKEN", "SENTRY_DSN")
+                "METRICS_TOKEN", "SENTRY_DSN", "BACKUP_ENCRYPT_KEY")
 
 
 def redact(value: str) -> str:
@@ -141,6 +154,8 @@ def summary() -> str:
         f"logs={'json' if LOG_JSON else 'text'}",
         f"metrics={'on' if METRICS_TOKEN else 'off'}",
         f"sentry={'on' if SENTRY_DSN else 'off'}",
+        f"backup={'offsite' if BACKUP_UPLOAD_CMD else 'local-only'}"
+        f"{'+enc' if BACKUP_ENCRYPT_KEY else ''}",
         f"webapp={WEBAPP_URL or '<не задан>'}",
         f"admin={ADMIN_ID or '<не задан>'}",
         f"token={redact(BOT_TOKEN)}",
@@ -217,4 +232,24 @@ def problems() -> list[tuple[str, bool]]:
         # подбирается, а выгрузка показывает и обороты валюты, и состояние задач
         out.append((f"METRICS_TOKEN длиной {len(METRICS_TOKEN)} символов — "
                     "нужно хотя бы 16", True))
+    if BACKUP_ENCRYPT_KEY:
+        # проверяем ключ на старте, а не в момент бэкапа: иначе про опечатку
+        # узнаём через сутки из лога фоновой задачи, которую никто не читает
+        try:
+            _klen = len(base64.b64decode(BACKUP_ENCRYPT_KEY, validate=True))
+        except Exception:
+            _klen = -1
+        if _klen != 32:
+            out.append(("BACKUP_ENCRYPT_KEY должен быть 32 байта в base64 "
+                        "(openssl rand -base64 32)", True))
+    if BACKUP_UPLOAD_CMD and "{src}" not in BACKUP_UPLOAD_CMD:
+        # без подстановки команда запустится и вернёт 0, отправив не тот файл
+        # или ничего: «бэкапы уезжают» будет неправдой ровно до аварии
+        out.append(("BACKUP_UPLOAD_CMD без {src}: непонятно, какой файл "
+                    "отправлять", True))
+    if BACKUP_UPLOAD_CMD and not BACKUP_ENCRYPT_KEY:
+        # снимок — это персональные данные игроков и их балансы; чужому
+        # хранилищу их отдают зашифрованными или не отдают вовсе
+        out.append(("BACKUP_UPLOAD_CMD задан без BACKUP_ENCRYPT_KEY: снимок "
+                    "с данными игроков уедет наружу незашифрованным", False))
     return out

@@ -255,11 +255,12 @@ async def healthz():
     Планировщик показан отдельным полем потому, что при ROLE=api он живёт в
     ДРУГОМ процессе: у отвечающего на /healthz фоновых задач нет вовсе, и без
     этой строки «бэкапов нет уже неделю» выглядело бы снаружи как здоровье."""
-    from server import cache, scheduler
+    from server import backup, cache, scheduler
     from server.game_logic import db
     db.q1("SELECT 1 AS ok")
     return {"ok": True, "ts": time.time(), "role": settings.ROLE,
-            "cache": cache.health(), "scheduler": scheduler.health()}
+            "cache": cache.health(), "scheduler": scheduler.health(),
+            "backup": backup.status()}
 
 
 @app.get("/livez")

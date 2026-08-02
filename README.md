@@ -169,6 +169,21 @@ systemctl status cookie-api cookie-scheduler
   хранит неделю (`BACKUP_INTERVAL_H`, `BACKUP_KEEP`). Движок выбирает
   `db.snapshot`: sqlite backup API или `pg_dump --format=custom` (нужен
   `postgresql-client` в PATH, иначе снимок пропускается с записью в лог).
+  Дальше `server/backup.py`: контрольная сумма рядом с файлом, шифрование
+  AES-256-GCM ключом `BACKUP_ENCRYPT_KEY` и отправка **с машины** командой
+  `BACKUP_UPLOAD_CMD` (шаблон с `{src}`/`{name}` — работает с rclone, aws,
+  scp; своего клиента S3 в процессе нет намеренно). Копия, лежащая на том же
+  диске, что и база, спасает только от ошибочного запроса.
+  Раз в сутки задача `backup_drill` **разворачивает** свежий снимок: сверяет
+  сумму, гоняет шифрование туда-обратно и открывает базу. Бэкап, который ни
+  разу не разворачивали, — это предположение, а не бэкап.
+  Суточный снимок означает RPO в сутки. Чтобы получить RPO ≤ 5 минут, на
+  сервере PostgreSQL включается непрерывный архив WAL (`archive_mode`,
+  `archive_timeout = 300`); что именно писать в конфиг и как из архива
+  восстановиться — **`deploy/RUNBOOK.md`**, там же сценарии потери машины,
+  отката на точку во времени и порчи одной таблицы. Работает ли архив на
+  самом деле, отвечает `backup.pitr_status()` — вопросом к живой базе, а не
+  чтением конфига.
 - **PostgreSQL** — второй диалект той же схемы. Включается заполненным
   `DATABASE_URL` (`DATABASE_PATH` при этом игнорируется), нужен драйвер
   `psycopg[binary]` из `requirements.txt`. Схема одна: она написана на типах
@@ -207,6 +222,8 @@ systemctl status cookie-api cookie-scheduler
   | `rate(http_requests_total{status=~"5.."})` > 1% пять минут | ручка сломана |
   | p99 `http_request_duration_seconds` > 2 с | база или воркеры не тянут |
   | `job_last_ok_age_seconds{job="db_backup"}` > 2 суток | бэкапов нет |
+  | `job_last_ok_age_seconds{job="backup_drill"}` > 2 суток | учения молчат |
+  | `backup_age_seconds` > 2 суток | файла нет, хотя задача «прошла» |
   | `job_last_ok_age_seconds{job="notify_pass"}` > 1 часа | планировщик умер |
   | `cache_backend_up == 0` при нескольких воркерах | лимит стал N-кратным |
   | `rate(db_tx_retries_total)` растёт | писатели дерутся за базу |

@@ -1162,6 +1162,297 @@ check("18.19 сканер смотрит индекс git, а не рабочи�
       "git" in _pathlib.Path("tools", "check_secrets.py").read_text(
           encoding="utf-8") and _sec.main() == 0)
 
+print("\n=== 19. Бэкапы, шифрование и восстановление ===")
+import base64 as _b64
+import shlex as _shlex
+
+from server import backup as _bk
+
+# ---- проверка ключа ----
+_good_key = _b64.b64encode(b"K" * 32).decode()
+reload_settings(BACKUP_ENCRYPT_KEY=None)
+check("19.1 без ключа шифрование выключено", _bk._key() is None)
+reload_settings(BACKUP_ENCRYPT_KEY=_good_key)
+check("19.2 ключ на 32 байта принимается", _bk._key() == b"K" * 32)
+for _bad, _why in ((_b64.b64encode(b"short").decode(), "19.3 короткий ключ отвергнут"),
+                   ("не base64!!", "19.4 не-base64 ключ отвергнут")):
+    reload_settings(BACKUP_ENCRYPT_KEY=_bad)
+    try:
+        _bk._key()
+        check(_why, False)
+    except _bk.BackupError:
+        check(_why, True)
+
+# ---- шифрование ----
+reload_settings(BACKUP_ENCRYPT_KEY=_good_key)
+_tmp = tempfile.gettempdir()
+_plain = os.path.join(_tmp, f"bk_plain_{os.getpid()}")
+_enc = _plain + ".enc"
+_dec = _plain + ".dec"
+# больше одного куска: перестановка и обрыв кусков ловятся только на многих
+_marker = b"USER-BALANCE-1076078800"
+_payload = _marker + b"x" * (_bk.CHUNK + 17) + _marker
+with open(_plain, "wb") as _f:
+    _f.write(_payload)
+
+_bk.encrypt_file(_plain, _enc, _bk._key())
+_cipher_bytes = open(_enc, "rb").read()
+check("19.5 открытых данных в шифртексте не остаётся",
+      _marker not in _cipher_bytes and _cipher_bytes.startswith(_bk.MAGIC)
+      and len(_cipher_bytes) > len(_payload))
+_bk.decrypt_file(_enc, _dec, _bk._key())
+check("19.6 расшифровка возвращает ровно исходный файл",
+      open(_dec, "rb").read() == _payload)
+
+# чужой ключ обязан ЛОМАТЬСЯ, а не отдавать мусор: расшифровка «успешно, но
+# ерундой» означала бы восстановление в битую базу
+try:
+    _bk.decrypt_file(_enc, _dec, b"Z" * 32)
+    check("19.7 чужой ключ не расшифровывает", False)
+except _bk.BackupError as e:
+    check("19.7 чужой ключ не расшифровывает", "не расшифровался" in str(e))
+
+# обрезанный файл — самая частая порча при отправке по сети
+_cut = _plain + ".cut"
+with open(_cut, "wb") as _f:
+    _f.write(_cipher_bytes[:-500])
+try:
+    _bk.decrypt_file(_cut, _dec, _bk._key())
+    check("19.8 обрезанный архив не проходит молча", False)
+except _bk.BackupError:
+    check("19.8 обрезанный архив не проходит молча", True)
+
+# один изменённый байт в середине
+_raw = bytearray(_cipher_bytes)
+_raw[len(_raw) // 2] ^= 0xFF
+_bad_path = _plain + ".bad"
+with open(_bad_path, "wb") as _f:
+    _f.write(bytes(_raw))
+try:
+    _bk.decrypt_file(_bad_path, _dec, _bk._key())
+    check("19.9 подмена байта в архиве обнаружена", False)
+except _bk.BackupError:
+    check("19.9 подмена байта в архиве обнаружена", True)
+
+try:
+    _bk.decrypt_file(_plain, _dec, _bk._key())
+    check("19.10 незашифрованный файл не принимается за архив", False)
+except _bk.BackupError as e:
+    check("19.10 незашифрованный файл не принимается за архив",
+          "не наш формат" in str(e))
+
+check("19.11 контрольная сумма считается потоком",
+      _bk.sha256(_plain) == __import__("hashlib").sha256(_payload).hexdigest())
+
+# ---- отправка наружу ----
+_up_script = os.path.join(_tmp, f"bk_up_{os.getpid()}.py")
+with open(_up_script, "w", encoding="utf-8") as _f:
+    # аргументы: что отправить, куда, каким кодом выйти, и имя как его увидела
+    # команда — по нему проверяется подстановка {name}
+    _f.write("import shutil, sys\n"
+             "code = int(sys.argv[3])\n"
+             "if code:\n"
+             "    sys.exit(code)\n"
+             "shutil.copyfile(sys.argv[1], sys.argv[2])\n"
+             "open(sys.argv[2] + '.name', 'w').write(sys.argv[4])\n")
+_dest = os.path.join(_tmp, f"bk_dest_{os.getpid()}")
+_py = _shlex.quote(sys.executable.replace("\\", "/"))
+_script_q = _shlex.quote(_up_script.replace("\\", "/"))
+
+
+def _cmd(dest, code="0"):
+    return f"{_py} {_script_q} {{src}} {_shlex.quote(dest)} {code} {{name}}"
+
+
+reload_settings(BACKUP_UPLOAD_CMD=None)
+check("19.12 без команды отправка просто выключена", _bk.upload(_plain) is False)
+
+reload_settings(BACKUP_UPLOAD_CMD=_cmd(_dest))
+check("19.13 отправка запускает команду и подставляет {src}",
+      _bk.upload(_plain) is True and os.path.exists(_dest)
+      and open(_dest, "rb").read() == _payload)
+
+# ненулевой код возврата — это «файл НЕ уехал», и молчать об этом нельзя:
+# «бэкапы отправляются» проверяется ровно в момент аварии
+reload_settings(BACKUP_UPLOAD_CMD=_cmd(_dest, code="3"))
+try:
+    _bk.upload(_plain)
+    check("19.14 неудачная отправка — ошибка, а не тишина", False)
+except _bk.BackupError as e:
+    check("19.14 неудачная отправка — ошибка, а не тишина", "3" in str(e))
+
+reload_settings(BACKUP_UPLOAD_CMD="этой-команды-нет-нигде {src}")
+try:
+    _bk.upload(_plain)
+    check("19.15 отсутствующая команда отправки — ошибка", False)
+except _bk.BackupError as e:
+    check("19.15 отсутствующая команда отправки — ошибка", "не найдена" in str(e))
+
+# {name} должен быть ИМЕНЕМ файла, а не путём: иначе в чужом хранилище
+# появится дерево каталогов этой машины
+reload_settings(BACKUP_UPLOAD_CMD=_cmd(_dest))
+_bk.upload(_plain)
+check("19.16 {name} — имя файла, а не путь с машины",
+      open(_dest + ".name", encoding="utf-8").read() == os.path.basename(_plain))
+
+# ---- полный проход ----
+os.unlink(_dest) if os.path.exists(_dest) else None
+reload_settings(BACKUP_ENCRYPT_KEY=_good_key, BACKUP_UPLOAD_CMD=_cmd(_dest))
+_info = _bk.run()
+check("19.17 снимок сделан, посчитан и отправлен",
+      _info["encrypted"] and _info["uploaded"]
+      and _info["size"] > _bk.MIN_SIZE and os.path.exists(_dest))
+check("19.18 рядом со снимком лежит контрольная сумма",
+      os.path.exists(_info["path"] + ".sha256")
+      and _bk.sha256(_info["path"]) in open(
+          _info["path"] + ".sha256", encoding="utf-8").read())
+# наружу уезжает ЗАШИФРОВАННОЕ, иначе в чужом хранилище лежат имена и балансы
+check("19.19 наружу ушёл шифртекст, а не сама база",
+      open(_dest, "rb").read(4) == _bk.MAGIC)
+check("19.20 зашифрованная копия рядом с базой не остаётся",
+      not os.path.exists(_info["path"] + ".enc"))
+
+# ---- учения ----
+_drill = _bk.drill()
+check("19.21 учения разворачивают снимок и считают строки",
+      _drill["encrypted"] and "users" in _drill and _drill["age_hours"] < 1)
+
+# битый файл при целой сумме — ровно то, ради чего сумма и пишется
+_snap = _bk.latest(".bak")
+_keep = open(_snap, "rb").read()
+with open(_snap, "r+b") as _f:
+    _f.write(b"\x00" * 64)
+try:
+    _bk.drill()
+    check("19.22 порча снимка на диске обнаружена", False)
+except _bk.BackupError as e:
+    check("19.22 порча снимка на диске обнаружена", "сумма не" in str(e))
+with open(_snap, "wb") as _f:
+    _f.write(_keep)
+check("19.23 после починки учения снова проходят", _bk.drill()["users"] >= 0)
+
+# ---- бракованные снимки ----
+_folder = _bk._folder()
+_saved = {f: open(os.path.join(_folder, f), "rb").read()
+          for f in os.listdir(_folder)}
+for _f in _saved:
+    os.remove(os.path.join(_folder, _f))
+try:
+    _bk.drill()
+    check("19.24 учения без единого снимка — ошибка", False)
+except _bk.BackupError as e:
+    check("19.24 учения без единого снимка — ошибка", "снимков нет" in str(e))
+check("19.25 сводка честно говорит, что копий нет",
+      _bk.status()["snapshots"] == 0)
+
+# пустой снимок страшнее отсутствующего: задача отчиталась об успехе
+_real_snapshot = _bk.db.snapshot
+_bk.db.snapshot = lambda keep=7: open(
+    os.path.join(_folder, "empty.20200101-000000.bak"), "wb").close() or \
+    os.path.join(_folder, "empty.20200101-000000.bak")
+try:
+    _bk.run()
+    check("19.26 пустой снимок считается провалом", False)
+except _bk.BackupError as e:
+    check("19.26 пустой снимок считается провалом", "мал" in str(e))
+_bk.db.snapshot = _real_snapshot
+for _f, _data in _saved.items():
+    open(os.path.join(_folder, _f), "wb").write(_data)
+for _f in list(os.listdir(_folder)):
+    if _f.startswith("empty."):
+        os.remove(os.path.join(_folder, _f))
+
+# висячая сумма от вычищенного снимка
+open(os.path.join(_folder, "gone.20200101-000000.bak.sha256"), "w").write("x")
+_bk._prune_orphan_sums()
+check("19.27 суммы от удалённых снимков не копятся",
+      not os.path.exists(os.path.join(_folder,
+                                      "gone.20200101-000000.bak.sha256")))
+
+# ---- конфиг ----
+_s19 = reload_settings(BACKUP_ENCRYPT_KEY=_b64.b64encode(b"short").decode())
+check("19.28 кривой ключ шифрования отменяет старт",
+      any("BACKUP_ENCRYPT_KEY" in t for t in fatals(_s19)))
+_s19 = reload_settings(BACKUP_UPLOAD_CMD="rclone copy куда-то",
+                       BACKUP_ENCRYPT_KEY=_good_key)
+check("19.29 команда отправки без {src} отменяет старт",
+      any("{src}" in t for t in fatals(_s19)))
+_s19 = reload_settings(BACKUP_UPLOAD_CMD="rclone copyto {src} r2:b/{name}",
+                       BACKUP_ENCRYPT_KEY=None)
+check("19.30 отправка без шифрования — предупреждение, а не отказ",
+      "незашифрованным" in texts(_s19)
+      and not any("незашифрованным" in t for t in fatals(_s19)))
+_s19 = reload_settings(BACKUP_ENCRYPT_KEY="A" * 43 + "=",
+                       BACKUP_UPLOAD_CMD="rclone copyto {src} r2:b/{name}")
+check("19.31 ключ бэкапа не печатается в сводке",
+      "AAAA" not in _s19.summary() and "backup=offsite+enc" in _s19.summary()
+      and "BACKUP_ENCRYPT_KEY" in _s19._SECRET_KEYS)
+check("19.32 без отправки сводка честно говорит про локальную копию",
+      "backup=local-only" in reload_settings(
+          BACKUP_UPLOAD_CMD=None, BACKUP_ENCRYPT_KEY=None).summary())
+
+# ---- расписание и метрики ----
+reload_settings(BACKUP_ENCRYPT_KEY=None, BACKUP_UPLOAD_CMD=None)
+import bot.notifier as _notifier
+
+importlib.reload(_notifier)
+_job_keys = [k for k, _, _, _ in _notifier.JOBS]
+check("19.33 бэкап и учения — отдельные задачи планировщика",
+      "db_backup" in _job_keys and "backup_drill" in _job_keys)
+reload_settings(BACKUP_DRILL_INTERVAL_H="0")
+importlib.reload(_notifier)
+check("19.34 учения выключаются нулевым интервалом",
+      "backup_drill" not in [k for k, _, _, _ in _notifier.JOBS]
+      and "db_backup" in [k for k, _, _, _ in _notifier.JOBS])
+reload_settings(BACKUP_DRILL_INTERVAL_H=None)
+importlib.reload(_notifier)
+
+# провал бэкапа обязан дойти до планировщика: задача, которая проглотила
+# ошибку, выглядит в метриках здоровой ровно до дня восстановления
+_bk_run_real = _bk.run
+_bk.run = lambda: (_ for _ in ()).throw(_bk.BackupError("места нет"))
+try:
+    _notifier._backup_db()
+    check("19.35 провал бэкапа не проглатывается", False)
+except RuntimeError as e:
+    check("19.35 провал бэкапа не проглатывается", "места нет" in str(e))
+_bk.run = _bk_run_real
+
+obs.refresh_gauges()
+_txt19 = obs.render()
+check("19.36 возраст и размер копии видны в метриках",
+      "backup_age_seconds" in _txt19 and "backup_size_bytes" in _txt19
+      and "backup_drill_total" in _txt19)
+check("19.37 состояние бэкапов видно в /healthz",
+      "backup.status()" in open("main.py", encoding="utf-8").read()
+      and "age_hours" in _bk.status())
+
+# ---- PITR ----
+_pitr = _bk.pitr_status()
+check("19.38 на SQLite PITR честно объявлен неприменимым",
+      _pitr["supported"] is False)
+check("19.39 для PostgreSQL статус архива спрашивается у живой базы",
+      "pg_stat_archiver" in open(os.path.join("server", "backup.py"),
+                                 encoding="utf-8").read())
+
+# ---- runbook ----
+_rb = _pathlib.Path("deploy", "RUNBOOK.md")
+check("19.40 runbook на месте", _rb.exists())
+_rb_src = _rb.read_text(encoding="utf-8") if _rb.exists() else ""
+for _need, _what in (("RPO", "19.41 указан RPO — сколько данных теряем"),
+                     ("RTO", "19.42 указан RTO — за сколько поднимаемся"),
+                     ("archive_timeout", "19.43 описано включение WAL-архива"),
+                     ("recovery_target_time", "19.44 описан откат на момент"),
+                     ("pg_restore", "19.45 описано разворачивание дампа"),
+                     ("getWebhookInfo", "19.46 не забыт webhook после переезда"),
+                     ("systemctl stop", "19.47 сказано остановить запись до "
+                                        "восстановления")):
+    check(_what, _need in _rb_src)
+
+for _f in (_plain, _enc, _dec, _cut, _bad_path, _dest, _up_script):
+    if os.path.exists(_f):
+        os.remove(_f)
+
 use_fallback()
 importlib.reload(_settings)
 
