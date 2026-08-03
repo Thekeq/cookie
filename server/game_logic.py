@@ -482,6 +482,34 @@ def bp_catchup_mult(user: dict, now: float | None = None) -> float:
     return 1.0
 
 
+def rest_mult(user: dict, now: float | None = None) -> float:
+    """Множитель XP дневного контента за пропущенные дни (см. cfg.rest_mult).
+
+    Считается ОДИН раз в сутки и запоминается в rest_day/rest_mult. Иначе весь
+    бонус забирало бы первое задание дня: после него «последний день контента»
+    стал бы сегодняшним, и остальные семь наград дня пришли бы по единице, хотя
+    компенсировать нужно сутки целиком.
+
+    Параллельные клеймы посчитают одно и то же: значение зависит только от
+    сохранённого дня и сегодняшней даты, поэтому запись идемпотентна.
+    """
+    today = _utc_day(now or time.time())
+    row = db.q1("SELECT rest_day, rest_mult FROM users WHERE user_id = ?",
+                (user["user_id"],))
+    last = row["rest_day"] if row else None
+    if last == today:
+        return float(row["rest_mult"] or 1.0)
+    try:
+        gap = (datetime.date.fromisoformat(today)
+               - datetime.date.fromisoformat(last)).days if last else 1
+    except ValueError:      # мусор в колонке не должен стоить игроку награды
+        gap = 1
+    mult = cfg.rest_mult(gap)
+    db.exec("UPDATE users SET rest_day = ?, rest_mult = ? WHERE user_id = ?",
+            (today, mult, user["user_id"]))
+    return mult
+
+
 def claim_quest(user: dict, key: str) -> dict:
     """Возвращает награду задания или кидает ValueError."""
     day = _utc_day(time.time())
@@ -497,7 +525,7 @@ def claim_quest(user: dict, key: str) -> dict:
         raise ValueError("err_claimed")
     reward = quest_reward_cookies(user["user_id"], key, income)
     bp_xp = int(q["reward_bp_xp"] * bp_catchup_mult(user))
-    xp = cfg.quest_reward_xp(user["level"])
+    xp = cfg.quest_reward_xp(user["level"]) * rest_mult(user)
     with db.tx():  # отметка + печеньки + BP XP — одним куском
         # условный UPDATE: параллельный клейм не выдаст награду дважды
         if db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ? AND claimed = 0",
@@ -1919,6 +1947,7 @@ def claim_order(user: dict, order_id: int | None = None,
     first = user["orders_completed"] == 0
     # платим по ТЕКУЩЕМУ доходу: хранимая сумма могла быть выписана до престижа
     reward, bp_xp = order_reward(row["template"], hourly_income(uid))
+    rest = rest_mult(user)
     with db.tx():
         # WHERE status = 'active' + version + rowcount: два параллельных клейма
         # одного заказа иначе оба прошли бы проверку выше и заплатили дважды
@@ -1936,7 +1965,8 @@ def claim_order(user: dict, order_id: int | None = None,
         # берём через _order_difficulty: шаблон в строке мог остаться от старой
         # версии конфига, и обращение по ключу уронило бы клейм заказа.
         add_xp(uid, cfg.order_reward_xp(_order_difficulty(row["template"]),
-                                        user["level"]), bp_xp)
+                                        user["level"]) * rest,
+               bp_xp)
         _bump_orders_day(uid, day, completed=True)
     track(uid, "order_done")
     if first:

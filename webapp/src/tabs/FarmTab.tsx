@@ -7,8 +7,10 @@ import type { FarmState } from '../types'
 import RecipePanel from './RecipePanel'
 
 const B_ICONS: Record<string, string> = {
-  cursor: '👆', granny: '👵', bakery: '🏠', factory: '🏭',
-  mine: '⛏️', portal: '🌀', timelab: '⏳', moonbase: '🌙', singularity: '🕳️',
+  cursor: '👆', granny: '👵', bakery: '🏠', conveyor: '🛗', factory: '🏭',
+  mine: '⛏️', shipment: '🚚', reactor: '☢️', portal: '🌀', cloud: '☁️',
+  timelab: '⏳', moonbase: '🌙', quantum: '🔮', galaxy: '🌌',
+  singularity: '🕳️', multiverse: '♾️',
 }
 const U_ICONS: Record<string, string> = {
   click_mult: '💪', farm_mult: '🏭', energy_cap: '🔋', energy_regen: '⚡', passive_mult: '🧩',

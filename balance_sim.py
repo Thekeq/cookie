@@ -301,10 +301,14 @@ def simulate(name: str, sim_hours: float) -> dict:
             # часах текущего дохода и у прокачанного игрока это заметная сумма,
             # но здесь мы мерим кривую УРОВНЕЙ, и подмешивать в неё ещё один
             # источник дохода значит смешать два вопроса в одном числе.
-            if int(minute // 1440) != daily_done[0]:
-                daily_done[0] = int(minute // 1440)
-                st["xp"] += cfg.DAILY_QUESTS_PER_DAY * cfg.quest_reward_xp(st["level"])
-                st["xp"] += cfg.ORDERS_PER_DAY * cfg.order_reward_xp(2, st["level"])
+            day_now = int(minute // 1440)
+            if day_now != daily_done[0]:
+                # «отдых»: пропущенные дни дневного контента нельзя доиграть,
+                # без этой ручки возвращенца не вытянуть ничем общим
+                rest = cfg.rest_mult(day_now - daily_done[0]) if daily_done[0] >= 0 else 1.0
+                daily_done[0] = day_now
+                st["xp"] += cfg.DAILY_QUESTS_PER_DAY * cfg.quest_reward_xp(st["level"]) * rest
+                st["xp"] += cfg.ORDERS_PER_DAY * cfg.order_reward_xp(2, st["level"]) * rest
 
             if not head_start_done:
                 boost = max(25_000.0, base_income_ph() * head_start_h)
@@ -482,8 +486,16 @@ def check_invariants(st: dict) -> list:
     # стратегия честно предпочитает ферму (доля 0.38-0.75), а с 12-го держит клик
     # на 0.96-1.00 от разрешённого. Ровно на 10-м мерить нельзя — потолок растёт
     # вместе с уровнем, и сразу после левелапа доля проваливается на один тик.
+    #
+    # Спрашиваем это только у того, кто вообще тапает. Симуляция режет прирост
+    # от клика долей времени в сессии (см. gain_cps *= session/(session+pause)),
+    # и у профиля, который проводит в игре меньше 5% календаря, клик по
+    # построению стоит в двадцать раз меньше номинала — предпочесть ему ферму
+    # это не мёртвая ветка, а верный ответ. Ловим мы обратное: игрок тапает
+    # часами, а качать клик всё равно невыгодно.
     cap = cfg.click_max_level(st["level"])
-    if st["level"] >= 12 and st["click_level"] < cap * 0.9:
+    taps_enough = st["live_online_h"] >= 0.05 * st["hours"]
+    if taps_enough and st["level"] >= 12 and st["click_level"] < cap * 0.9:
         bad.append(f"[{name}] ветка клика мертва: {st['click_level']} при "
                    f"разрешённых {cap} на {st['level']}-м уровне")
 
@@ -556,10 +568,17 @@ def main():
         problems += check_invariants(st)
         misses += check_targets(st)
 
-    # Батл-пасс: цель 60-80% сезона у активной когорты
-    ref = runs.get("active") or runs.get("casual") or next(iter(runs.values()))
-    bp_days = battle_pass_days(ref)
+    # Батл-пасс: цель 60-80% сезона у активной когорты.
+    #
+    # Считаем ВСЕГДА на горизонте сезона, какой бы горизонт ни попросили в
+    # аргументах. Темп XP разгоняется вместе с игроком, поэтому средний темп за
+    # первые сутки экстраполируется в 17 дней, а за две недели — в 9; вопрос
+    # «влезает ли пасс в сезон» имеет ровно один осмысленный горизонт — сам сезон.
+    ref_name = "active" if "active" in runs else next(iter(runs))
     season = cfg.SEASON_LENGTH_DAYS
+    ref = (runs[ref_name] if runs[ref_name]["hours"] == season * 24
+           else simulate(ref_name, season * 24))
+    bp_days = battle_pass_days(ref)
     print(f"\nБатл-пасс ({cfg.BP_MAX_LEVEL} ур., {cfg.bp_total_xp(cfg.BP_MAX_LEVEL):,.0f} XP): "
           f"~{bp_days:.1f} дн. темпом «{ref['profile']}» при сезоне {season} дн. "
           f"({bp_days / season * 100:.0f}% сезона, цель 60-80%)")
@@ -568,8 +587,14 @@ def main():
     elif not 0.6 * season <= bp_days <= 0.8 * season:
         misses.append(f"батл-пасс занимает {bp_days / season * 100:.0f}% сезона, цель 60-80%")
 
-    # Абузер: во сколько раз обгоняет честного активного игрока
-    if "exploiter" in runs and "active" in runs:
+    # Абузер: во сколько раз обгоняет честного активного игрока.
+    #
+    # Требование про УСТОЙЧИВЫЙ отрыв, поэтому меряем от суток и дальше. На
+    # получасовом горизонте отношение задано не экономикой, а расписанием:
+    # абузер провёл в игре все 30 минут, активный — свои 15, и стартовый запас
+    # энергии обоим налит полным. Никакая ручка энергии этого не убирает, так
+    # что порог там ловил бы календарь профиля, а не дыру в балансе.
+    if "exploiter" in runs and "active" in runs and hours >= 24:
         adv = runs["exploiter"]["earned"] / max(1.0, runs["active"]["earned"])
         print(f"Абузер обгоняет активного в {adv:.1f} раза "
               f"(предел {EXPLOIT_MAX_ADVANTAGE})")

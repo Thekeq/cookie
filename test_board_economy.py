@@ -198,7 +198,7 @@ for _k, _v in cfg.FARM_BUILDINGS.items():
     check(f"farm {_k} pays back in {_min:.0f} min", 10 <= _min <= 90, f"{_min:.1f}")
 
 # --- буст пассивки мерджа ---
-check("passive lvl3 = 90/h", cfg.passive_income_per_hour(3) == 90)
+check("passive lvl3 = 5500/h", cfg.passive_income_per_hour(3) == 5500)
 
 # --- оффлайн-кап за Stars ---
 user = db.get_user(UID)

@@ -159,6 +159,11 @@ class DataBase:
                 # оставлены — их данные единственный след истории до миграции.
                 'bp_claimed_free': 'TEXT DEFAULT "[]"',
                 'bp_claimed_premium': 'TEXT DEFAULT "[]"',
+                # «отдых»: множитель XP дневного контента за пропущенные дни.
+                # Считается один раз в сутки и хранится, иначе первое задание дня
+                # съедало бы весь бонус (см. game_logic.rest_mult)
+                'rest_day': 'TEXT',
+                'rest_mult': 'REAL DEFAULT 1',
                 'farm_collected_at': 'REAL DEFAULT 0',      # когда забирали доход фермы
                 'active_skin': 'TEXT DEFAULT "classic"',    # скин большой печеньки
                 'created_at': 'REAL DEFAULT 0',
