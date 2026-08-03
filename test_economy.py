@@ -128,6 +128,26 @@ check("0.6 снимок earned сохранён",
 ec.backfill_opening()  # повторный вызов после отметки — должен быть no-op
 check("0.7 backfill не повторяется", len(ledger(OLD, "cookies")) == 1)
 
+# Испорченный остаток из старой базы. Раньше миграция падала на нём с
+# err_bad_amount, причём при ИМПОРТЕ модуля: один такой аккаунт уводил весь
+# процесс в цикл рестартов systemd после успешного во всём остальном деплоя.
+# xp, а не cookies: на cookies висит триггер, который такой UPDATE не пропустит,
+# а в боевой базе значение легло в колонку ещё ДО появления триггера.
+BROKEN = BASE + 90
+db.create_user(BROKEN, "broken", "Broken")
+db.exec("UPDATE users SET xp = 1e300, cookies = 100 WHERE user_id = ?", (BROKEN,))
+db.exec("DELETE FROM schema_migrations WHERE name = ?", ("backfill:ledger_opening",))
+ec.backfill_opening()   # не должен бросить: повторные строки гасит idempotent
+check("0.8 миграция пережила испорченный остаток",
+      db.get_user(BROKEN)["xp"] == ec.LEGACY_CAP, db.get_user(BROKEN)["xp"])
+check("0.9 в книгу ушло уже починенное значение",
+      len(ledger(BROKEN, "xp")) == 1
+      and ledger(BROKEN, "xp")[0]["amount"] == ec.LEGACY_CAP)
+check("0.10 колонка сходится с книгой после починки",
+      abs(ec.reconcile(BROKEN)["xp"]["drift"]) < 1e-6, ec.reconcile(BROKEN)["xp"])
+check("0.11 здоровые остатки соседа не задвоились",
+      len(ledger(OLD, "cookies")) == 1)
+
 # ==========================================================================
 # 1. Инварианты баланса (триггер trg_users_balance_sane)
 # ==========================================================================

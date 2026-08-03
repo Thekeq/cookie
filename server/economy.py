@@ -18,6 +18,7 @@
 книги — баг, его найдёт `reconcile`.
 """
 import json
+import logging
 import math
 import time
 import uuid
@@ -61,6 +62,10 @@ EXTERNAL = ("stars",)
 LEDGERED_PARTIAL = ("energy", "bp_xp")
 
 MAX_ABS = 1e15
+# Куда обрезается испорченный остаток из старой базы (см. _legacy_value).
+# Строго меньше MAX_ABS: и CHECK на economy_ledger.amount, и триггер на
+# users.cookies сравнивают с 1e15 строго, поэтому само значение они отвергнут.
+LEGACY_CAP = math.nextafter(MAX_ABS, 0.0)
 
 
 class ConflictError(Exception):
@@ -226,6 +231,44 @@ def prune_ops(ttl_days: float) -> int:
 
 # ---------- входящие остатки ----------
 
+def _legacy_value(user_id: int, column: str, value) -> float:
+    """Остаток из старой базы, приведённый к тому, что книга примет.
+
+    До книги баланс считался в Python и записывался колонкой целиком, поэтому в
+    базе, пережившей те версии, встречаются NaN и inf (деление на ноль в
+    расчёте дохода) и числа за пределами MAX_ABS. Такой остаток нельзя ни
+    записать (`_sane` его отвергает), ни пропустить (колонка разошлась бы с
+    книгой навсегда, и сверка кричала бы на этого игрока каждый день).
+
+    Раньше миграция на нём падала — и падала при ИМПОРТЕ модуля, то есть один
+    испорченный аккаунт уводил весь процесс в цикл рестартов, причём после
+    успешного деплоя и с виду верным конфигом.
+
+    Поэтому чиним данные, а не ослабляем проверку: NaN и inf становятся нулём
+    (арифметически такой баланс всё равно мёртв — любая операция с ним снова
+    даёт NaN), слишком большое обрезается до MAX_ABS. Колонка тут же приводится
+    к тому же значению — иначе книга разойдётся с ней в первый же день.
+
+    Отрицательный великан уходит в ноль, а не в -MAX_ABS: на cookies висит
+    триггер trg_users_balance_sane с нижней границей -1e6, и «починка» ниже неё
+    сама же оборвала бы транзакцию с 'balance_insane'. Верхняя планка — не сам
+    MAX_ABS, а ближайшее меньшее число: CHECK книги требует amount СТРОГО
+    меньше 1e15, и ровно 1e15 он бы не принял."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = 0.0
+    if math.isfinite(num) and abs(num) <= MAX_ABS:
+        return num
+    fixed = LEGACY_CAP if math.isfinite(num) and num > 0 else 0.0
+    logging.error("миграция книги: у %s колонка %s = %r — заменена на %s",
+                  user_id, column, value, fixed)
+    # имя колонки берётся из CURRENCY_COLUMN, а не из запроса — подстановка
+    # безопасна, параметром имя колонки передать нельзя
+    db.exec(f"UPDATE users SET {column} = ? WHERE user_id = ?", (fixed, user_id))
+    return fixed
+
+
 def backfill_opening():
     """Заводит в книгу тех, кто пришёл в игру до неё.
 
@@ -242,7 +285,7 @@ def backfill_opening():
     for u in users:
         with db.tx():
             for currency, column in CURRENCY_COLUMN.items():
-                value = u[column] or 0
+                value = _legacy_value(u["user_id"], column, u[column] or 0)
                 if not value:
                     continue
                 record(u["user_id"], currency, value, "opening_balance", value,
