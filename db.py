@@ -720,15 +720,20 @@ class DataBase:
             self.connection.backup(dest)
         finally:
             dest.close()
-        self._prune_snapshots(folder, ".bak", keep)
+        self._prune_snapshots(folder, os.path.basename(self.db_file) + ".",
+                              ".bak", keep)
         return path
 
     @staticmethod
-    def _prune_snapshots(folder: str, suffix: str, keep: int):
-        # у всех снимков одинаковый префикс, а дальше идёт UTC-метка в
-        # сортируемом формате — поэтому лексикографический порядок и есть
-        # хронологический, отдельная сортировка по mtime не нужна
-        old = sorted(f for f in os.listdir(folder) if f.endswith(suffix))
+    def _prune_snapshots(folder: str, prefix: str, suffix: str, keep: int):
+        # Чистим ТОЛЬКО снимки этой базы: в одной папке легко оказываются файлы
+        # с другим префиксом (переименовали базу, рядом второй экземпляр), и
+        # тогда лексикографический порядок перестаёт быть хронологическим —
+        # свежий снимок уезжает в начало списка и удаляется сразу после
+        # создания. Внутри одного префикса дальше идёт UTC-метка в сортируемом
+        # формате, поэтому порядок имён и есть порядок времени.
+        old = sorted(f for f in os.listdir(folder)
+                     if f.startswith(prefix) and f.endswith(suffix))
         for name in old[:-keep] if keep > 0 else old:
             try:
                 os.remove(os.path.join(folder, name))
@@ -771,7 +776,7 @@ class DataBase:
             # stderr pg_dump пароля не содержит — он не в argv и не в выводе
             raise RuntimeError(
                 f"pg_dump вернул {res.returncode}: {res.stderr.strip()[:500]}")
-        self._prune_snapshots(folder, ".dump", keep)
+        self._prune_snapshots(folder, name + ".", ".dump", keep)
         return path
 
     # ---------- диалект: DDL ----------

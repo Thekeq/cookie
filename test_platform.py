@@ -219,6 +219,12 @@ for path in pathlib.Path(".").rglob("*.py"):
     parts = set(path.parts)
     if "__pycache__" in parts or path.name.startswith(("test_", "temp_")):
         continue
+    # deploy/ — не приложение, а инструменты вокруг него. Скрипт выкладки
+    # работает РОВНО в тот момент, когда код приложения подменяется, и импорт
+    # server.settings означал бы, что выкладка падает от поломки в том, что она
+    # выкатывает. Свои переменные он читает сам и из окружения юнита.
+    if "deploy" in parts:
+        continue
     if path.name in ("settings.py", "simplay.py", "balance_sim.py"):
         continue
     text = path.read_text(encoding="utf-8")

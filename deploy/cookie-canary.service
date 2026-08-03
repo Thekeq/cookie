@@ -1,0 +1,53 @@
+[Unit]
+# Канарейка: та же роль api, но из ОТДЕЛЬНОГО каталога и на отдельном порту.
+# Отдельный каталог принципиален: код парка и код канарейки существуют
+# одновременно, и общий каталог означал бы, что выкладка канарейки уже
+# подменила код всем — то есть ровно то, чего канарейка должна избежать.
+#
+# Планировщика здесь нет и быть не может: вторая копия — это второй ролловер
+# сезона, второй бэкап и вторая рассылка. ROLE=api это и запрещает.
+Description=Cookie Merge — канарейка (API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cookie
+Group=cookie
+WorkingDirectory=/opt/cookie-canary
+# .env общий с парком: база, Redis, токены и ключи у них одни. Отличаются
+# ровно три вещи, и все три заданы здесь.
+EnvironmentFile=/opt/cookie/.env
+Environment=ROLE=api
+Environment=BOT_MODE=webhook
+Environment=PORT=8001
+# Своя полка метрик в Redis. Без неё /metrics канарейки отдавал бы сумму по
+# всему парку: её собственные пятисотки растворились бы в трафике здоровых
+# процессов, и наблюдение показывало бы «всё хорошо» ровно тогда, когда плохо.
+Environment=METRICS_NAMESPACE=canary
+# Свой файл логов: ротация — это переименование, и два процесса, ротирующих
+# один файл, теряют на ней записи.
+Environment=LOG_FILE=/opt/cookie-canary/cookie-canary.log
+# Один воркер намеренно: канарейка берёт 5-10% трафика, ей хватает, а лишние
+# процессы усложняют чтение её же метрик.
+Environment=WEB_CONCURRENCY=1
+ExecStart=/opt/cookie-canary/venv/bin/python main.py
+# Restart=on-failure, а не always: канарейку ГАСЯТ штатно, командой отката, и
+# always поднимал бы её обратно под трафик, который у неё только что отобрали.
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cookie-canary /opt/cookie
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+# WantedBy отсутствует намеренно: канарейка не должна подниматься сама после
+# перезагрузки машины. Её включает выкладка и выключает откат.

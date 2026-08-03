@@ -49,8 +49,12 @@ from server import cache, settings
 log = logging.getLogger(__name__)
 
 # Префикс ключей в Redis — тот же, что у остального разделяемого состояния.
-_COUNTER_KEY = cache.PREFIX + "m:counter"
-_HIST_KEY = cache.PREFIX + "m:hist"
+# METRICS_NAMESPACE разводит по разным полкам парк и канарейку: состояние
+# лимитера у них общее намеренно, а счётчики — нет, иначе доля отказов новой
+# версии считалась бы вместе со старой и не была бы видна вовсе.
+_NS = (settings.METRICS_NAMESPACE + ":") if settings.METRICS_NAMESPACE else ""
+_COUNTER_KEY = cache.PREFIX + "m:" + _NS + "counter"
+_HIST_KEY = cache.PREFIX + "m:" + _NS + "hist"
 
 
 # ---------- корреляция ----------
@@ -149,6 +153,8 @@ META = {
     "db_queries_total": ("counter", "Запросы к базе по типу"),
     "db_query_seconds": ("histogram", "Время запроса к базе"),
     "db_tx_retries_total": ("counter", "Повторы BEGIN IMMEDIATE (база занята)"),
+    "db_dirty_connections_total": ("counter", "Соединения, выброшенные с "
+                                   "залипшей транзакцией"),
     "economy_minted_total": ("counter", "Начислено валюты по книге операций"),
     "economy_spent_total": ("counter", "Списано валюты по книге операций"),
     "economy_refunded_total": ("counter", "Возвращено валюты (refund Stars)"),

@@ -531,9 +531,25 @@ except OSError as e:
 finally:
     backup.db.snapshot = _real_snapshot
 
+# Чужие снимки в той же папке (переименовали базу, рядом второй экземпляр) не
+# должны участвовать в чистке этой базы: сортировка по имени в перемешанных
+# префиксах перестаёт быть хронологической, и свежий снимок удаляется сразу
+# после создания — бэкап «прошёл», а файла нет
+_folder = db._backups_folder()
+_decoys = [os.path.join(_folder, f"zzz-other.db.2020010{i}-000000.bak")
+           for i in range(1, 9)]
+for _d in _decoys:
+    with open(_d, "wb") as _f:
+        _f.write(b"\x00" * 16)
+
 _info = backup.run()
 check("7.3 после освобождения места бэкап снова проходит",
       _info["size"] > backup.MIN_SIZE)
+check("7.3a чужие снимки в папке не съедают свежий",
+      os.path.exists(_info["path"]))
+for _d in _decoys:
+    if os.path.exists(_d):
+        os.remove(_d)
 _drill = backup.drill()
 check(f"7.4 учения берут САМЫЙ СВЕЖИЙ снимок ({_drill['snapshot']})",
       _drill["snapshot"] == os.path.basename(_info["path"]))
