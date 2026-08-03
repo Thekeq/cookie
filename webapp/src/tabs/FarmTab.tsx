@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import { fmt, useGame } from '../App'
+import { fmt, fmtRate, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { FarmState } from '../types'
@@ -75,7 +75,7 @@ export default function FarmTab() {
             <div className="hint">{t('farm_hint', { n: farm.offline_cap_hours })}</div>
           </div>
           <div style={{ fontWeight: 800, color: 'var(--good)', whiteSpace: 'nowrap' }}>
-            +{fmt(farm.cps)}/s
+            +{fmtRate(farm.cps)}/s
           </div>
         </div>
       </div>
@@ -108,7 +108,7 @@ export default function FarmTab() {
                 {t(('b_' + b.key) as any)} {b.owned > 0 && <span className="hint">×{b.owned}</span>}
               </b>
               <div className="hint">
-                +{fmt(b.cps_each)}/s {b.owned > 0 && `(= ${fmt(b.cps_each * b.owned)}/s)`}
+                +{fmtRate(b.cps_each)}/s {b.owned > 0 && `(= ${fmtRate(b.cps_each * b.owned)}/s)`}
               </div>
             </div>
             {b.maxed ? (

@@ -44,6 +44,16 @@ export function fmt(n: number): string {
   return (n / 1000 ** tier).toFixed(1) + SUFFIX[tier]
 }
 
+// Скорость (cookies/с), а не запас. Отдельно от fmt потому, что fmt округляет
+// вниз до целого — для баланса это правильно (дробных печенек игрок не видит),
+// а для скорости это ложь: у бабушки 0.9/с, и в шапке она писалась «+0/s», то
+// есть постройка выглядела сломанной сразу после покупки.
+export function fmtRate(n: number): string {
+  if (!isFinite(n)) return '∞'
+  if (n > 0 && n < 100) return String(Math.round(n * 10) / 10)
+  return fmt(n)
+}
+
 export default function App() {
   const [lang, setLangState] = useState<Lang>(loadLang())
   const setLang = (l: Lang) => {
