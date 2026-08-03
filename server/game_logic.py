@@ -497,14 +497,17 @@ def claim_quest(user: dict, key: str) -> dict:
         raise ValueError("err_claimed")
     reward = quest_reward_cookies(user["user_id"], key, income)
     bp_xp = int(q["reward_bp_xp"] * bp_catchup_mult(user))
+    xp = cfg.quest_reward_xp(user["level"])
     with db.tx():  # отметка + печеньки + BP XP — одним куском
         # условный UPDATE: параллельный клейм не выдаст награду дважды
         if db.exec("UPDATE daily_quests SET claimed = 1 WHERE id = ? AND claimed = 0",
                    (row["id"],)) == 0:
             raise ValueError("err_claimed")
         add_cookies(user["user_id"], reward, count_earned=False)
-        add_xp(user["user_id"], 0, bp_xp)
-    return {"reward_cookies": reward, "reward_bp_xp": bp_xp}
+        # XP уровня, а не только батл-пасса: дневной контент — единственный
+        # источник прогресса, не зависящий от темпа тапа (см. QUEST_XP_SHARE)
+        add_xp(user["user_id"], xp, bp_xp)
+    return {"reward_cookies": reward, "reward_bp_xp": bp_xp, "reward_xp": xp}
 
 
 def claimable_quests_count(user_id: int) -> int:
@@ -1487,9 +1490,16 @@ def board_base_income(user_id: int) -> float:
        доски вверх, а доход печеньки остаётся константой, и доска умирает;
     2) без множителей — иначе престиж поднимал бы цены ровно во столько же
        раз, во сколько доход, спавнов в час было бы столько же, и престиж
-       вообще не ускорял бы набор XP (то есть был бы бессмыслен)."""
+       вообще не ускорял бы набор XP (то есть был бы бессмыслен).
+
+    Премия за рекорд тира (record_multiplier) — исключение и входит СЮДА: она
+    относится к самой доске, а не к внешним бустам, и цена спавна обязана расти
+    вместе с ней, иначе окупаемость предмета падает с 12 часов до полутора."""
     rows = db.q("SELECT item_level FROM board WHERE user_id = ?", (user_id,))
-    return sum(cfg.passive_income_per_hour(r["item_level"]) for r in rows)
+    user = db.get_user(user_id)
+    record = (user["best_item_level"] or 0) if user else 0
+    return sum(cfg.passive_income_per_hour(r["item_level"])
+               for r in rows) * cfg.record_multiplier(record)
 
 
 def passive_per_hour(user_id: int) -> float:
@@ -1922,7 +1932,11 @@ def claim_order(user: dict, order_id: int | None = None,
         add_cookies(uid, reward, count_earned=False,
                     operation_id=f"order_claim:{row['id']}",
                     reason="order_reward", ref_type="order", ref_id=str(row["id"]))
-        add_xp(uid, 0, bp_xp)
+        # XP уровня, а не только батл-пасса (см. ORDER_XP_SHARE). Сложность
+        # берём через _order_difficulty: шаблон в строке мог остаться от старой
+        # версии конфига, и обращение по ключу уронило бы клейм заказа.
+        add_xp(uid, cfg.order_reward_xp(_order_difficulty(row["template"]),
+                                        user["level"]), bp_xp)
         _bump_orders_day(uid, day, completed=True)
     track(uid, "order_done")
     if first:
@@ -2486,6 +2500,7 @@ def full_state(user_id: int) -> dict:
     board = db.q("SELECT cell, item_level FROM board WHERE user_id = ? ORDER BY cell", (user_id,))
     items_count = len(board)
     board_income = board_base_income(user_id)  # цены спавна — только от доски
+    record = user["best_item_level"] or 0      # премия за рекорд входит и в цену
     base_income = income_base(user_id)        # сила клика — от фермы и доски
     nxt = user["level"] + 1
     eff = upgrade_effects(user_id)
@@ -2540,13 +2555,14 @@ def full_state(user_id: int) -> dict:
         "skins_owned": sorted(owned_skins),
         "board": board,
         "board_cells": board_cells_state(user),
-        "spawn_cost": cfg.spawn_cost(items_count, board_income),
+        "spawn_cost": cfg.spawn_cost(items_count, board_income, record=record),
         # прямая покупка печенек выше 1 lvl: доступные уровни и цены.
         # Отдаём только реально доступные тиры: цены за 21 lvl (6.5 млн часов
         # дохода) — мусор в ответе, который фронт всё равно не показывает
         "spawn_direct": {
             "max_level": _direct_max_level(user),
-            "costs": {str(l): cfg.direct_spawn_cost(l, items_count, board_income)
+            "costs": {str(l): cfg.direct_spawn_cost(l, items_count, board_income,
+                                                    record=record)
                       for l in range(1, _direct_max_level(user) + 2)},
         },
         # бейдж на вкладке пекарни: активный заказ выполнен и ждёт сдачи

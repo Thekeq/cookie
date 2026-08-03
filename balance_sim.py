@@ -105,6 +105,8 @@ def simulate(name: str, sim_hours: float) -> dict:
         "maxed_at_h": None, "earned_at_max": None, "online_at_max": None,
     }
     earned_src = {"farm": 0.0, "board": 0.0, "click": 0.0}
+    click_xp_day = [-1, 0.0]      # [номер суток, кликов за эти сутки]
+    daily_done = [-1]             # сутки, за которые уже забран дневной контент
     log_events = []
     level_at = {}          # уровень -> минута, когда взят
     earned_at_level = {}   # уровень -> сколько всего заработано к этому моменту
@@ -113,7 +115,9 @@ def simulate(name: str, sim_hours: float) -> dict:
         return sum(cfg.FARM_BUILDINGS[k]["cps"] * v for k, v in st["buildings"].items())
 
     def board_income_ph():
-        return sum(cfg.passive_income_per_hour(l) for l in st["board"])
+        # премия за рекорд тира — то, ради чего вообще имеет смысл сливать
+        return (sum(cfg.passive_income_per_hour(l) for l in st["board"])
+                * cfg.record_multiplier(st["best_item"]))
 
     def base_income_ph():
         """Доход без кликов — от него считается сила клика (как в game_logic)."""
@@ -174,6 +178,9 @@ def simulate(name: str, sim_hours: float) -> dict:
         while spent_something:
             spent_something = False
             best, best_ratio, best_cost, best_kind = None, 0.0, 0.0, None
+            # Сливаем ДО оценки покупок: слияние освобождает клетку, и без него
+            # доска выглядела бы полной, а покупка на неё — невозможной.
+            merge_board()
 
             # клик: прирост дохода считаем по реальному темпу тапа в сессии
             base = base_income_ph()
@@ -191,10 +198,32 @@ def simulate(name: str, sim_hours: float) -> dict:
             for key, b in cfg.FARM_BUILDINGS.items():
                 if st["level"] < b["req_level"]:
                     continue
-                cost = cfg.building_cost(key, st["buildings"].get(key, 0))
+                if st["best_item"] < b.get("req_record", 0):
+                    continue      # ферма выше середины требует прогресса доски
+                owned = st["buildings"].get(key, 0)
+                if owned >= cfg.FARM_MAX_COPIES:
+                    continue      # здание упёрлось в потолок копий
+                cost = cfg.building_cost(key, owned)
                 ratio = b["cps"] / cost
                 if st["cookies"] >= cost and ratio > best_ratio:
                     best, best_ratio, best_cost, best_kind = key, ratio, cost, "building"
+
+            # Доска сравнивается ТОЙ ЖЕ метрикой, что ферма и клик: прирост
+            # дохода на печеньку. Раньше она стояла в ветке «если денег не
+            # хватило больше ни на что», то есть стенд по построению не мог
+            # показать её долю выше остатков — а именно долю доски мы и меряем.
+            cells = cfg.merge_cells_unlocked(st["level"], 0)
+            if len(st["board"]) < cells:
+                direct_cap = max(1, max_item_unlocked() - cfg.SPAWN_DIRECT_GAP)
+                for lvl in range(direct_cap, 0, -1):
+                    cost = cfg.direct_spawn_cost(lvl, len(st["board"]),
+                                                 record=st["best_item"])
+                    gain_cps = (cfg.passive_income_per_hour(lvl)
+                                * cfg.record_multiplier(st["best_item"]) / 3600.0)
+                    if st["cookies"] >= cost and gain_cps / cost > best_ratio:
+                        best, best_ratio = lvl, gain_cps / cost
+                        best_cost, best_kind = cost, "board"
+                        break        # ниже тир — хуже отношение, дальше не смотрим
 
             if best_kind == "click":
                 st["cookies"] -= best_cost
@@ -206,22 +235,13 @@ def simulate(name: str, sim_hours: float) -> dict:
                 st["buildings"][best] = st["buildings"].get(best, 0) + 1
                 spent_something = True
                 continue
-            # доска: сначала СЛИВАЕМ (именно заполненная доска и требует слияния —
-            # иначе стенд замирал с полной доской неслитых предметов), потом
-            # покупаем самый высокий тир, который можем себе позволить
-            merge_board()
-            cells = cfg.merge_cells_unlocked(st["level"], 0)
-            if len(st["board"]) < cells:
-                direct_cap = max(1, max_item_unlocked() - cfg.SPAWN_DIRECT_GAP)
-                for lvl in range(direct_cap, 0, -1):
-                    cost = cfg.direct_spawn_cost(lvl, len(st["board"]))
-                    if st["cookies"] >= cost:
-                        st["cookies"] -= cost
-                        st["board"].append(lvl)
-                        claim_record(lvl)
-                        merge_board()
-                        spent_something = True
-                        break
+            if best_kind == "board":
+                st["cookies"] -= best_cost
+                st["board"].append(best)
+                claim_record(best)
+                merge_board()
+                spent_something = True
+                continue
 
     def online_at(minute: int) -> bool:
         """Игрок в приложении? Учитывает и суточный цикл возвращенца."""
@@ -273,6 +293,19 @@ def simulate(name: str, sim_hours: float) -> dict:
             online_min += 1
             earned_by_online.append(st["earned"])
 
+            # Дневной контент: три задания и пять заказов. Моделируем как
+            # выполненные за первый заход суток — цели у них мелкие (80-500
+            # кликов, 5-15 мерджей), пятиминутной сессии хватает.
+            #
+            # Награда печеньками намеренно НЕ моделируется: она считается в
+            # часах текущего дохода и у прокачанного игрока это заметная сумма,
+            # но здесь мы мерим кривую УРОВНЕЙ, и подмешивать в неё ещё один
+            # источник дохода значит смешать два вопроса в одном числе.
+            if int(minute // 1440) != daily_done[0]:
+                daily_done[0] = int(minute // 1440)
+                st["xp"] += cfg.DAILY_QUESTS_PER_DAY * cfg.quest_reward_xp(st["level"])
+                st["xp"] += cfg.ORDERS_PER_DAY * cfg.order_reward_xp(2, st["level"])
+
             if not head_start_done:
                 boost = max(25_000.0, base_income_ph() * head_start_h)
                 st["cookies"] += boost
@@ -294,7 +327,18 @@ def simulate(name: str, sim_hours: float) -> dict:
             earned_src["click"] += gain
             st["cookies"] += gain
             st["earned"] += gain
-            st["xp"] += clicks * 0.5
+            # XP за клики — с дневным софт-капом, как в game_logic. Плоские 0.5
+            # за клик завышали именно тех, кого кап и придуман сдерживать:
+            # casual нащёлкивает 36 000 кликов в сутки, то есть 18 000 XP вместо
+            # 8 250. Стенд показывал 30 уровень там, где игра даёт 22.
+            day = int(minute // 1440)
+            if day != click_xp_day[0]:
+                click_xp_day[0], click_xp_day[1] = day, 0.0
+            before_cap = max(0.0, cfg.CLICK_XP_SOFT_CAP - click_xp_day[1])
+            cheap = min(clicks, before_cap)
+            st["xp"] += cheap * cfg.CLICK_XP_RATE \
+                + (clicks - cheap) * cfg.CLICK_XP_RATE_CAPPED
+            click_xp_day[1] += clicks
 
             before = st["cookies"]
             try_spend()
@@ -323,19 +367,23 @@ def simulate(name: str, sim_hours: float) -> dict:
         надо на текущем количестве зданий."""
         best = None
         for key, b in cfg.FARM_BUILDINGS.items():
-            if st["level"] < b["req_level"]:
+            if st["level"] < b["req_level"] or st["best_item"] < b.get("req_record", 0):
                 continue
-            h = cfg.building_cost(key, st["buildings"].get(key, 0)) / (b["cps"] * 3600)
+            owned = st["buildings"].get(key, 0)
+            if owned >= cfg.FARM_MAX_COPIES:
+                continue
+            h = cfg.building_cost(key, owned) / (b["cps"] * 3600)
             best = h if best is None else min(best, h)
         return best
 
     def board_payback_hours():
         """Окупаемость следующей покупки на доску, в часах."""
         lvl = max(1, max_item_unlocked() - cfg.SPAWN_DIRECT_GAP)
-        inc = cfg.passive_income_per_hour(lvl)
+        inc = cfg.passive_income_per_hour(lvl) * cfg.record_multiplier(st["best_item"])
         if inc <= 0:
             return None
-        return cfg.direct_spawn_cost(lvl, len(st["board"])) / inc
+        return cfg.direct_spawn_cost(lvl, len(st["board"]),
+                                     record=st["best_item"]) / inc
 
     # Форма кривой заработка: какая доля всего заработка ушла на ПОСЛЕДНЮЮ ПЯТУЮ
     # ЧАСТЬ ВЗЯТЫХ УРОВНЕЙ. Ось — прогресс, а не время, и это принципиально:

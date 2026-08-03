@@ -109,13 +109,19 @@ export default function FarmTab() {
                 +{fmt(b.cps_each)}/s {b.owned > 0 && `(= ${fmt(b.cps_each * b.owned)}/s)`}
               </div>
             </div>
-            {b.unlocked ? (
+            {b.maxed ? (
+              <span className="hint" style={{ fontSize: 12 }}>{t('farm_maxed', { n: b.max_copies })}</span>
+            ) : b.unlocked ? (
               <button className="claim-chip" disabled={liveBalance < b.cost}
                       onClick={() => post('/api/farm/buy_building', b.key, true)}>
                 🍪 {fmt(b.cost)}
               </button>
             ) : (
-              <span className="hint" style={{ fontSize: 12 }}>🔒 {t('req_level', { n: b.req_level })}</span>
+              <span className="hint" style={{ fontSize: 12 }}>
+                🔒 {b.lock === 'record'
+                  ? t('req_record', { n: b.req_record })
+                  : t('req_level', { n: b.req_level })}
+              </span>
             )}
           </div>
         ))}

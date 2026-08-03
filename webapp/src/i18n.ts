@@ -77,6 +77,8 @@ const dict = {
   applied: { en: 'Applied', uk: 'Активний', ru: 'Активен' },
   apply: { en: 'Apply', uk: 'Обрати', ru: 'Выбрать' },
   req_level: { en: 'Level {n} required', uk: 'Потрібен {n} рівень', ru: 'Нужен {n} уровень' },
+  req_record: { en: 'Merge tier {n} required', uk: 'Потрібен {n} тир на дошці', ru: 'Нужен {n} тир на доске' },
+  farm_maxed: { en: 'MAX ×{n}', uk: 'МАКС ×{n}', ru: 'МАКС ×{n}' },
   not_enough: { en: 'Not enough cookies', uk: 'Не вистачає печива', ru: 'Не хватает печенек' },
 
   // названия зданий/апгрейдов
@@ -297,6 +299,8 @@ const dict = {
   err_check_failed: { en: 'Could not verify subscription', uk: 'Не вдалося перевірити підписку', ru: 'Не удалось проверить подписку' },
   err_not_subscribed: { en: 'Subscribe to the channel first', uk: 'Спочатку підпишись на канал', ru: 'Сначала подпишись на канал' },
   err_req_level: { en: 'Level {n} required', uk: 'Потрібен {n} рівень', ru: 'Нужен {n} уровень' },
+  err_req_record: { en: 'Merge tier {n} required', uk: 'Потрібен {n} тир на дошці', ru: 'Нужен {n} тир на доске' },
+  err_max_copies: { en: 'Max {n} of this building', uk: 'Максимум {n} таких будівель', ru: 'Максимум {n} таких зданий' },
   err_owned: { en: 'Already owned', uk: 'Вже придбано', ru: 'Уже куплено' },
   err_not_owned: { en: 'Not purchased', uk: 'Не придбано', ru: 'Не куплено' },
 

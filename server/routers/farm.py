@@ -39,13 +39,24 @@ def _farm_payload(tg: dict) -> dict:
     owned_skins.add("classic")
 
     buildings = []
+    record = user["best_item_level"] or 0
     for key, b in cfg.FARM_BUILDINGS.items():
         owned = counts.get(key, 0)
+        req_record = b.get("req_record", 0)
         buildings.append({
             "key": key, "owned": owned, "cps_each": b["cps"],
             "cost": cfg.building_cost(key, owned),
             "req_level": b["req_level"],
-            "unlocked": user["level"] >= b["req_level"],
+            # оба требования и потолок копий уходят на фронт: кнопка обязана
+            # объяснить, почему она погасла, а не отдавать ошибку по тапу
+            "req_record": req_record,
+            "max_copies": cfg.FARM_MAX_COPIES,
+            "maxed": owned >= cfg.FARM_MAX_COPIES,
+            "unlocked": user["level"] >= b["req_level"] and record >= req_record,
+            # причину замка считает сервер: у фронта нет рекорда тира под рукой,
+            # а два разных замка нельзя показывать одной подписью «нужен уровень»
+            "lock": ("level" if user["level"] < b["req_level"]
+                     else "record" if record < req_record else None),
         })
     upgrades = []
     for key, u in cfg.COOKIE_UPGRADES.items():
@@ -105,7 +116,14 @@ def _buy_building(body: "KeyIn", tg: dict) -> dict:
     # проверяем тот же баланс, что видит игрок, без гонок параллельных покупок
     with db.tx():
         user = gl.collect_all(tg["id"])
+        # рекорд тира и потолок копий проверяем ВНУТРИ транзакции: оба читаются
+        # из строки игрока, которую параллельная покупка/мердж могли изменить
+        req_record = b.get("req_record", 0)
+        if (user["best_item_level"] or 0) < req_record:
+            raise HTTPException(400, f"err_req_record|{req_record}")
         owned = gl.farm_counts(tg["id"]).get(body.key, 0)
+        if owned >= cfg.FARM_MAX_COPIES:
+            raise HTTPException(400, f"err_max_copies|{cfg.FARM_MAX_COPIES}")
         cost = cfg.building_cost(body.key, owned)
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")

@@ -300,7 +300,8 @@ async def spawn(body: SpawnIn = SpawnIn(), tg: dict = Depends(require_revision))
         if level > max_direct:
             raise HTTPException(400, f"err_direct_cap|{max_direct}")
 
-        cost = cfg.direct_spawn_cost(level, len(board), gl.board_base_income(tg["id"]))
+        cost = cfg.direct_spawn_cost(level, len(board), gl.board_base_income(tg["id"]),
+                                     record=user["best_item_level"] or 0)
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
         cell = _best_free_cell(free_cells, board)

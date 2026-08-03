@@ -97,26 +97,55 @@ SPAWN_L1_BASE = 50.0            # база спавна печеньки 1 ур�
 # полностью реинвестированной доски удваивался каждые ~5.5ч.
 ITEM_PAYBACK_HOURS = 12.0
 
-def spawn_cost(items_on_board: int, board_income_per_hour: float = 0.0) -> float:
-    """Цена спавна печеньки lvl1. board_income_per_hour оставлен в сигнатуре
-    для совместимости вызовов и будущих правок — на цену L1 он не влияет."""
-    return SPAWN_L1_BASE * (SPAWN_COST_GROWTH ** items_on_board)
+# Премия за рекорд тира. Доска физически ограничена (12-25 клеток и потолок
+# тира по уровню), ферма — нет, поэтому без премии merge-цикл к середине игры
+# давал 2-7% дохода и превращался в декорацию при живой ферме. Премия — ровно
+# то, чего не хватало: множитель ко ВСЕЙ доске за каждый новый личный рекорд.
+#
+# Почему за рекорд, а не за мердж. Награда за каждое слияние умножилась бы на
+# число спавнов (дерево слияния до тира L стоит 2^(L-1) спавнов) и доска
+# разогналась бы сама — этим уже болел PASSIVE_GROWTH = 2.15. Рекорд берётся
+# один раз за тир и вверх, поэтому премия ограничена сверху конструкцией:
+# 1.10^21 ≈ 7.4 на максимальном тире, и больше не станет никогда.
+MERGE_RECORD_BONUS = 0.10
+MERGE_RECORD_FROM = 3           # тиры ниже третьего дохода не дают вовсе
 
-def item_base_price(level: int) -> float:
+def record_multiplier(best_item_level: int) -> float:
+    """Множитель дохода доски за личный рекорд тира."""
+    steps = max(0, int(best_item_level or 0) - MERGE_RECORD_FROM)
+    return (1.0 + MERGE_RECORD_BONUS) ** steps
+
+def spawn_cost(items_on_board: int, board_income_per_hour: float = 0.0,
+               record: int = 0) -> float:
+    """Цена спавна печеньки lvl1. board_income_per_hour оставлен в сигнатуре
+    для совместимости вызовов и будущих правок — на цену L1 он не влияет.
+
+    Премия за рекорд входит в цену ровно так же, как в доход: иначе она
+    удешевляла бы весь путь слияния в те же 7.4 раза, окупаемость предмета
+    падала бы с 12 часов до полутора, и доска снова стала бы печатным станком.
+    С премией в обеих частях ITEM_PAYBACK_HOURS означает то, что написано в
+    имени, на любом рекорде."""
+    return (SPAWN_L1_BASE * (SPAWN_COST_GROWTH ** items_on_board)
+            * record_multiplier(record))
+
+def item_base_price(level: int, record: int = 0) -> float:
     """Сколько предмет производит за ITEM_PAYBACK_HOURS часов."""
     return max(SPAWN_L1_BASE,
-               passive_income_per_hour(level) * ITEM_PAYBACK_HOURS)
+               passive_income_per_hour(level) * ITEM_PAYBACK_HOURS) \
+        * record_multiplier(record)
 
 # топ-тиры только слиянием: напрямую можно купить максимум unlocked - 3
 SPAWN_DIRECT_GAP = 3
 
 def direct_spawn_cost(level: int, items_on_board: int,
-                      board_income_per_hour: float = 0.0) -> float:
+                      board_income_per_hour: float = 0.0,
+                      record: int = 0) -> float:
     """Прямая покупка тира: окупается за ITEM_PAYBACK_HOURS часов + та же
     надбавка за заполненность. Всегда дороже пути слияния — слияние выгоднее."""
     if level <= 1:
-        return spawn_cost(items_on_board, board_income_per_hour)
-    return item_base_price(level) * (SPAWN_COST_GROWTH ** items_on_board)
+        return spawn_cost(items_on_board, board_income_per_hour, record)
+    return (item_base_price(level, record)
+            * (SPAWN_COST_GROWTH ** items_on_board))
 
 # Мусорка/печь: перетащил печеньку — клетка освободилась, вернулась часть цены.
 # Возврат считается от ФАКТИЧЕСКИ вложенного (board.paid), а не от текущей цены:
@@ -161,7 +190,7 @@ def merge_reward_xp(new_level: int) -> float:
 # Доля разрыва между уровнями, которую закрывает рекорд тира. Остальное игрок
 # добирает временнЫм контентом: заказы, квесты, дейлики, дуэли, клики (у тех
 # свой дневной кап). 0.5 держит баланс «половина за глубину, половина за игру».
-FIRST_ITEM_XP_SHARE = 0.35
+FIRST_ITEM_XP_SHARE = 0.22
 
 def first_item_xp(item_level: int) -> float:
     """XP за первое в жизни создание печеньки item_level.
@@ -244,6 +273,34 @@ def xp_for_level(level: int) -> float:
         return 0
     return 250 * (level - 1) ** 2.1
 
+def level_xp_step(level: int) -> float:
+    """Сколько XP стоит шаг с level на level+1."""
+    return xp_for_level(min(level + 1, MAX_LEVEL)) - xp_for_level(min(level, MAX_LEVEL))
+
+# Доля шага уровня за одно дневное задание и за заказ по сложности.
+#
+# До этого квесты и заказы платили ТОЛЬКО XP батл-пасса (add_xp(uid, 0, bp_xp)),
+# то есть уровень игрока рос исключительно кликами и рекордами тира. Обе вещи
+# пропорциональны темпу тапа, поэтому лестница разъезжалась по когортам в
+# десятки раз: активный набивает 172 000 кликов в сутки, новичок — 1 800.
+# Симуляция ловила это как «новичок на 8 уровне при цели 12-17» и одновременно
+# «активный взял потолок за 10 дней».
+#
+# Дневной контент — единственный источник, который НЕ зависит от темпа тапа:
+# три квеста и пять заказов одинаково доступны и тому, кто заходит на пять
+# минут. Поэтому именно он выравнивает когорты, а доля от шага уровня (а не
+# константа) держит награду осмысленной на всей лестнице: на 3 уровне это 130
+# XP, на 29 — 1 900, и переписывать таблицу при правке кривой не нужно.
+QUEST_XP_SHARE = 0.03
+ORDER_XP_SHARE = {1: 0.01, 2: 0.025, 3: 0.05}
+
+def quest_reward_xp(user_level: int) -> float:
+    return max(20.0, level_xp_step(user_level) * QUEST_XP_SHARE)
+
+def order_reward_xp(difficulty: int, user_level: int) -> float:
+    share = ORDER_XP_SHARE.get(int(difficulty), ORDER_XP_SHARE[1])
+    return max(20.0, level_xp_step(user_level) * share)
+
 def level_reward(level: int) -> dict:
     """Награда за достижение уровня. Растёт быстрее линейного, чтобы поздние
     уровни оставались событием; full_refill — левел-ап заливает энергию до полного."""
@@ -301,7 +358,7 @@ def bp_level_for_xp(xp: float) -> int:
 # вчетверо меньше XP — мягкий тормоз для автокликеров, честным не мешает
 CLICK_XP_SOFT_CAP = 10_000
 CLICK_XP_RATE = 0.5
-CLICK_XP_RATE_CAPPED = 0.125
+CLICK_XP_RATE_CAPPED = 0.025
 
 # Награды пасса тоже в часах дохода: весь премиум-трек за 30 уровней давал
 # 186 000 печенек — на 30-й день это 0.04 секунды дохода, то есть Premium Пасс
@@ -640,19 +697,40 @@ BOOST_CLICK_X2_MULT = 2.0
 # Окупаемость здания растёт с тиром: 17 минут у первого, ~65 минут у последнего.
 # Было 3.3 минуты (cursor: 100 печенек -> 1800/ч) — ферма окупалась почти
 # мгновенно, поэтому съедала весь капитал и делала клик и доску бессмысленными.
+# req_record — личный рекорд тира на доске, без которого здание не открыть.
+# Ферма обязана ПОДДЕРЖИВАТЬ мердж, а не заменять его: раньше игрок мог не
+# трогать доску вовсе и всё равно уходил в экспоненту, потому что зданий можно
+# купить сколько угодно, а клеток на доске 12-25. Требование по рекорду
+# начинается с середины (mine): первые четыре здания открыты как раньше, чтобы
+# новичок не упёрся в мердж, которого ещё не понял.
 FARM_BUILDINGS = {
     "cursor":   {"base_cost": 500,      "cps": 0.5,   "req_level": 1},
     "granny":   {"base_cost": 5_000,    "cps": 4,     "req_level": 2},
     "bakery":   {"base_cost": 32_000,   "cps": 20,    "req_level": 4},
     "factory":  {"base_cost": 180_000,  "cps": 90,    "req_level": 7},
-    "mine":     {"base_cost": 600_000,  "cps": 250,   "req_level": 10},
-    "portal":   {"base_cost": 2_500_000,"cps": 900,   "req_level": 15},
-    "timelab":  {"base_cost": 12_000_000,"cps": 3800, "req_level": 20},
-    "moonbase": {"base_cost": 56_000_000,  "cps": 16000,  "req_level": 24},
-    "singularity": {"base_cost": 300_000_000, "cps": 75000, "req_level": 28},
+    "mine":     {"base_cost": 600_000,  "cps": 250,   "req_level": 10, "req_record": 8},
+    "portal":   {"base_cost": 2_500_000,"cps": 900,   "req_level": 15, "req_record": 11},
+    "timelab":  {"base_cost": 12_000_000,"cps": 3800, "req_level": 20, "req_record": 14},
+    "moonbase": {"base_cost": 56_000_000,  "cps": 16000,  "req_level": 24, "req_record": 17},
+    "singularity": {"base_cost": 300_000_000, "cps": 75000, "req_level": 28,
+                    "req_record": 20},
 }
 FARM_COST_GROWTH = 1.22          # цена растёт за каждое купленное здание
 FARM_OFFLINE_CAP_HOURS = 3       # базовый кап оффлайн-фарма (+ Stars-бонус offline_cap_*)
+
+# Потолок копий одного здания. Цена 1.22^n тормозит ферму, но НЕ ограничивает
+# её: доход фермы растёт как логарифм денег, а деньги растут во времени
+# экспоненциально, поэтому между уровнями ферма прибавляет всегда. Доска в это
+# же время стоит на месте — её потолок задан тиром, а тир открывается уровнями.
+# Линию без потолка не победить линией с потолком ни при каких ценах: симуляция
+# показывала новичка с тридцатью фабриками, у которого вся доска давала 0.4%
+# дохода, потому что одна фабрика перевешивала её в семь раз.
+#
+# 25 — то же число, что и клеток на доске, и это не совпадение: обе ветки
+# упираются в один предел, а дальше растут только НОВЫМИ зданиями и НОВЫМИ
+# тирами, то есть уровнем игрока. Новые здания с середины списка требуют ещё и
+# рекорда тира (req_record) — ферма выше потолка растёт через доску, а не мимо.
+FARM_MAX_COPIES = 25
 
 def building_cost(key: str, owned: int) -> float:
     return FARM_BUILDINGS[key]["base_cost"] * (FARM_COST_GROWTH ** owned)

@@ -28,7 +28,11 @@ export interface FarmBuilding {
   cps_each: number
   cost: number
   req_level: number
+  req_record: number
+  max_copies: number
+  maxed: boolean
   unlocked: boolean
+  lock: 'level' | 'record' | null
 }
 
 export interface FarmUpgrade {
