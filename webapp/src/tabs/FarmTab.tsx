@@ -3,6 +3,7 @@ import { api } from '../api'
 import { fmt, fmtRate, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
+import { askConfirm } from '../telegram'
 import type { FarmState } from '../types'
 import { useBusy } from '../useBusy'
 import RecipePanel from './RecipePanel'
@@ -17,6 +18,9 @@ const B_ICONS: Record<string, string> = {
 const U_ICONS: Record<string, string> = {
   click_mult: '💪', farm_mult: '🏭', energy_cap: '🔋', energy_regen: '⚡', passive_mult: '🧩',
 }
+
+// Покупка дороже половины кошелька — уже не «случайный тап»: переспрашиваем.
+const EXPENSIVE_SHARE = 0.5
 
 export default function FarmTab() {
   const { refresh, toast, liveBalance, flushClicks } = useGame()
@@ -41,8 +45,15 @@ export default function FarmTab() {
   // поэтому оборванный ответ можно переспросить, не купив вторую.
   // bkey — под каким ключом крутится спиннер: у здания, апгрейда и скина
   // ключи из разных пространств имён и вполне могут совпасть.
-  const post = (bkey: string, path: string, key: string, once = false) =>
+  // ask — подпись покупки; передаётся только там, где списываются печеньки,
+  // и диалог всплывает, лишь когда цена ощутима на фоне баланса
+  const post = (bkey: string, path: string, key: string, once = false, ask?: {
+    title: string; cost: number
+  }) =>
     run(bkey, async () => {
+      if (ask && ask.cost > liveBalance * EXPENSIVE_SHARE) {
+        if (!(await askConfirm(`${t('buy')}: ${ask.title} · 🍪 ${fmt(ask.cost)}`))) return
+      }
       try {
         await flushClicks() // сервер должен знать про все тапы до проверки цены
         const f = once ? await api.postOnce(path, { key }) : await api.post(path, { key })
@@ -123,7 +134,8 @@ export default function FarmTab() {
             ) : b.unlocked ? (
               <button className="claim-chip"
                       disabled={busy === 'b:' + b.key || liveBalance < b.cost}
-                      onClick={() => post('b:' + b.key, '/api/farm/buy_building', b.key, true)}>
+                      onClick={() => post('b:' + b.key, '/api/farm/buy_building', b.key, true,
+                        { title: t(('b_' + b.key) as any), cost: b.cost })}>
                 {busy === 'b:' + b.key ? <Spinner /> : <>🍪 {fmt(b.cost)}</>}
               </button>
             ) : (
@@ -150,7 +162,8 @@ export default function FarmTab() {
               <button
                 className="claim-chip"
                 disabled={!u.unlocked || busy === 'u:' + u.key || liveBalance < u.cost}
-                onClick={() => post('u:' + u.key, '/api/farm/buy_upgrade', u.key)}
+                onClick={() => post('u:' + u.key, '/api/farm/buy_upgrade', u.key, false,
+                  { title: upgradeName(u), cost: u.cost })}
               >
                 {busy === 'u:' + u.key ? <Spinner /> : <>🍪 {fmt(u.cost)}</>}
               </button>
@@ -174,7 +187,8 @@ export default function FarmTab() {
               ) : s.unlocked ? (
                 <button className="claim-chip" style={{ marginTop: 4 }}
                         disabled={busy === 'skin:' + s.key || liveBalance < s.cost}
-                        onClick={() => post('skin:' + s.key, '/api/farm/buy_skin', s.key)}>
+                        onClick={() => post('skin:' + s.key, '/api/farm/buy_skin', s.key, false,
+                          { title: s.emoji, cost: s.cost })}>
                   {busy === 'skin:' + s.key ? <Spinner /> : <>🍪 {fmt(s.cost)}</>}
                 </button>
               ) : (

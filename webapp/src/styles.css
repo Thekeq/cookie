@@ -981,3 +981,29 @@ input.field:focus { border-color: var(--accent); }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------- тема Telegram ----------
+   telegram.ts кладёт themeParams в переменные: все параметры как --tg-*,
+   а поверхности и текст подменяют фирменные (--bg, --bg2, --dough, --text,
+   --hint, --bad). Карамельный акцент остаётся акцентом игры: на нём держатся
+   градиенты и свечения, менять его на кнопочный цвет клиента значит рассыпать
+   сцену.
+
+   data-tg-theme на <html> — светлая схема клиента. Карточки нарисованы
+   полупрозрачными сливками (rgba(255,224,168,...)): на светлом фоне они
+   исчезают, поэтому на светлой теме подложка и акцент темнеют. */
+:root[data-tg-theme='light'] {
+  --card: rgba(74, 42, 12, 0.06);
+  --card-edge: rgba(74, 42, 12, 0.16);
+  --accent: #a5620b;
+  --accent2: #814a06;
+  --glaze: #c98a2a;
+  --good: #2f8f45;
+  --bad: #c0392b;
+}
+:root[data-tg-theme='light'] body {
+  background:
+    radial-gradient(120% 90% at 50% 108%, rgba(165, 98, 11, 0.1), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+}

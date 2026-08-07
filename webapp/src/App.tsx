@@ -1,5 +1,6 @@
 import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useRef, useState } from 'react'
-import { api, ApiError, startParam } from './api'
+import { api, ApiError } from './api'
+import { startTarget, useBackButton } from './telegram'
 import type { GameState } from './types'
 import { Lang, LangCtx, loadLang, saveLang, setActiveLang, useT, useTErr } from './i18n'
 import { formatNumber, formatRate } from './format'
@@ -82,8 +83,9 @@ function Game() {
   const te = useTErr()
   const [state, setState] = useState<GameState | null>(null)
   const [error, setError] = useState('')
-  // диплинк /admin из бота открывает приложение сразу на админ-панели
-  const [tab, setTab] = useState(startParam() === 'admin' ? 'profile' : 'clicker')
+  // диплинк из бота (пуш, ссылка, /admin) открывает приложение сразу на нужной
+  // вкладке; составные вкладки сами дочитают из него свой сегмент
+  const [tab, setTab] = useState(startTarget()?.tab ?? 'clicker')
   const [toastMsg, setToastMsg] = useState<{ text: string; err: boolean } | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
   const [showOnboarding, setShowOnboarding] = useState(!localStorage.getItem('onboarded'))
@@ -110,6 +112,12 @@ function Game() {
     toastTimer.current = setTimeout(() => setToastMsg(null), 2500)
   }, [])
   useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
+
+  // Нативная «назад» на любой вкладке кроме стартовой: раньше единственным
+  // выходом с внутреннего экрана была панель вкладок, а системная кнопка
+  // закрывала приложение целиком. Слой самый нижний (priority 0) — сегменты
+  // и модалки перекрывают его своими.
+  useBackButton(tab === 'clicker' ? null : () => setTab('clicker'))
 
   const refresh = useCallback(async () => {
     const s = await api.get('/api/state')

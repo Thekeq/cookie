@@ -5,6 +5,7 @@ import { fmt, useGame } from './App'
 import { useFocusTrap } from './a11y'
 import { useT, useTErr } from './i18n'
 import { sfxError, sfxFanfare } from './sound'
+import { useBackButton, useMainButton } from './telegram'
 import type { DailyState } from './types'
 
 export default function DailyModal({ daily, onClose }: { daily: DailyState; onClose: () => void }) {
@@ -12,7 +13,9 @@ export default function DailyModal({ daily, onClose }: { daily: DailyState; onCl
   const te = useTErr()
   const { refresh, toast } = useGame()
   const [busy, setBusy] = useState(false)
+  // Escape закрывает через ловушку фокуса, нативная «назад» — через слой стека
   const trap = useFocusTrap(onClose)
+  useBackButton(onClose, 1)
 
   const claim = async () => {
     if (busy) return
@@ -30,6 +33,17 @@ export default function DailyModal({ daily, onClose }: { daily: DailyState; onCl
       onClose()
     }
   }
+
+  // забрать награду можно и нативной кнопкой — она под большим пальцем
+  useMainButton(
+    {
+      text: t('daily_claim', { n: fmt(daily.next_reward) }),
+      onClick: claim,
+      enabled: !busy,
+      progress: busy,
+    },
+    1,
+  )
 
   // подсвечиваем день, который заберём сейчас (цикл по 7)
   const activeDay = ((daily.next_streak - 1) % 7) + 1

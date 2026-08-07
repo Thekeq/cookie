@@ -4,10 +4,14 @@
 import { fmt } from './App'
 import { useFocusTrap } from './a11y'
 import { useT } from './i18n'
+import { useBackButton, useMainButton } from './telegram'
 
 export default function OfflineModal({ amount, onClose }: { amount: number; onClose: () => void }) {
   const t = useT()
+  // Escape закрывает через ловушку фокуса, нативная «назад» — через слой стека
   const trap = useFocusTrap(onClose)
+  useBackButton(onClose, 1)
+  useMainButton({ text: t('offline_ok'), onClick: onClose }, 1)
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div

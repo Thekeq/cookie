@@ -2,6 +2,7 @@
 // Транспорт (таймауты, ретраи, классификация ошибок, статус сети) — в net.ts.
 
 import { ApiError, CanceledError, netRequest, newRequestId } from './net'
+import { initTheme, tg } from './telegram'
 
 // Реэкспорт, чтобы вкладкам не пришлось знать про второй модуль:
 // `import { api, ApiError } from './api'` продолжает работать как раньше.
@@ -18,7 +19,9 @@ export {
 } from './net'
 export type { ApiErrorKind, NetStatus } from './net'
 
-const tg = (window as any).Telegram?.WebApp
+// Диплинк читается через тот же модуль, что и остальной SDK; реэкспорт — чтобы
+// `import { startParam } from './api'` в App/ProfileHubTab продолжал работать.
+export { startParam } from './telegram'
 
 // Дев-режим: бот присылает ссылку 127.0.0.1/#tgWebAppData=<initData> —
 // обычно telegram-web-app.js сам её парсит, но подстрахуемся и запомним
@@ -35,15 +38,6 @@ function devInitData(): string {
 
 function getInitData(): string {
   return tg?.initData || devInitData()
-}
-
-/** startParam диплинка: t.me/bot?startapp=X или ?tgWebAppStartParam=X (dev) */
-export function startParam(): string {
-  return (
-    tg?.initDataUnsafe?.start_param ||
-    new URLSearchParams(window.location.search).get('tgWebAppStartParam') ||
-    ''
-  )
 }
 
 export function haptic(style: 'light' | 'medium' | 'heavy' = 'light') {
@@ -211,6 +205,9 @@ export function initTelegram() {
   tg?.ready?.()
   tg?.expand?.()
   tg?.disableVerticalSwipes?.()
+  // тему раскатываем ДО первого рендера: иначе игрок со светлым клиентом
+  // успевает увидеть кадр в тёмной палитре
+  initTheme()
 }
 
 export function tgUserId(): number | null {

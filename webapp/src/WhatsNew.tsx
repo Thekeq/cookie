@@ -8,6 +8,7 @@
 // сделали. Версия хранится в localStorage — экран показывается один раз.
 import { useFocusTrap } from './a11y'
 import { useT } from './i18n'
+import { useBackButton, useMainButton } from './telegram'
 
 /** Поднимай при заметных для игрока изменениях. */
 export const APP_VERSION = 3
@@ -27,7 +28,10 @@ const NOTES: { ico: string; key: string }[] = [
 
 export default function WhatsNew({ onClose }: Props) {
   const t = useT()
+  // Escape закрывает через ловушку фокуса, нативная «назад» — через слой стека
   const trap = useFocusTrap(onClose)
+  useBackButton(onClose, 1)
+  useMainButton({ text: t('whats_new_ok'), onClick: onClose }, 1)
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div

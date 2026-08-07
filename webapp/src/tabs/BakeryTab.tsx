@@ -7,6 +7,7 @@ import { api, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxFanfare } from '../sound'
+import { askConfirm } from '../telegram'
 import { useBusy } from '../useBusy'
 import Spinner from './Spinner'
 
@@ -82,6 +83,9 @@ export default function BakeryTab() {
 
   const abandonOrder = () => run('abandon', async () => {
     if (!orders?.active) return
+    // отказ съедает попытку из дневного лимита и прогресс заказа: спрашиваем
+    // нативным диалогом, промах пальцем по кнопке тут стоит дня
+    if (!(await askConfirm(t('order_abandon')))) return
     try {
       const r = await api.post('/api/orders/abandon',
         { id: orders.active.id, version: orders.active.version })

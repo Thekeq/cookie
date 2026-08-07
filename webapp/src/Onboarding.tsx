@@ -2,6 +2,7 @@ import { useContext, useState } from 'react'
 import { useFocusTrap } from './a11y'
 import { LANGS, LangCtx, useT } from './i18n'
 import { sfxBuy } from './sound'
+import { useBackButton, useMainButton } from './telegram'
 
 // Онбординг для новых игроков: шаг 0 — выбор языка, шаги 1..4 — туториал (скипается)
 const STEPS = [
@@ -27,6 +28,14 @@ export default function Onboarding({ onDone }: { onDone: () => void }) {
 
   const s = step > 0 ? STEPS[step - 1] : null
   const last = step === STEPS.length
+
+  // «назад» листает туториал на шаг назад; на выборе языка листать некуда,
+  // и кнопки там нет — иначе она закрывала бы приложение
+  useBackButton(step > 0 ? () => setStep(step - 1) : null)
+  useMainButton({
+    text: last ? t('tut_start') : t('tut_next'),
+    onClick: () => (last ? finish() : setStep(step + 1)),
+  })
 
   // Один общий контейнер на оба шага: ловушка фокуса цепляется к узлу при
   // монтировании, и если бы шаги возвращали разные корневые div-ы, после

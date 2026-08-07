@@ -5,6 +5,7 @@ import { LANGS, LangCtx, useT, useTErr } from '../i18n'
 import {
   isMusicOn, isSfxOn, sfxBuy, sfxError, sfxFanfare, toggleMusic, toggleSfx,
 } from '../sound'
+import { tg } from '../telegram'
 import type { Achievement, RefMilestone } from '../types'
 import { useBusy } from '../useBusy'
 import PrestigeModal from '../PrestigeModal'
@@ -12,8 +13,6 @@ import Spinner from './Spinner'
 
 // username бота для реф-ссылок; при деплое поменяй на своего
 const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
-
-const tgApp = (window as any).Telegram?.WebApp
 
 export default function ProfileTab() {
   const { state, refresh, toast } = useGame()
@@ -115,7 +114,7 @@ export default function ProfileTab() {
   const openChannel = () => {
     if (!channel?.channel) return
     const url = `https://t.me/${channel.channel}`
-    if (tgApp?.openTelegramLink) tgApp.openTelegramLink(url)
+    if (tg?.openTelegramLink) tg.openTelegramLink(url)
     else window.open(url, '_blank')
   }
 

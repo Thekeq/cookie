@@ -1,16 +1,24 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
+import { useFocusTrap } from '../a11y'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxMerge } from '../sound'
 import { COOKIE_SKINS } from '../cookieSkins'
+import { askConfirm, useBackButton } from '../telegram'
 import { useBusy } from '../useBusy'
 import Spinner from './Spinner'
+
+// Покупка дороже половины кошелька — уже не «случайный тап»: переспрашиваем.
+const EXPENSIVE_SHARE = 0.5
 
 // Альбом блестящих печенек: 24 слота, наборы дают постоянный бонус к доходу
 function AlbumModal({ onClose }: { onClose: () => void }) {
   const t = useT()
   const [data, setData] = useState<any>(null)
+  // единственная модалка без ловушки фокуса — заодно и Escape заработал
+  const trap = useFocusTrap(onClose)
+  useBackButton(onClose, 1)
 
   useEffect(() => {
     api.get('/api/collection').then(setData).catch(() => {})
@@ -18,8 +26,15 @@ function AlbumModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-        <b style={{ fontSize: 17 }}>{t('album_title')}</b>
+      <div
+        ref={trap}
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="album-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <b id="album-title" style={{ fontSize: 17 }}>{t('album_title')}</b>
         {data && (
           <>
             <div className="hint" style={{ marginTop: 6 }}>
@@ -235,6 +250,13 @@ export default function MergeTab() {
   }
 
   const spawn = () => run('spawn', async () => {
+    // тир на пол-кошелька покупают осознанно, а промахиваются по кнопке —
+    // случайно, поэтому дорогую покупку переспрашиваем нативным диалогом
+    const cost = costOf(safeBuyLevel)
+    if (cost > liveBalance * EXPENSIVE_SHARE) {
+      const what = `${t('buy_cookie')} ${COOKIE_SKINS[safeBuyLevel]} ${safeBuyLevel} · 🍪 ${fmt(cost)}`
+      if (!(await askConfirm(what))) return
+    }
     try {
       await flushClicks() // сервер должен знать про все тапы до проверки цены
       const s = await api.postBoard('/api/merge/spawn', { level: buyLevel })

@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react'
 import { fmt } from './App'
 import { useFocusTrap } from './a11y'
 import { useT } from './i18n'
+import { askConfirm, useBackButton, useMainButton } from './telegram'
 
 interface Props {
   points: number          // сколько очков даст перерождение
@@ -21,8 +22,27 @@ export default function PrestigeModal(
 ) {
   const t = useT()
   const [burning, setBurning] = useState(false)
-  // во время сцены сгорания закрывать нечего — Escape отключаем, как и клик по фону
+  // во время сцены сгорания закрывать нечего — Escape отключаем, как и клик по
+  // фону и нативную «назад»
   const trap = useFocusTrap(burning ? undefined : onClose)
+  useBackButton(burning ? null : onClose, 1)
+
+  // Сброс необратим, поэтому последний шаг — нативный да/нет клиента: модалка
+  // объясняет ЧТО произойдёт, диалог ловит промах пальцем по кнопке.
+  const ask = async () => {
+    if (burning) return
+    if (await askConfirm(t('prestige_confirm', { n: fmt(points) }))) setBurning(true)
+  }
+
+  useMainButton(
+    {
+      text: burning ? t('prestige_burning') : t('prestige_confirm_btn'),
+      onClick: ask,
+      enabled: !burning,
+      progress: burning,
+    },
+    1,
+  )
 
   // на подтверждении проигрываем короткую сцену, потом отдаём управление
   useEffect(() => {
@@ -69,7 +89,7 @@ export default function PrestigeModal(
           </div>
         </div>
 
-        <button className="btn" disabled={burning} onClick={() => setBurning(true)}>
+        <button className="btn" disabled={burning} onClick={ask}>
           {burning ? t('prestige_burning') : t('prestige_confirm_btn')}
         </button>
         {!burning && (
