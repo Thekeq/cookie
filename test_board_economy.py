@@ -200,6 +200,37 @@ for _k, _v in cfg.FARM_BUILDINGS.items():
 # --- буст пассивки мерджа ---
 check("passive lvl3 = 5500/h", cfg.passive_income_per_hour(3) == 5500)
 
+# --- путь слияния обязан окупаться не быстрее прямой покупки ---
+# Дыра, которую стенд не видел: ITEM_PAYBACK_HOURS управляет ПРЯМОЙ покупкой, а
+# доход можно собрать и путём слияния — 2^(L-1) спавнов по SPAWN_L1_BASE. Премия
+# за рекорд стоит в обеих частях и сокращается, поэтому окупаемость пути
+# слияния — чистая константа 4 * spawn_cost / PASSIVE_BASE, одинаковая на всех
+# тирах и НИКАК не связанная с ITEM_PAYBACK_HOURS.
+def _merge_payback(level, record, cells=0):
+    _cost = 2 ** (level - 1) * cfg.spawn_cost(cells, record=record)
+    return _cost / (cfg.passive_income_per_hour(level) * cfg.record_multiplier(record))
+
+# Окупаемость одинакова на всех тирах: и число спавнов, и доход удваиваются.
+_flat = [_merge_payback(_l, cfg.MERGE_PAYBACK_FULL_AT) for _l in (4, 8, 12, 16, 20)]
+check("merge-path payback is flat across tiers", max(_flat) - min(_flat) < 0.01,
+      f"{min(_flat):.2f}..{max(_flat):.2f}h")
+check("merge path costs its designed payback",
+      abs(_flat[0] - cfg.MERGE_PAYBACK_HOURS) < 0.01,
+      f"{_flat[0]:.2f}ч, цель {cfg.MERGE_PAYBACK_HOURS}ч")
+# Слияние обязано остаться выгоднее прямой покупки — иначе основной цикл игры
+# теряет смысл, — но ВДВОЕ, а не в девяносто раз.
+_ratio = cfg.direct_spawn_cost(12, 0, record=cfg.MERGE_PAYBACK_FULL_AT) / (
+    2 ** 11 * cfg.spawn_cost(0, record=cfg.MERGE_PAYBACK_FULL_AT))
+check("merge stays better than direct, but only 2x", 1.5 <= _ratio <= 3.0,
+      f"x{_ratio:.2f}")
+# Новичок платит флор: доска не должна дорожать раньше, чем он её освоил.
+check("spawn floor holds for a fresh player",
+      cfg.spawn_cost(0, record=0) == cfg.SPAWN_L1_BASE, f"{cfg.spawn_cost(0):.0f}")
+# И цена обязана РАСТИ с рекордом, иначе печатный станок возвращается.
+check("spawn price grows with tier record",
+      cfg.spawn_cost(0, record=12) > cfg.spawn_cost(0, record=4) > cfg.spawn_cost(0, record=3),
+      f"{cfg.spawn_cost(0, record=3):.0f} -> {cfg.spawn_cost(0, record=12):.0f}")
+
 # --- оффлайн-кап за Stars ---
 user = db.get_user(UID)
 check("base farm cap 3h", gl.farm_offline_cap_hours(user) == 3)

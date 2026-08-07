@@ -17,6 +17,7 @@
     python balance_sim.py 336 active      # конкретный профиль
     python balance_sim.py 720 all         # все профили, месяц
     python balance_sim.py 336 all --strict  # промах по кривой = ошибка
+    python balance_sim.py --matrix        # доля доски: когорты x горизонты
 """
 import sys
 
@@ -86,6 +87,32 @@ TARGET_LEVELS = {
 # Во сколько раз абузеру позволено обгонять честного активного игрока.
 EXPLOIT_MAX_ADVANTAGE = 2.5
 
+# Коридор доли доски в доходе. ДВУСТОРОННИЙ, и это главное: раньше тут стоял
+# один нижний порог 10%, поэтому стенд молчал и когда доска давала 4% (мердж
+# декорация), и когда 60% (декорацией становилась ферма). Замер по всем
+# когортам и горизонтам показал разброс 0-59.6% — то есть в каждой отдельной
+# точке кривой одна из двух веток выглядела бессмысленной, и какая именно
+# зависело от дня и профиля.
+#
+# Доля — величина ЭМЕРДЖЕНТНАЯ, её нельзя назначить: обе ветки покупаются в
+# try_spend() по одной метрике (прирост дохода на печеньку), поэтому доля
+# получается из гонки окупаемостей 12ч*1.08^клеток у доски против
+# базовая*1.22^копий у здания. Коридор — это цель тюнинга этих констант, а не
+# ручка, которую можно повернуть напрямую.
+BOARD_SHARE_BAND = (0.30, 0.60)
+
+# С какого горизонта коридор вообще имеет смысл. На получасе доски ещё нет ни у
+# кого: игрок делает первые спавны, и доля задана не экономикой, а тем, успел ли
+# он купить вторую печеньку. Мерить там — ловить шум расписания профиля.
+BOARD_SHARE_FROM_H = 24
+
+# Спавнов в минуту. Настоящий ограничитель мердж-цикла — не деньги, а РУКИ:
+# спавн это отдельный тап по кнопке, и слить дерево до высокого тира разом
+# нельзя, сколько бы печенек ни лежало. Без этой ручки жадная стратегия
+# спавнила в одну минуту столько, на сколько хватало баланса (миллионы раз), —
+# то есть стенд считал бесконечно и выдавал доход, недостижимый физически.
+SPAWNS_PER_MIN = 20
+
 
 def simulate(name: str, sim_hours: float) -> dict:
     """Прогоняет один профиль и возвращает итоговое состояние."""
@@ -110,6 +137,7 @@ def simulate(name: str, sim_hours: float) -> dict:
     log_events = []
     level_at = {}          # уровень -> минута, когда взят
     earned_at_level = {}   # уровень -> сколько всего заработано к этому моменту
+    spawn_budget = [0]     # сколько спавнов осталось в этой минуте
 
     def farm_cps():
         return sum(cfg.FARM_BUILDINGS[k]["cps"] * v for k, v in st["buildings"].items())
@@ -215,7 +243,7 @@ def simulate(name: str, sim_hours: float) -> dict:
             cells = cfg.merge_cells_unlocked(st["level"], 0)
             if len(st["board"]) < cells:
                 direct_cap = max(1, max_item_unlocked() - cfg.SPAWN_DIRECT_GAP)
-                for lvl in range(direct_cap, 0, -1):
+                for lvl in range(direct_cap, 1, -1):
                     cost = cfg.direct_spawn_cost(lvl, len(st["board"]),
                                                  record=st["best_item"])
                     gain_cps = (cfg.passive_income_per_hour(lvl)
@@ -224,6 +252,26 @@ def simulate(name: str, sim_hours: float) -> dict:
                         best, best_ratio = lvl, gain_cps / cost
                         best_cost, best_kind = cost, "board"
                         break        # ниже тир — хуже отношение, дальше не смотрим
+
+                # Спавн L1 оценивается по МЕРДЖ-ПУТИ, а не по своему доходу.
+                #
+                # Без этого стенд не пользовался основным циклом игры вообще:
+                # у тира 1 доход нулевой, значит нулевое отношение, значит
+                # жадная стратегия не спавнила НИКОГДА. Доска существовала
+                # только через прямые покупки тиров по цене ITEM_PAYBACK_HOURS,
+                # то есть все замеры доли доски мерили ветку, которой живой
+                # игрок не пользуется — он мержит. Отсюда и брались 4% у
+                # новичка при 0 рекорда: доска в стенде была пустой.
+                #
+                # Четыре спавна L1 дают один тир 3, то есть PASSIVE_BASE/ч.
+                # Вклад одного спавна в будущий доход — PASSIVE_BASE/4.
+                if spawn_budget[0] > 0:
+                    cost = cfg.spawn_cost(len(st["board"]), record=st["best_item"])
+                    gain_cps = (cfg.PASSIVE_BASE / 4.0
+                                * cfg.record_multiplier(st["best_item"]) / 3600.0)
+                    if st["cookies"] >= cost and gain_cps / cost > best_ratio:
+                        best, best_ratio = 1, gain_cps / cost
+                        best_cost, best_kind = cost, "board"
 
             if best_kind == "click":
                 st["cookies"] -= best_cost
@@ -238,6 +286,8 @@ def simulate(name: str, sim_hours: float) -> dict:
             if best_kind == "board":
                 st["cookies"] -= best_cost
                 st["board"].append(best)
+                if best == 1:
+                    spawn_budget[0] -= 1
                 claim_record(best)
                 merge_board()
                 spent_something = True
@@ -345,6 +395,7 @@ def simulate(name: str, sim_hours: float) -> dict:
             click_xp_day[1] += clicks
 
             before = st["cookies"]
+            spawn_budget[0] = SPAWNS_PER_MIN
             try_spend()
             xp_level_check(minute)
             # «затык» = не смог ничего купить целую сессию
@@ -531,14 +582,19 @@ def check_targets(st: dict) -> list:
         out.append(f"[{name}] потолок {cfg.MAX_LEVEL} взят за {st['maxed_at_h'] / 24:.1f} дн. "
                    f"— раньше конца сезона ({cfg.SEASON_LENGTH_DAYS} дн.)")
 
-    # Доска обязана быть веткой дохода, а не декорацией. Проверять окупаемость
-    # предмета бессмысленно: она в порядке (ITEM_PAYBACK_HOURS), но доска
-    # ограничена 25 клетками, а ферма не ограничена ничем — поэтому её вклад и
-    # вырождается. Мерим то, что важно на самом деле: долю в доходе.
+    # Обе ветки обязаны быть источниками дохода, а не декорациями. Проверять
+    # окупаемость предмета бессмысленно: она в порядке (ITEM_PAYBACK_HOURS) —
+    # важна доля в доходе, и важны ОБЕ её границы. Ниже коридора декорацией
+    # становится мердж, выше — ферма.
+    lo, hi = BOARD_SHARE_BAND
     share = board_share(st)
-    if share < 0.10:
-        out.append(f"[{name}] доска даёт {share * 100:.1f}% дохода — мердж стал "
-                   f"декорацией (потолок 25 клеток против безлимитной фермы)")
+    if hours >= BOARD_SHARE_FROM_H:
+        if share < lo:
+            out.append(f"[{name}] {hours:g}ч: доска даёт {share * 100:.1f}% дохода, "
+                       f"коридор {lo * 100:.0f}-{hi * 100:.0f}% — мердж стал декорацией")
+        elif share > hi:
+            out.append(f"[{name}] {hours:g}ч: доска даёт {share * 100:.1f}% дохода, "
+                       f"коридор {lo * 100:.0f}-{hi * 100:.0f}% — ферма стала декорацией")
     return out
 
 
@@ -548,9 +604,40 @@ def battle_pass_days(st: dict) -> float:
     return cfg.bp_total_xp(cfg.BP_MAX_LEVEL) / max(1.0, xp_per_day)
 
 
+def share_matrix(strict: bool):
+    """Таблица «когорта x горизонт» с долей доски. Тюнинг одной командой.
+
+    Отдельный режим, потому что коридор — свойство ВСЕЙ кривой, а не одной
+    точки. Обычный прогон печатает терминальный час, и по нему невозможно
+    отличить «доля просела на неделю» от «доля просела навсегда»: чтобы увидеть
+    пилу, приходилось запускать стенд пять раз и склеивать вывод грепом.
+    """
+    lo, hi = BOARD_SHARE_BAND
+    cols = [h for h in HORIZONS if h >= BOARD_SHARE_FROM_H]
+    width = max(len(n) for n in PROFILES)
+    print(f"Доля доски в доходе, коридор {lo * 100:.0f}-{hi * 100:.0f}% "
+          f"(! = вне коридора)\n")
+    print(" " * width + "".join(f"{h:>10g}ч" for h in cols))
+    outside = 0
+    for name in PROFILES:
+        cells = []
+        for h in cols:
+            share = board_share(simulate(name, h))
+            bad = not (lo <= share <= hi)
+            outside += bad
+            cells.append(f"{share * 100:>9.1f}%{'!' if bad else ' '}")
+        print(f"{name:<{width}}" + "".join(cells))
+    total = len(PROFILES) * len(cols)
+    print(f"\nв коридоре {total - outside}/{total} клеток")
+    if outside and strict:
+        sys.exit(f"--strict: {outside} клеток вне коридора")
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     strict = "--strict" in sys.argv
+    if "--matrix" in sys.argv:
+        return share_matrix(strict)
     hours = float(args[0]) if args else 72.0
     which = args[1] if len(args) > 1 else "casual"
     names = list(PROFILES) if which == "all" else [which]
