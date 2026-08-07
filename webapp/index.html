@@ -1,8 +1,11 @@
 <!doctype html>
-<html lang="ru">
+<!-- lang проставляется из активной локали в App.tsx (loadLang по умолчанию 'en') -->
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!-- Зум НЕ запрещаем: maximum-scale/user-scalable=no ломает доступность
+         для слабовидящих. viewport-fit=cover — под safe-area в вебвью. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Cookie Merge</title>
     <meta name="theme-color" content="#17100a" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />

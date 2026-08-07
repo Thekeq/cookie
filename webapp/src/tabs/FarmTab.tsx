@@ -4,7 +4,9 @@ import { fmt, fmtRate, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { FarmState } from '../types'
+import { useBusy } from '../useBusy'
 import RecipePanel from './RecipePanel'
+import Spinner from './Spinner'
 
 const B_ICONS: Record<string, string> = {
   cursor: '👆', granny: '👵', bakery: '🏠', conveyor: '🛗', factory: '🏭',
@@ -22,6 +24,8 @@ export default function FarmTab() {
   const te = useTErr()
   const [farm, setFarm] = useState<FarmState | null>(null)
   const [section, setSection] = useState<'buildings' | 'upgrades' | 'skins'>('buildings')
+  // покупка списывает деньги: второй тап по той же кнопке не должен улететь
+  const { busy, run } = useBusy()
 
   useEffect(() => {
     api.get('/api/farm').then((f: FarmState) => {
@@ -34,19 +38,22 @@ export default function FarmTab() {
   }, [])
 
   // once — покупка постройки: у неё на сервере есть токен идемпотентности,
-  // поэтому оборванный ответ можно переспросить, не купив вторую
-  const post = async (path: string, key: string, once = false) => {
-    try {
-      await flushClicks() // сервер должен знать про все тапы до проверки цены
-      const f = once ? await api.postOnce(path, { key }) : await api.post(path, { key })
-      setFarm(f)
-      sfxBuy()
-      refresh()
-    } catch (e: any) {
-      sfxError()
-      toast(te(e.detail), true)
-    }
-  }
+  // поэтому оборванный ответ можно переспросить, не купив вторую.
+  // bkey — под каким ключом крутится спиннер: у здания, апгрейда и скина
+  // ключи из разных пространств имён и вполне могут совпасть.
+  const post = (bkey: string, path: string, key: string, once = false) =>
+    run(bkey, async () => {
+      try {
+        await flushClicks() // сервер должен знать про все тапы до проверки цены
+        const f = once ? await api.postOnce(path, { key }) : await api.post(path, { key })
+        setFarm(f)
+        sfxBuy()
+        refresh()
+      } catch (e: any) {
+        sfxError()
+        toast(te(e.detail), true)
+      }
+    })
 
   if (!farm)
     return (
@@ -114,9 +121,10 @@ export default function FarmTab() {
             {b.maxed ? (
               <span className="hint" style={{ fontSize: 12 }}>{t('farm_maxed', { n: b.max_copies })}</span>
             ) : b.unlocked ? (
-              <button className="claim-chip" disabled={liveBalance < b.cost}
-                      onClick={() => post('/api/farm/buy_building', b.key, true)}>
-                🍪 {fmt(b.cost)}
+              <button className="claim-chip"
+                      disabled={busy === 'b:' + b.key || liveBalance < b.cost}
+                      onClick={() => post('b:' + b.key, '/api/farm/buy_building', b.key, true)}>
+                {busy === 'b:' + b.key ? <Spinner /> : <>🍪 {fmt(b.cost)}</>}
               </button>
             ) : (
               <span className="hint" style={{ fontSize: 12 }}>
@@ -141,10 +149,10 @@ export default function FarmTab() {
             ) : (
               <button
                 className="claim-chip"
-                disabled={!u.unlocked || liveBalance < u.cost}
-                onClick={() => post('/api/farm/buy_upgrade', u.key)}
+                disabled={!u.unlocked || busy === 'u:' + u.key || liveBalance < u.cost}
+                onClick={() => post('u:' + u.key, '/api/farm/buy_upgrade', u.key)}
               >
-                🍪 {fmt(u.cost)}
+                {busy === 'u:' + u.key ? <Spinner /> : <>🍪 {fmt(u.cost)}</>}
               </button>
             )}
           </div>
@@ -159,14 +167,15 @@ export default function FarmTab() {
                 <div className="hint" style={{ color: 'var(--good)' }}>✓ {t('applied')}</div>
               ) : s.owned ? (
                 <button className="claim-chip" style={{ marginTop: 4 }}
-                        onClick={() => post('/api/farm/set_skin', s.key)}>
-                  {t('apply')}
+                        disabled={busy === 'apply:' + s.key}
+                        onClick={() => post('apply:' + s.key, '/api/farm/set_skin', s.key)}>
+                  {busy === 'apply:' + s.key ? <Spinner /> : t('apply')}
                 </button>
               ) : s.unlocked ? (
                 <button className="claim-chip" style={{ marginTop: 4 }}
-                        disabled={liveBalance < s.cost}
-                        onClick={() => post('/api/farm/buy_skin', s.key)}>
-                  🍪 {fmt(s.cost)}
+                        disabled={busy === 'skin:' + s.key || liveBalance < s.cost}
+                        onClick={() => post('skin:' + s.key, '/api/farm/buy_skin', s.key)}>
+                  {busy === 'skin:' + s.key ? <Spinner /> : <>🍪 {fmt(s.cost)}</>}
                 </button>
               ) : (
                 <div className="hint">🔒 {t('req_level', { n: s.req_level })}</div>

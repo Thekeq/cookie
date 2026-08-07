@@ -6,6 +6,7 @@ import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxFanfare } from '../sound'
 import type { Quest } from '../types'
 import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 const METRIC_ICO: Record<string, string> = {
   clicks: '👆', merges: '🧩', spawns: '🍪', buildings: '🏭', earned: '💰', make_item: '⭐',
@@ -44,7 +45,7 @@ export default function QuestsTab() {
     }
   })
 
-  const reroll = async (key: string) => {
+  const reroll = (key: string) => run('reroll:' + key, async () => {
     try {
       const r = await api.post('/api/quests/reroll', { key })
       sfxBuy()
@@ -54,7 +55,7 @@ export default function QuestsTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const questText = (q: Quest) => t(`q_${q.metric}` as any, { n: fmt(q.goal) })
 
@@ -75,10 +76,16 @@ export default function QuestsTab() {
                 <>
                   {' · '}
                   <span
-                    style={{ color: 'var(--accent)', cursor: 'pointer' }}
+                    style={{
+                      color: 'var(--accent)',
+                      cursor: busy === 'reroll:' + q.key ? 'default' : 'pointer',
+                      opacity: busy === 'reroll:' + q.key ? 0.6 : 1,
+                    }}
                     onClick={() => reroll(q.key)}
                   >
-                    🎲 {t('quest_reroll')}
+                    {busy === 'reroll:' + q.key
+                      ? <Spinner />
+                      : <>🎲 {t('quest_reroll')}</>}
                   </span>
                 </>
               )}
@@ -89,7 +96,9 @@ export default function QuestsTab() {
           </div>
           <button className="claim-chip" disabled={!q.done || q.claimed || busy === q.key}
                   onClick={() => claim(q.key)}>
-            {q.claimed ? '✓' : `${fmt(q.progress)}/${fmt(q.goal)}`}
+            {busy === q.key
+              ? <Spinner />
+              : q.claimed ? '✓' : `${fmt(q.progress)}/${fmt(q.goal)}`}
           </button>
         </div>
       ))}

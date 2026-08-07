@@ -7,9 +7,10 @@ N-кратным (восемь воркеров — восьмикратный �
 нагрузка на тяжёлые ручки), а ролловер сезона стартует в каждом процессе
 одновременно, и все они дерутся за один write-lock базы.
 
-Здесь два примитива, которых для этого достаточно:
+Здесь три примитива, которых для этого достаточно:
   * incr_window — скользящее окно счётчика (лимитер);
-  * lock — «эту работу делаю я» (единственный владелец фоновой задачи).
+  * lock — «эту работу делаю я» (единственный владелец фоновой задачи);
+  * get/setex (и обёртки get_json/set_json) — значение с TTL, то есть общий кэш.
 
 Фолбэк в память — не заглушка, а рабочий режим. Без REDIS_URL всё работает
 ровно как раньше: один процесс, состояние в памяти. Redis обязателен только
@@ -25,10 +26,13 @@ settings.problems(). Так дев и тесты не начинают треб�
 Поведение при недоступности Redis РАЗНОЕ, и это главное решение файла:
   * лимитер — fail open: моргнувший Redis не должен закрывать игру всем
     игрокам. Пропустить лишний запрос дешевле, чем массовый 429;
+  * кэш — fail open в память процесса: значение с TTL по определению можно
+    пересчитать, худшее последствие отказа — лишний запрос в базу;
   * lock — fail closed: не смогли убедиться, что владелец один — не работаем.
     Пропущенный тик планировщика стоит 15 минут, ролловер сезона, запущенный
     дважды, стоит пересчёта прогресса всем игрокам.
 """
+import json
 import logging
 import math
 import threading
@@ -188,6 +192,107 @@ def reset_all_windows():
         _failed("reset_all_windows", e)
 
 
+# ---------- значение с TTL (общий кэш) ----------
+
+# Фолбэк кэша. Держим ЗАКОДИРОВАННУЮ строку, а не объект: с объектом читатели
+# получали бы один и тот же словарь и правка одного портила бы кэш остальным
+# (лидерборд, например, дописывает в строки is_me на каждый запрос). Через
+# Redis такой аварии быть не может по построению — пусть и без него поведение
+# будет тем же.
+_kv: dict[str, tuple[float, str]] = {}     # key -> (когда протухнет, значение)
+_KV_MAX = 256                              # потолок: кэш не должен течь
+
+
+def _kv_get_local(key: str) -> str | None:
+    hit = _kv.get(key)
+    if hit is None:
+        return None
+    if hit[0] <= time.time():
+        _kv.pop(key, None)
+        return None
+    return hit[1]
+
+
+def _kv_set_local(key: str, ttl: float, value: str):
+    now = time.time()
+    if len(_kv) >= _KV_MAX:
+        for k, (expires, _v) in list(_kv.items()):
+            if expires <= now:
+                _kv.pop(k, None)
+        if len(_kv) >= _KV_MAX:
+            _kv.clear()     # ключей больше, чем мы готовы помнить, — начинаем с нуля
+    _kv[key] = (now + ttl, value)
+
+
+def get(key: str) -> str | None:
+    """Значение или None, если его нет либо срок вышел."""
+    r = client()
+    if r is None:
+        return _kv_get_local(key)
+    try:
+        return r.get(PREFIX + "kv:" + key)
+    except Exception as e:
+        _failed("get", e)
+        return _kv_get_local(key)
+
+
+def setex(key: str, ttl: float, value: str) -> bool:
+    """Положить значение на ttl секунд. False — легло только в память процесса.
+
+    В память пишем ТОЛЬКО когда Redis не ответил: иначе процесс держал бы
+    вторую копию каждого значения, а после падения Redis отдавал бы из неё
+    данные, которых остальные воркеры уже не видят.
+
+    TTL округляем вверх и не даём опуститься ниже секунды: SETEX с нулём
+    Redis считает ошибкой, а не «положить и сразу забыть»."""
+    r = client()
+    if r is not None:
+        try:
+            r.setex(PREFIX + "kv:" + key, max(1, int(math.ceil(ttl))), value)
+            return True
+        except Exception as e:
+            _failed("setex", e)
+    _kv_set_local(key, ttl, value)
+    return False
+
+
+def delete(key: str):
+    """Забыть значение (инвалидация кэша, тесты, админка)."""
+    _kv.pop(key, None)
+    r = client()
+    if r is not None:
+        try:
+            r.delete(PREFIX + "kv:" + key)
+        except Exception as e:
+            _failed("delete", e)
+
+
+def get_json(key: str):
+    """Разобранное значение или None.
+
+    Мусор в кэше (обрезанная запись, значение от прошлой версии кода со сменой
+    формата) читается как промах, а не как исключение: ручка обязана пережить
+    порченый кэш, пересчитав данные."""
+    raw = get(key)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        log.warning("кэш %s: значение не разбирается — считаем промахом", key)
+        return None
+
+
+def set_json(key: str, ttl: float, value) -> bool:
+    """Положить сериализуемое значение на ttl секунд."""
+    try:
+        raw = json.dumps(value, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        log.error("кэш %s: значение не сериализуется (%s) — не кэшируем", key, e)
+        return False
+    return setex(key, ttl, raw)
+
+
 # ---------- владение задачей ----------
 
 _locks: dict[str, tuple[str, float]] = {}   # name -> (token, expires_at)
@@ -311,3 +416,4 @@ def _reset_for_tests():
         _down_until = 0.0
         _windows.clear()
         _locks.clear()
+        _kv.clear()

@@ -4,6 +4,8 @@ import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { BPLevel } from '../types'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 interface BPData {
   season: number
@@ -22,27 +24,32 @@ export default function BattlePassTab() {
   const t = useT()
   const te = useTErr()
   const [bp, setBp] = useState<BPData | null>(null)
+  // награда уровня и покупка премиума — по одному запросу за раз
+  const { busy, run } = useBusy()
 
   const load = () => api.get('/api/battlepass').then(setBp)
   useEffect(() => {
     load()
   }, [])
 
-  const claim = async (level: number, track: 'free' | 'premium') => {
-    try {
-      const r = await api.postOnce('/api/battlepass/claim', { level, track })
-      hapticSuccess()
-      sfxBuy()
-      toast(`+${fmt(r.reward.cookies)} 🍪`)
-      load()
-      refresh()
-    } catch (e: any) {
-      sfxError()
-      toast(te(e.detail), true)
-    }
-  }
+  const bpKey = (level: number, track: 'free' | 'premium') => `${track}:${level}`
 
-  const buyPremium = async () => {
+  const claim = (level: number, track: 'free' | 'premium') =>
+    run(bpKey(level, track), async () => {
+      try {
+        const r = await api.postOnce('/api/battlepass/claim', { level, track })
+        hapticSuccess()
+        sfxBuy()
+        toast(`+${fmt(r.reward.cookies)} 🍪`)
+        load()
+        refresh()
+      } catch (e: any) {
+        sfxError()
+        toast(te(e.detail), true)
+      }
+    })
+
+  const buyPremium = () => run('premium', async () => {
     try {
       const r = await api.post('/api/shop/invoice', { item_key: 'bp_premium' })
       openInvoice(r.invoice_link, () => {
@@ -56,7 +63,7 @@ export default function BattlePassTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   if (!bp)
     return (
@@ -92,8 +99,11 @@ export default function BattlePassTab() {
           )
         })()}
         {!bp.premium && (
-          <button className="btn" style={{ marginTop: 10 }} onClick={buyPremium}>
-            {t('bp_buy')} ⭐ {bp.premium_price_stars}
+          <button className="btn" style={{ marginTop: 10 }}
+                  disabled={busy === 'premium'} onClick={buyPremium}>
+            {busy === 'premium'
+              ? <Spinner />
+              : <>{t('bp_buy')} ⭐ {bp.premium_price_stars}</>}
           </button>
         )}
       </div>
@@ -115,8 +125,12 @@ export default function BattlePassTab() {
               }
               onClick={() => l.reached && !l.free_claimed && claim(l.level, 'free')}
             >
-              🍪 {fmt(l.free.cookies)}
-              {l.free_claimed ? ' ✓' : ''}
+              {busy === bpKey(l.level, 'free') ? <Spinner /> : (
+                <>
+                  🍪 {fmt(l.free.cookies)}
+                  {l.free_claimed ? ' ✓' : ''}
+                </>
+              )}
             </div>
             <div
               className={
@@ -129,9 +143,13 @@ export default function BattlePassTab() {
               }
               onClick={() => l.reached && bp.premium && !l.premium_claimed && claim(l.level, 'premium')}
             >
-              🍪 {fmt(l.premium.cookies)}
-              {l.premium.energy ? ` +⚡${l.premium.energy}` : ''}
-              {l.premium_claimed ? ' ✓' : ''}
+              {busy === bpKey(l.level, 'premium') ? <Spinner /> : (
+                <>
+                  🍪 {fmt(l.premium.cookies)}
+                  {l.premium.energy ? ` +⚡${l.premium.energy}` : ''}
+                  {l.premium_claimed ? ' ✓' : ''}
+                </>
+              )}
             </div>
           </div>
         ))}

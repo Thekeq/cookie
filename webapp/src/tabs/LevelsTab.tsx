@@ -5,6 +5,8 @@ import { useT, useTErr } from '../i18n'
 import { sfxError, sfxFanfare } from '../sound'
 import type { LevelNode } from '../types'
 import { COOKIE_SKINS } from '../cookieSkins'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 export default function LevelsTab() {
   const { state, setState, toast } = useGame()
@@ -14,6 +16,8 @@ export default function LevelsTab() {
   const [claimable, setClaimable] = useState<number | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const clipRef = useRef<SVGRectElement>(null)
+  // награду за уровень тапают и с кнопки, и с узла тропинки — гасим оба разом
+  const { busy, run } = useBusy()
 
   const load = () =>
     api.get('/api/levels').then((r) => {
@@ -52,7 +56,7 @@ export default function LevelsTab() {
     el.style.transform = 'translateY(0)'
   }, [path, state.user.level, state.user.xp])
 
-  const claim = async () => {
+  const claim = () => run('claim', async () => {
     try {
       const s = await api.post('/api/levels/claim')
       setState(s)
@@ -65,7 +69,7 @@ export default function LevelsTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   if (!path)
     return (
@@ -106,8 +110,9 @@ export default function LevelsTab() {
           </div>
         )}
         {claimable && (
-          <button className="btn" style={{ marginTop: 10 }} onClick={claim}>
-            {t('claim_level', { n: claimable })}
+          <button className="btn" style={{ marginTop: 10 }}
+                  disabled={busy === 'claim'} onClick={claim}>
+            {busy === 'claim' ? <Spinner /> : t('claim_level', { n: claimable })}
           </button>
         )}
       </div>
@@ -166,7 +171,9 @@ export default function LevelsTab() {
                   )
               }}
             >
-              <span className="num">{n.level}</span>
+              <span className="num">
+                {busy === 'claim' && claimable === n.level ? <Spinner /> : n.level}
+              </span>
               {opens && <span className="sub">{COOKIE_SKINS[n.unlocks_items[0]]}</span>}
             </div>
           )

@@ -548,9 +548,21 @@ class DataBase:
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
         # finalize_seasons делает SELECT DISTINCT season_id на каждый запрос
-        # четырёх ручек; лидерборд фильтрует по (season_id, level)
+        # четырёх ручек; лидерборд считает по (season_id, level) размер лиги
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_season ON users(season_id, level)")
+        # Порядок лидерборда целиком (см. LEADERBOARD_ORDER): топ-100 лиги
+        # снимается первыми подходящими строками индекса, без сортировки всей
+        # таблицы сезона. Лиги отдельной колонки не имеют — это диапазон
+        # уровней (game_config.LEAGUES), поэтому в индексе на её месте стоит
+        # level, по нему же идёт и отбор лиги, и второй ключ сортировки.
+        # user_id последним ключом обязателен: без него при равных заработке и
+        # уровне порядок недетерминирован и место игрока прыгает на каждый F5.
+        # DESC в объявлении индекса понимают оба движка (SQLite с 3.3,
+        # PostgreSQL всегда), поэтому диалект тут не разветвляется.
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_leaderboard "
+            "ON users(season_id, season_earned DESC, level DESC, user_id)")
         # fulfill_pending перебирает зависшие покупки на каждом /auth
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_purchases_user ON purchases(user_id, status)")
@@ -1362,6 +1374,94 @@ class DataBase:
         if fields and not set(fields) <= self.SILENT_COLUMNS:
             cols += ", user_revision = user_revision + 1"
         self.exec(f"UPDATE users SET {cols} WHERE user_id = ?", (*fields.values(), user_id))
+
+    # ---------- лидерборд ----------
+    #
+    # Запросы таблицы лиги живут здесь, а не в ручке, ровно по одной причине:
+    # порядок и модель ранга обязаны быть ОДНИМИ на все места, где лидерборд
+    # считается. Их было три (топ ручки, «моё место» той же ручки, снапшот
+    # итогов сезона), и все три расходились: топ нумеровал строки подряд,
+    # «моё место» схлопывало равных, а порядок при равных заработке и уровне
+    # вообще не был определён — место игрока менялось от запроса к запросу.
+
+    # Полный порядок: третий ключ делает его СТРОГИМ, то есть воспроизводимым
+    # между запросами, воркерами и движками. Ровно этот же порядок несёт
+    # idx_users_leaderboard.
+    LEADERBOARD_ORDER = "season_earned DESC, level DESC, user_id ASC"
+    LEADERBOARD_TOP = 100
+
+    @staticmethod
+    def league_cond(level_min: int, level_max: int | None) -> tuple[str, list]:
+        """Условие «игрок в этой лиге» и его параметры.
+
+        Верхней границы у старшей лиги нет — там условие из одной половины,
+        и собирать его в каждом call site значило бы разъезжающиеся варианты."""
+        cond = "level >= ?"
+        params: list = [level_min]
+        if level_max is not None:
+            cond += " AND level <= ?"
+            params.append(level_max)
+        return cond, params
+
+    def leaderboard_top(self, season: int, level_min: int, level_max: int | None,
+                        limit: int | None = None) -> list[dict]:
+        """Топ лиги со проставленным rank (competition rank)."""
+        cond, lp = self.league_cond(level_min, level_max)
+        rows = self.q(
+            f"SELECT user_id, username, first_name, level, season_earned "
+            f"FROM users WHERE season_id = ? AND {cond} "
+            f"ORDER BY {self.LEADERBOARD_ORDER} LIMIT ?",
+            [season, *lp, limit or self.LEADERBOARD_TOP])
+        return competition_ranks(rows)
+
+    def leaderboard_count(self, season: int, level_min: int,
+                          level_max: int | None) -> int:
+        """Сколько всего игроков в лиге (знаменатель «ты N-й из M»)."""
+        cond, lp = self.league_cond(level_min, level_max)
+        return self.q1(
+            f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond}",
+            [season, *lp])["c"]
+
+    def leaderboard_rank(self, season: int, level_min: int, level_max: int | None,
+                         season_earned: float, level: int) -> int:
+        """Место игрока по той же модели, что и rank в leaderboard_top.
+
+        Считается как «сколько игроков строго впереди» + 1 — это и есть
+        competition rank: у равных по (заработок, уровень) место одинаковое,
+        а следующий за парой вторых получает четвёртое. Считать место игрока
+        нумерацией строк нельзя: он может не входить в топ-100 вовсе."""
+        cond, lp = self.league_cond(level_min, level_max)
+        return self.q1(
+            f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond} "
+            f"AND (season_earned > ? OR (season_earned = ? AND level > ?))",
+            [season, *lp, season_earned, season_earned, level])["c"] + 1
+
+
+# Ранг считается по (заработок за сезон, уровень) — user_id в ключ ранга НЕ
+# входит: он разводит порядок строк, но не должен разводить места. Иначе двое
+# с одинаковым результатом получали бы разные места и разные призы по признаку,
+# которого в игре не видно.
+LEADERBOARD_RANK_KEY = ("season_earned", "level")
+
+
+def competition_ranks(rows: list[dict]) -> list[dict]:
+    """Проставляет rows[i]['rank'] по модели competition rank: 1, 2, 2, 4.
+
+    Строки обязаны прийти уже отсортированными по LEADERBOARD_ORDER. Модель
+    выбрана из двух: ordinal rank (1,2,3,4) нумерует строки подряд и потому не
+    совпадает ни с каким счётным запросом — «моё место» из COUNT(*) и место в
+    таблице расходились у любой пары с равным результатом. Competition rank
+    выражается счётом «сколько строго впереди», поэтому одинаково считается и
+    по списку, и одним COUNT(*) для игрока вне топа."""
+    rank = 0
+    prev = None
+    for i, row in enumerate(rows):
+        key = tuple(row[c] for c in LEADERBOARD_RANK_KEY)
+        if key != prev:
+            rank = i + 1        # пропуск мест после группы равных — это и есть 1,2,2,4
+            prev = key
+        row["rank"] = rank
+    return rows
 
 
 _shared: "DataBase | None" = None

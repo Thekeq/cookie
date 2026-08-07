@@ -4,6 +4,8 @@ import { fmt, useGame } from '../App'
 import { LangCtx, useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import type { ShopItem } from '../types'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 const ICONS: Record<string, string> = {
   energy_full: '⚡',
@@ -22,7 +24,8 @@ export default function ShopTab() {
   const te = useTErr()
   const { lang } = useContext(LangCtx)
   const [items, setItems] = useState<ShopItem[]>([])
-  const [busy, setBusy] = useState<string | null>(null)
+  // второй тап не должен плодить инвойсы (общий useBusy вместо своего флага)
+  const { busy, run } = useBusy()
   const timers = useRef<ReturnType<typeof setTimeout>[]>([])
 
   const loadItems = () => api.get('/api/shop').then((r) => setItems(r.items)).catch(() => {})
@@ -33,9 +36,7 @@ export default function ShopTab() {
   }, [lang])
   useEffect(() => () => timers.current.forEach(clearTimeout), [])
 
-  const buy = async (item: ShopItem) => {
-    if (busy) return          // второй тап не должен плодить инвойсы
-    setBusy(item.key)
+  const buy = (item: ShopItem) => run(item.key, async () => {
     try {
       const r = await api.post('/api/shop/invoice', { item_key: item.key })
       openInvoice(r.invoice_link, () => {
@@ -57,10 +58,8 @@ export default function ShopTab() {
     } catch (e: any) {
       sfxError()
       toast(te(e.detail), true)
-    } finally {
-      setBusy(null)
     }
-  }
+  })
 
   return (
     <div>
@@ -88,7 +87,7 @@ export default function ShopTab() {
               disabled={busy !== null}
               onClick={() => buy(it)}
             >
-              ⭐ {it.stars}
+              {busy === it.key ? <Spinner /> : <>⭐ {it.stars}</>}
             </button>
           )}
         </div>

@@ -1,7 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { api, ApiError, startParam } from './api'
 import type { GameState } from './types'
-import { Lang, LangCtx, loadLang, saveLang, useT, useTErr } from './i18n'
+import { Lang, LangCtx, loadLang, saveLang, setActiveLang, useT, useTErr } from './i18n'
+import { formatNumber, formatRate } from './format'
 import { unlockAudio } from './sound'
 import Onboarding from './Onboarding'
 import DailyModal from './DailyModal'
@@ -33,33 +34,19 @@ interface Ctx {
 const GameCtx = createContext<Ctx>(null!)
 export const useGame = () => useContext(GameCtx)
 
-// суффиксы до дециллиона: поздние цены доски реально уходят за 1e15,
-// и «605062015.2B» вместо «605.1Qa» читалось как поломка
-const SUFFIX = ['', 'K', 'M', 'B', 'T', 'Qa', 'Qi', 'Sx', 'Sp', 'Oc', 'No', 'Dc']
-
-export function fmt(n: number): string {
-  if (!isFinite(n)) return '∞'
-  if (n < 1e4) return Math.floor(n).toLocaleString('en')
-  const tier = Math.min(SUFFIX.length - 1, Math.floor(Math.log10(n) / 3))
-  return (n / 1000 ** tier).toFixed(1) + SUFFIX[tier]
-}
-
-// Скорость (cookies/с), а не запас. Отдельно от fmt потому, что fmt округляет
-// вниз до целого — для баланса это правильно (дробных печенек игрок не видит),
-// а для скорости это ложь: у бабушки 0.9/с, и в шапке она писалась «+0/s», то
-// есть постройка выглядела сломанной сразу после покупки.
-export function fmtRate(n: number): string {
-  if (!isFinite(n)) return '∞'
-  if (n > 0 && n < 100) return String(Math.round(n * 10) / 10)
-  return fmt(n)
-}
+// Форматирование переехало в format.ts (локаль-зависимое). Имена fmt/fmtRate
+// оставлены как есть: их импортируют из './App' все вкладки.
+export const fmt = formatNumber
+export const fmtRate = formatRate
 
 export default function App() {
   const [lang, setLangState] = useState<Lang>(loadLang())
   const setLang = (l: Lang) => {
     setLangState(l)
-    saveLang(l)
+    saveLang(l) // внутри saveLang → setActiveLang: <html lang> и Intl-форматтеры
   }
+  // синхронно, до рендера детей: fmt() зовут прямо в разметке вкладок
+  setActiveLang(lang)
   return (
     <LangCtx.Provider value={{ lang, setLang }}>
       <Game />
@@ -310,10 +297,15 @@ function Game() {
     >
       <div className="app">
         <div className="header">
-          <div className="balance">🍪 {fmt(liveBalance)}</div>
+          {/* aria-label с числительным: скринридер читает «1 234 печеньки»,
+              а не «печенье 1 234». Живой регион тут не нужен — баланс тикает
+              каждую секунду, и aria-live превратил бы это в непрерывный поток */}
+          <div className="balance" aria-label={`${t('balance_label')}: ${t.plural('n_cookies', Math.floor(liveBalance), { n: fmt(liveBalance) })}`}>
+            <span aria-hidden="true">🍪 {fmt(liveBalance)}</span>
+          </div>
           <div className="lvl">
-            ⚡ {Math.floor(liveEnergyShown)}/{state.user.max_energy} · {t('level')}{' '}
-            {state.user.level}
+            <span aria-hidden="true">⚡</span> {Math.floor(liveEnergyShown)}/{state.user.max_energy} ·{' '}
+            {t('level')} {state.user.level}
           </div>
         </div>
         <div className="content">
@@ -324,18 +316,35 @@ function Game() {
           {tab === 'progress' && <ProgressTab />}
           {tab === 'profile' && <ProfileHubTab />}
         </div>
-        <div className="tabbar">
+        <nav className="tabbar" aria-label={t('nav_sections')}>
           {tabs.map((tb) => (
-            <button key={tb.key} className={tab === tb.key ? 'active' : ''} onClick={() => setTab(tb.key)}>
-              <span className="ico" style={{ position: 'relative' }}>
+            <button
+              key={tb.key}
+              aria-current={tab === tb.key ? 'page' : undefined}
+              className={tab === tb.key ? 'active' : ''}
+              onClick={() => setTab(tb.key)}
+            >
+              <span className="ico" aria-hidden="true" style={{ position: 'relative' }}>
                 {tb.ico}
                 {tb.badge && <span className="tab-badge" />}
               </span>
               {tb.label}
+              {/* бейдж — красная точка; цвет один состояние кодировать не может */}
+              {tb.badge && <span className="sr-only"> — {t('badge_new')}</span>}
             </button>
           ))}
+        </nav>
+        {/* Живой регион смонтирован всегда: если создавать его вместе с тостом,
+            часть скринридеров не успевает подхватить изменение и молчит. */}
+        <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {toastMsg ? (toastMsg.err ? `${t('error')}: ${toastMsg.text}` : toastMsg.text) : ''}
         </div>
-        {toastMsg && <div className={'toast' + (toastMsg.err ? ' error' : '')}>{toastMsg.text}</div>}
+        {toastMsg && (
+          <div className={'toast' + (toastMsg.err ? ' error' : '')} aria-hidden="true">
+            {toastMsg.err && <span className="toast-ico">⚠️</span>}
+            {toastMsg.text}
+          </div>
+        )}
         {offlineIncome > 1 && (
           <OfflineModal amount={offlineIncome} onClose={() => setOfflineIncome(0)} />
         )}

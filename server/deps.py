@@ -25,11 +25,17 @@
 Здесь же живёт X-Op-Id — соседняя по смыслу защита: версия отбивает действие
 со старого экрана, токен операции склеивает повтор ОДНОГО И ТОГО ЖЕ действия
 в один. Первое про «ход устарел», второе про «ответ не доехал».
+
+И общий лимитер (`rate_limit`) — он тоже про «кто и что имеет право сделать»,
+только считает не версии, а частоту. Точечные лимиты на дорогих ручках
+(`gl.check_rate_limit` в роутерах) остаются на месте: они знают цену КОНКРЕТНОЙ
+ручки. Здесь — потолок сверху, который есть у каждой ручки без исключения.
 """
 import re
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, HTTPException, Request, Response
 
+from server import cache, obs, settings
 from server.auth import tg_user
 from server.economy import ConflictError
 from server.game_logic import db
@@ -94,3 +100,118 @@ async def require_revision(
     if any(row[col] != v for col, v in wanted.items()):
         raise ConflictError(tg["id"])
     return tg
+
+
+# ---------- общий лимитер ----------
+#
+# Значения читаются из server.settings, если они там появятся, иначе берутся
+# отсюда: settings — единственная точка чтения окружения, а дефолт должен
+# лежать рядом с кодом, который его применяет.
+#
+# Числа выбраны как ПОТОЛОК, а не как рабочая частота. Нормальный клиент шлёт
+# /api/state раз в 30 секунд и батчи кликов раз в пару секунд; точечные лимиты
+# в роутерах (STATE_PER_MINUTE=40, PROMO_ATTEMPTS_PER_HOUR=10 и прочие) режут
+# сильно раньше. Задача этого слоя другая — не дать обойти их перебором ручек
+# и не дать анониму молотить в дверь.
+def _cfg(name: str, default):
+    return type(default)(getattr(settings, name, default))
+
+
+RATE_LIMIT_ENABLED = _cfg("RATE_LIMIT_ENABLED", True)
+# авторизованный игрок: на одну ручку и суммарно по всем
+RATE_LIMIT_USER_PER_MINUTE = _cfg("RATE_LIMIT_USER_PER_MINUTE", 240)
+RATE_LIMIT_USER_TOTAL_PER_MINUTE = _cfg("RATE_LIMIT_USER_TOTAL_PER_MINUTE", 1200)
+# аноним (подпись не сошлась или заголовка нет вовсе) — считаем по IP
+RATE_LIMIT_ANON_PER_MINUTE = _cfg("RATE_LIMIT_ANON_PER_MINUTE", 60)
+RATE_LIMIT_ANON_TOTAL_PER_MINUTE = _cfg("RATE_LIMIT_ANON_TOTAL_PER_MINUTE", 300)
+RATE_LIMIT_WINDOW = _cfg("RATE_LIMIT_WINDOW", 60.0)
+
+# Ручки, по которым принимают решения машины, а не игроки. /livez и /readyz
+# опрашивает балансировщик несколько раз в секунду, и 429 на них означает
+# вывод здорового процесса из ротации; webhook — это трафик Telegram, там
+# лимит превращается в потерянные апдейты (в том числе о платежах).
+RATE_LIMIT_EXEMPT = frozenset({
+    "/livez", "/readyz", "/healthz", "/metrics", settings.WEBHOOK_PATH,
+})
+
+# Кому верим, когда он представляется чужим адресом. X-Forwarded-For ставит
+# кто угодно: приняв его от произвольного клиента, мы бы дали ему бесконечный
+# запас «разных IP» — то есть отключили бы лимит для анонимов ровно там, где
+# он единственный. Заголовок читается только от локального nginx.
+TRUSTED_PROXIES = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+
+
+def client_ip(request: Request) -> str:
+    """Адрес игрока с точки зрения лимитера."""
+    peer = (request.client.host if request.client else "") or "-"
+    if peer in TRUSTED_PROXIES:
+        fwd = (request.headers.get("x-real-ip")
+               or request.headers.get("x-forwarded-for", "").split(",")[0])
+        fwd = fwd.strip()
+        if fwd:
+            return fwd[:64]
+    return peer[:64]
+
+
+def endpoint_key(request: Request) -> str:
+    """Метка ручки — ШАБЛОН пути (`/api/user/{uid}`), а не сам путь.
+
+    С сырым путём каждая ссылка заводила бы отдельный ключ в Redis, и лимит
+    перестал бы что-либо ограничивать: у любого запроса счётчик был бы свой."""
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "other"
+
+
+async def rate_limit(
+        request: Request,
+        response: Response,
+        authorization: str = Header(default=""),
+        x_lang: str = Header(default="en", alias="X-Lang"),
+) -> None:
+    """Потолок частоты на КАЖДУЮ ручку API. Вешается на приложение целиком
+    (`FastAPI(dependencies=[Depends(rate_limit)])`), поэтому новую ручку нельзя
+    забыть прикрыть — это и есть причина не делать его декоратором.
+
+    Ключи: user + IP + endpoint. Игрок опознаётся ТОЛЬКО по проверенной подписи:
+    возьми мы user_id из непроверенной initData, любой желающий выжигал бы
+    чужой лимит, подставляя чужой номер, — то есть лимитер сам стал бы оружием.
+    Не опознанные запросы считаются по одному IP на всех.
+
+    IP входит в ключ вместе с user_id намеренно: за одним адресом оператора
+    сидят тысячи игроков, и общий на них счётчик отбивал бы законную игру, а
+    для авторизованного user_id уже уникален сам по себе.
+
+    Middleware'ом это быть не может: шаблон маршрута известен только после
+    роутинга, а до него ключом стал бы сырой путь.
+    """
+    if not RATE_LIMIT_ENABLED:
+        return
+    path = endpoint_key(request)
+    if path in RATE_LIMIT_EXEMPT:
+        return
+
+    # Мягкое опознание: отказ здесь не наш — его отдаст сама ручка со своим
+    # текстом. Результат (и успех, и отказ) оседает на request.state, поэтому
+    # подпись проверяется один раз на запрос, а не дважды.
+    try:
+        uid = (await tg_user(request, response, authorization, x_lang))["id"]
+    except HTTPException:
+        uid = 0
+
+    ip = client_ip(request)
+    if uid:
+        checks = ((f"rl:{uid}:{ip}:{path}", RATE_LIMIT_USER_PER_MINUTE),
+                  (f"rl:{uid}:{ip}", RATE_LIMIT_USER_TOTAL_PER_MINUTE))
+    else:
+        checks = ((f"rl:anon:{ip}:{path}", RATE_LIMIT_ANON_PER_MINUTE),
+                  (f"rl:anon:{ip}", RATE_LIMIT_ANON_TOTAL_PER_MINUTE))
+
+    for key, limit in checks:
+        allowed, _ = cache.incr_window(key, limit, RATE_LIMIT_WINDOW)
+        if not allowed:
+            obs.inc("rate_limited_total", path=path,
+                    kind="user" if uid else "anon")
+            # Retry-After — не вежливость: без него клиент повторяет сразу и
+            # продлевает себе окно, потому что счётчик считает и отбитые тоже
+            raise HTTPException(429, "err_too_fast",
+                                headers={"Retry-After": str(int(RATE_LIMIT_WINDOW))})

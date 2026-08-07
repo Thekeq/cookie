@@ -28,6 +28,21 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
+/* Текст только для скринридера: живые регионы (тосты) и подписи к состояниям,
+   которые на экране переданы иконкой или цветом. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+/* Минимальный тач-таргет 44x44 (WCAG 2.5.5): мелкие кнопки промахивались
+   пальцем, и игрок «случайно» покупал не то, что хотел. */
+.btn, .tabbar button, .onb-lang, .onb-skip, .recipe-opt {
+  min-height: 44px;
+}
+.golden-cookie { min-width: 44px; min-height: 44px; }
+
 html, body, #root { height: 100%; }
 
 body {
@@ -78,6 +93,7 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   gap: 2px;
 }
 .tabbar button {
+  position: relative;
   flex: 1; background: none; border: none; color: var(--hint);
   font-family: var(--font-body); font-size: 10px; font-weight: 500;
   padding: 7px 0 6px; cursor: pointer; border-radius: 14px;
@@ -175,12 +191,24 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   touch-action: manipulation;
 }
 .big-cookie:active { transform: scale(0.93); }
-/* без рамки/подсветки при тапе — печенька не «кнопка» */
-.big-cookie:focus, .big-cookie:focus-visible, .big-cookie:active {
+/* Пальцем печенька не «кнопка» — рамки при тапе быть не должно (:focus без
+   :focus-visible браузер как раз и ставит после клика). А вот при навигации
+   с клавиатуры кольцо обязано быть видно: без него неясно, куда нажимаешь. */
+.big-cookie:focus, .big-cookie:active {
   outline: none; border: none; box-shadow: none;
   -webkit-tap-highlight-color: transparent;
 }
-.golden-cookie:focus, .golden-cookie:focus-visible { outline: none; }
+.big-cookie:focus-visible {
+  outline: 3px solid var(--glaze);
+  outline-offset: 6px;
+  border-radius: 50%;
+}
+.golden-cookie:focus { outline: none; }
+.golden-cookie:focus-visible {
+  outline: 3px solid var(--glaze);
+  outline-offset: 4px;
+  border-radius: 50%;
+}
 .click-float {
   position: absolute; pointer-events: none;
   font-family: var(--font-display); font-weight: 800;

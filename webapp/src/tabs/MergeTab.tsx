@@ -4,6 +4,8 @@ import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxMerge } from '../sound'
 import { COOKIE_SKINS } from '../cookieSkins'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 // Альбом блестящих печенек: 24 слота, наборы дают постоянный бонус к доходу
 function AlbumModal({ onClose }: { onClose: () => void }) {
@@ -86,6 +88,8 @@ export default function MergeTab() {
   const levelTouched = useRef(false) // игрок сам выбрал тир — не подменяем
   const [showAlbum, setShowAlbum] = useState(false)
   const busy = useRef(false)
+  // отдельно от busy выше: тот про ход по доске (жест), этот про кнопку покупки
+  const { busy: buying, run } = useBusy()
   const boardRef = useRef<HTMLDivElement>(null)
   const trashRef = useRef<HTMLDivElement>(null)
 
@@ -230,7 +234,7 @@ export default function MergeTab() {
         !(target >= cellsOpen && !boardMap.has(target))) doMove(from, target)
   }
 
-  const spawn = async () => {
+  const spawn = () => run('spawn', async () => {
     try {
       await flushClicks() // сервер должен знать про все тапы до проверки цены
       const s = await api.postBoard('/api/merge/spawn', { level: buyLevel })
@@ -246,7 +250,7 @@ export default function MergeTab() {
       if (e.state) setState(e.state)
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const maxDirect = state.spawn_direct?.max_level || 1
   const costOf = (l: number) => state.spawn_direct?.costs?.[String(l)] ?? state.spawn_cost
@@ -388,11 +392,13 @@ export default function MergeTab() {
       <button
         className="btn"
         onClick={spawn}
-        disabled={boardFull || liveBalance < buyCost}
+        disabled={boardFull || buying === 'spawn' || liveBalance < buyCost}
       >
-        {boardFull
-          ? t('board_full')
-          : `${t('buy_cookie')} ${COOKIE_SKINS[safeBuyLevel]} ${safeBuyLevel} · 🍪 ${fmt(buyCost)}`}
+        {buying === 'spawn'
+          ? <Spinner />
+          : boardFull
+            ? t('board_full')
+            : `${t('buy_cookie')} ${COOKIE_SKINS[safeBuyLevel]} ${safeBuyLevel} · 🍪 ${fmt(buyCost)}`}
       </button>
       <div className="hint" style={{ textAlign: 'center', marginTop: 8 }}>
         {t('merge_hint')} {COOKIE_SKINS[state.max_item_unlocked]} {state.max_item_unlocked}

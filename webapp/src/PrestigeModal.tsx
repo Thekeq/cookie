@@ -4,6 +4,7 @@
 // разгорается, и обе колонки последствий видно до нажатия.
 import { useEffect, useState } from 'react'
 import { fmt } from './App'
+import { useFocusTrap } from './a11y'
 import { useT } from './i18n'
 
 interface Props {
@@ -20,6 +21,8 @@ export default function PrestigeModal(
 ) {
   const t = useT()
   const [burning, setBurning] = useState(false)
+  // во время сцены сгорания закрывать нечего — Escape отключаем, как и клик по фону
+  const trap = useFocusTrap(burning ? undefined : onClose)
 
   // на подтверждении проигрываем короткую сцену, потом отдаём управление
   useEffect(() => {
@@ -31,14 +34,18 @@ export default function PrestigeModal(
   return (
     <div className="modal-backdrop" onClick={burning ? undefined : onClose}>
       <div className={"modal-card prestige-modal" + (burning ? " burning" : "")}
+           ref={trap}
+           role="dialog"
+           aria-modal="true"
+           aria-labelledby="prestige-title"
            onClick={(e) => e.stopPropagation()}>
-        <div className="prestige-scene">
+        <div className="prestige-scene" aria-hidden="true">
           <span className="prestige-old">🏚️</span>
           <span className="prestige-arrow">→</span>
           <span className="prestige-new">✨</span>
         </div>
 
-        <h3 style={{ marginBottom: 6 }}>{t('prestige_title')}</h3>
+        <h3 id="prestige-title" style={{ marginBottom: 6 }}>{t('prestige_title')}</h3>
         <div className="prestige-gain">x{multiplier.toFixed(2)}</div>
         <div className="hint" style={{ marginBottom: 12 }}>
           {t('prestige_modal_hint', { n: fmt(points) })}
@@ -46,14 +53,15 @@ export default function PrestigeModal(
 
         <div className="prestige-cols">
           <div className="prestige-col lose">
-            <div className="prestige-col-t">{t('prestige_lose')}</div>
+            {/* колонки различались только цветом рамки — добавили знак в заголовок */}
+            <div className="prestige-col-t"><span aria-hidden="true">✖ </span>{t('prestige_lose')}</div>
             <div>🏭 {t('buildings')}</div>
             <div>🧩 {t('tab_merge')}</div>
             <div>⬆️ {t('upgrades')}</div>
             <div>🍪 {t('prestige_lose_cookies')}</div>
           </div>
           <div className="prestige-col keep">
-            <div className="prestige-col-t">{t('prestige_keep')}</div>
+            <div className="prestige-col-t"><span aria-hidden="true">✔ </span>{t('prestige_keep')}</div>
             <div>🎖️ {t('tab_bp')}</div>
             <div>👥 {t('friends')}</div>
             <div>⭐ {t('tab_shop')}</div>

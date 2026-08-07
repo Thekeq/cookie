@@ -7,6 +7,8 @@ import { api, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxFanfare } from '../sound'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 const METRIC_ICO: Record<string, string> = {
   clicks: '👆', merges: '🧩', spawns: '🍪', buildings: '🏭', earned: '💰', make_item: '⭐',
@@ -44,6 +46,8 @@ export default function BakeryTab() {
   const te = useTErr()
   const { refresh, toast, flushClicks } = useGame()
   const [orders, setOrders] = useState<OrdersState | null>(null)
+  // взять/сдать/бросить заказ — по одному запросу за раз, и видно, какому
+  const { busy, run } = useBusy()
 
   const load = () => {
     api.get('/api/orders').then((r: OrdersState) => {
@@ -62,7 +66,7 @@ export default function BakeryTab() {
     return () => clearInterval(timer)
   }, [])
 
-  const takeOrder = async (o: Order) => {
+  const takeOrder = (o: Order) => run('take:' + o.id, async () => {
     try {
       await api.post('/api/orders/take', { slot: o.slot, id: o.id })
       sfxBuy()
@@ -74,9 +78,9 @@ export default function BakeryTab() {
       load()
       toast(te(e.detail), true)
     }
-  }
+  })
 
-  const abandonOrder = async () => {
+  const abandonOrder = () => run('abandon', async () => {
     if (!orders?.active) return
     try {
       const r = await api.post('/api/orders/abandon',
@@ -87,9 +91,9 @@ export default function BakeryTab() {
       load()
       toast(te(e.detail), true)
     }
-  }
+  })
 
-  const claimOrder = async () => {
+  const claimOrder = () => run('claim', async () => {
     try {
       await flushClicks() // тапы должны долететь до сервера (метрика clicks)
       const r = await api.postOnce('/api/orders/claim',
@@ -104,7 +108,7 @@ export default function BakeryTab() {
       load()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const orderText = (o: Order) => t(`order_${o.template}` as any, { n: fmt(o.goal) })
 
@@ -177,10 +181,15 @@ export default function BakeryTab() {
             ))}
           </div>
         )}
+        {/* печь тапабельна целиком, поэтому и спиннер сдачи живёт в ней */}
         <div className="oven-caption">
-          {mode === 'idle' && t('bakery_pick')}
-          {mode === 'baking' && t('bakery_baking')}
-          {mode === 'ready' && t('bakery_ready')}
+          {busy === 'claim' ? <Spinner /> : (
+            <>
+              {mode === 'idle' && t('bakery_pick')}
+              {mode === 'baking' && t('bakery_baking')}
+              {mode === 'ready' && t('bakery_ready')}
+            </>
+          )}
         </div>
       </div>
 
@@ -198,16 +207,20 @@ export default function BakeryTab() {
               🎁 🍪 {fmt(active.reward_cookies)} · 🎖️ {fmt(active.reward_bp_xp)} XP
             </div>
           </div>
-          <button className="claim-chip" disabled={!active.done} onClick={claimOrder}>
-            {active.done ? t('order_claim') : `${fmt(active.progress)}/${fmt(active.goal)}`}
+          <button className="claim-chip" disabled={!active.done || busy === 'claim'}
+                  onClick={claimOrder}>
+            {busy === 'claim'
+              ? <Spinner />
+              : active.done ? t('order_claim') : `${fmt(active.progress)}/${fmt(active.goal)}`}
           </button>
         </div>
       )}
 
       {/* не сложился заказ — можно отказаться ценой одной попытки из лимита */}
       {active && !active.done && (
-        <button className="btn secondary" style={{ fontSize: 13 }} onClick={abandonOrder}>
-          {t('order_abandon')}
+        <button className="btn secondary" style={{ fontSize: 13 }}
+                disabled={busy === 'abandon'} onClick={abandonOrder}>
+          {busy === 'abandon' ? <Spinner /> : t('order_abandon')}
         </button>
       )}
 
@@ -225,8 +238,9 @@ export default function BakeryTab() {
                 {DIFF_CHEST[o.difficulty]} 🍪 {fmt(o.reward_cookies)} · 🎖️ {fmt(o.reward_bp_xp)} XP
               </div>
             </div>
-            <button className="claim-chip" onClick={() => takeOrder(o)}>
-              {t('order_take')}
+            <button className="claim-chip" disabled={busy === 'take:' + o.id}
+                    onClick={() => takeOrder(o)}>
+              {busy === 'take:' + o.id ? <Spinner /> : t('order_take')}
             </button>
           </div>
         ))}

@@ -3,6 +3,8 @@ import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxClick, sfxError, sfxFanfare } from '../sound'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 interface Float {
   id: number
@@ -20,6 +22,8 @@ export default function ClickerTab() {
   const [floats, setFloats] = useState<Float[]>([])
   const floatId = useRef(0)
   const wrapRef = useRef<HTMLDivElement>(null)
+  // тап по кнопке с запросом не должен уходить дважды
+  const { busy, run } = useBusy()
 
   // локальный предикт энергии: рисуем сразу, сервер подтверждает батчем
   const [localEnergy, setLocalEnergy] = useState(state.user.energy)
@@ -76,7 +80,7 @@ export default function ClickerTab() {
     setTimeout(() => setFloats((fs) => fs.filter((x) => x.id !== f.id)), 800)
   }
 
-  const onGoldenClick = async () => {
+  const onGoldenClick = () => run('golden', async () => {
     setGolden({ ...golden, active: false })
     hapticSuccess()
     sfxFanfare()
@@ -90,9 +94,9 @@ export default function ClickerTab() {
     } catch {
       /* исчезла на сервере раньше — не страшно */
     }
-  }
+  })
 
-  const upgrade = async () => {
+  const upgrade = () => run('click_up', async () => {
     try {
       await flushClicks() // сервер должен знать про все тапы до проверки цены
       const s = await api.post('/api/click/upgrade')
@@ -104,9 +108,9 @@ export default function ClickerTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
-  const claimTutorial = async () => {
+  const claimTutorial = () => run('tutorial', async () => {
     try {
       const r = await api.post('/api/tutorial/claim')
       hapticSuccess()
@@ -117,7 +121,7 @@ export default function ClickerTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const boost = state.boosts.find((b) => b.key === 'click_x2')
   const frenzy = state.boosts.find((b) => b.key === 'golden_frenzy')
@@ -187,9 +191,10 @@ export default function ClickerTab() {
         <button
           className="golden-cookie"
           style={{ left: `${goldenPos.left}%`, top: `${goldenPos.top}%` }}
+          disabled={busy === 'golden'}
           onPointerDown={onGoldenClick}
         >
-          🌟
+          {busy === 'golden' ? <Spinner /> : '🌟'}
         </button>
       )}
 
@@ -211,8 +216,9 @@ export default function ClickerTab() {
             ))}
           </div>
           {tut.all_done && (
-            <button className="btn" style={{ marginTop: 10 }} onClick={claimTutorial}>
-              {t('tut_claim', { n: fmt(tut.reward) })}
+            <button className="btn" style={{ marginTop: 10 }}
+                    disabled={busy === 'tutorial'} onClick={claimTutorial}>
+              {busy === 'tutorial' ? <Spinner /> : t('tut_claim', { n: fmt(tut.reward) })}
             </button>
           )}
         </div>
@@ -233,12 +239,15 @@ export default function ClickerTab() {
         </div>
         <button
           className="btn"
-          disabled={clickCapped || liveBalance < state.user.click_upgrade_cost}
+          disabled={clickCapped || busy === 'click_up'
+            || liveBalance < state.user.click_upgrade_cost}
           onClick={upgrade}
         >
-          {clickCapped
-            ? t('click_capped_btn')
-            : `${t('upgrade_for')} 🍪 ${fmt(state.user.click_upgrade_cost)}`}
+          {busy === 'click_up'
+            ? <Spinner />
+            : clickCapped
+              ? t('click_capped_btn')
+              : `${t('upgrade_for')} 🍪 ${fmt(state.user.click_upgrade_cost)}`}
         </button>
       </div>
     </div>

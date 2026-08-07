@@ -4,6 +4,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from server import cache
 from server import economy
 from server import game_config as cfg
 from server import game_logic as gl
@@ -323,34 +324,37 @@ async def create_invoice(body: BuyIn, tg: dict = Depends(tg_user)):
 
 # ---------- лидерборд ----------
 
-# Кеш топа лиги: (сезон, лига) -> (время, строки, всего игроков).
-# Каждый вызов делал три полных прохода по users, а таблица за минуту
+# Кеш топа лиги: (сезон, лига) -> {строки, всего игроков}.
+# Каждый вызов делал два полных прохода по users, а таблица за минуту
 # практически не меняется — цикл запросов деградировал базу для всех.
-_lb_cache: dict[tuple[int, str], tuple[float, list[dict], int]] = {}
+#
+# Кэш ОБЩИЙ (Redis), а не словарь процесса. Со словарём при WEB_CONCURRENCY > 1
+# у каждого воркера была своя версия таблицы со своим возрастом: F5 показывал
+# то одну, то другую, и место игрока «прыгало» безо всяких изменений в базе.
+# cache.get_json/set_json сами уходят в память процесса, когда Redis не
+# настроен или недоступен, — одиночный запуск и тесты работают как раньше.
+def _lb_cache_key(season: int, lkey: str) -> str:
+    return f"lb:{season}:{lkey}"
 
 
-def _leaderboard_cached(season: int, lkey: str, cond: str,
-                        lparams: tuple) -> tuple[list[dict], int]:
-    key = (season, lkey)
-    hit = _lb_cache.get(key)
-    now = time.time()
-    if hit and now - hit[0] < cfg.LEADERBOARD_CACHE_SEC:
-        return hit[1], hit[2]
-    rows = db.q(
-        f"SELECT user_id, username, first_name, level, season_earned "
-        f"FROM users WHERE season_id = ? AND {cond} "
-        f"ORDER BY season_earned DESC, level DESC LIMIT 100",
-        [season] + list(lparams))
-    for i, row in enumerate(rows):
-        row["rank"] = i + 1
+def _leaderboard_cached(season: int, lkey: str, level_min: int,
+                        level_max: int | None) -> tuple[list[dict], int]:
+    key = _lb_cache_key(season, lkey)
+    hit = cache.get_json(key)
+    if hit is not None:
+        return hit["top"], hit["total"]
+    # Порядок и модель ранга — в db: тем же порядком считается «моё место»
+    # ниже, а расхождение этих двух мест игрок видит как ошибку в таблице
+    rows = db.leaderboard_top(season, level_min, level_max)
+    for row in rows:
         row["name"] = row.pop("first_name") or row.pop("username") or "Player"
         row.pop("username", None)
-        row["prize"] = cfg.season_reward(i + 1, row["season_earned"])
-    total = db.q1(f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond}",
-                  [season] + list(lparams))["c"]
-    if len(_lb_cache) > 64:
-        _lb_cache.clear()
-    _lb_cache[key] = (now, rows, total)
+        # приз считается от места, а место — competition rank: двое с
+        # одинаковым результатом получают одинаковый приз, и это единственный
+        # вариант, который игрок может проверить сам
+        row["prize"] = cfg.season_reward(row["rank"], row["season_earned"])
+    total = db.leaderboard_count(season, level_min, level_max)
+    cache.set_json(key, cfg.LEADERBOARD_CACHE_SEC, {"top": rows, "total": total})
     return rows, total
 
 
@@ -360,19 +364,22 @@ async def leaderboard(tg: dict = Depends(tg_user)):
     соревнуется с новичками), а место внутри лиги — заработком ЗА СЕЗОН, ведь
     именно он и обнуляется. Раньше сортировка шла по уровню, который сезон не
     сбрасывает: таблица стояла на месте, а престиж ронял игрока на дно.
-    Топ-10 каждой лиги получают призы в конце сезона."""
+    Топ-10 каждой лиги получают призы в конце сезона.
+
+    Место — competition rank (1, 2, 2, 4) и в таблице, и в поле me.rank: обе
+    цифры считает db одной моделью. Раньше таблица нумеровала строки подряд,
+    а «моё место» схлопывало равных, и игрок с седьмой строки видел у себя
+    шестое место."""
     gl.check_rate_limit(tg["id"], "heavy", cfg.HEAVY_PER_MINUTE, 60)
     gl.ensure_user_season(tg["id"])
     season = gl.current_season()
     me = db.get_user(tg["id"])
     my_level = me["level"] if me else 1
     lkey, lo, hi = cfg.league_of(my_level)
-    cond = "level >= ?" + (" AND level <= ?" if hi is not None else "")
-    lparams = [lo] + ([hi] if hi is not None else [])
 
     # Топ и общее число игроков кешируются на LEADERBOARD_CACHE_SEC: это два
     # прохода по users на каждый вызов, а таблица за минуту почти не меняется.
-    top, players_total = _leaderboard_cached(season, lkey, cond, tuple(lparams))
+    top, players_total = _leaderboard_cached(season, lkey, lo, hi)
     top = [dict(r) for r in top]
     for row in top:
         # is_me считаем здесь, а user_id в ответ НЕ отдаём: раньше уходили
@@ -381,11 +388,8 @@ async def leaderboard(tg: dict = Depends(tg_user)):
 
     my_rank = None
     if me:
-        my_rank = db.q1(
-            f"SELECT COUNT(*) c FROM users WHERE season_id = ? AND {cond} AND "
-            f"(season_earned > ? OR (season_earned = ? AND level > ?))",
-            [season] + lparams + [me["season_earned"], me["season_earned"],
-                                  me["level"]])["c"] + 1
+        my_rank = db.leaderboard_rank(season, lo, hi,
+                                      me["season_earned"], me["level"])
     return {
         "top": top,
         "me": {"rank": my_rank, "season_earned": me["season_earned"] if me else 0},

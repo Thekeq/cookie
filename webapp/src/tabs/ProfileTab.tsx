@@ -8,6 +8,7 @@ import {
 import type { Achievement, RefMilestone } from '../types'
 import { useBusy } from '../useBusy'
 import PrestigeModal from '../PrestigeModal'
+import Spinner from './Spinner'
 
 // username бота для реф-ссылок; при деплое поменяй на своего
 const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
@@ -54,7 +55,7 @@ export default function ProfileTab() {
     }
   })
 
-  const claimMilestone = async (key: string) => {
+  const claimMilestone = (key: string) => run('ms:' + key, async () => {
     try {
       await api.post('/api/referrals/milestone', { key })
       hapticSuccess()
@@ -66,9 +67,9 @@ export default function ProfileTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
-  const claimChannel = async () => {
+  const claimChannel = () => run('channel', async () => {
     try {
       const r = await api.post('/api/channel/claim')
       hapticSuccess()
@@ -80,13 +81,15 @@ export default function ProfileTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   // window.confirm для необратимого действия — чужой шрифт, чужие кнопки и
   // ни слова о том, что сгорит, а что останется. Заменено сценой-модалкой.
   const [prestigeAsk, setPrestigeAsk] = useState(false)
 
-  const doPrestige = async () => {
+  // Модалка закрывается сразу, а запрос ещё летит — спиннер поэтому уезжает
+  // на кнопку престижа под ней, иначе сброс выглядел бы как «ничего не было».
+  const doPrestige = () => run('prestige', async () => {
     const p = state.prestige
     if (!p?.can_prestige) return
     setPrestigeAsk(false)
@@ -103,7 +106,7 @@ export default function ProfileTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   const shareAch = (title: string) => {
     shareRefLink(BOT_USERNAME, state.user.user_id, t('share_ach_text', { a: title }))
@@ -116,7 +119,7 @@ export default function ProfileTab() {
     else window.open(url, '_blank')
   }
 
-  const redeemPromo = async () => {
+  const redeemPromo = () => run('promo', async () => {
     if (!promo.trim()) return
     try {
       const r = await api.post('/api/promo/redeem', { code: promo })
@@ -129,7 +132,7 @@ export default function ProfileTab() {
       sfxError()
       toast(te(e.detail), true)
     }
-  }
+  })
 
   return (
     <div>
@@ -215,10 +218,12 @@ export default function ProfileTab() {
                 <button
                   className="claim-chip"
                   style={{ marginLeft: 10 }}
-                  disabled={!m.done || m.claimed}
+                  disabled={!m.done || m.claimed || busy === 'ms:' + m.key}
                   onClick={() => claimMilestone(m.key)}
                 >
-                  {m.claimed ? '✓' : `${m.progress}/${m.count}`}
+                  {busy === 'ms:' + m.key
+                    ? <Spinner />
+                    : m.claimed ? '✓' : `${m.progress}/${m.count}`}
                 </button>
               </div>
             ))}
@@ -238,8 +243,11 @@ export default function ProfileTab() {
           </div>
         )}
         {state.prestige?.can_prestige ? (
-          <button className="btn" onClick={() => setPrestigeAsk(true)}>
-            {t('prestige_gain', { n: state.prestige.gain_available })} ✨
+          <button className="btn" disabled={busy === 'prestige'}
+                  onClick={() => setPrestigeAsk(true)}>
+            {busy === 'prestige'
+              ? <Spinner />
+              : <>{t('prestige_gain', { n: state.prestige.gain_available })} ✨</>}
           </button>
         ) : (
           <div className="hint">
@@ -259,8 +267,9 @@ export default function ProfileTab() {
             <button className="btn secondary" style={{ flex: 1 }} onClick={openChannel}>
               {t('channel_open')}
             </button>
-            <button className="btn" style={{ flex: 1 }} onClick={claimChannel}>
-              {t('channel_check')}
+            <button className="btn" style={{ flex: 1 }}
+                    disabled={busy === 'channel'} onClick={claimChannel}>
+              {busy === 'channel' ? <Spinner /> : t('channel_check')}
             </button>
           </div>
         </div>
@@ -276,8 +285,8 @@ export default function ProfileTab() {
             value={promo}
             onChange={(e) => setPromo(e.target.value.toUpperCase())}
           />
-          <button className="claim-chip" onClick={redeemPromo}>
-            OK
+          <button className="claim-chip" disabled={busy === 'promo'} onClick={redeemPromo}>
+            {busy === 'promo' ? <Spinner /> : 'OK'}
           </button>
         </div>
       </div>
@@ -300,7 +309,7 @@ export default function ProfileTab() {
           ) : (
             <button className="claim-chip" disabled={!a.done || busy === a.key}
                     onClick={() => claimAch(a.key)}>
-              {`🍪 ${fmt(a.reward)}`}
+              {busy === a.key ? <Spinner /> : `🍪 ${fmt(a.reward)}`}
             </button>
           )}
         </div>

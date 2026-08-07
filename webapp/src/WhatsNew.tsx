@@ -6,6 +6,7 @@
 //
 // Список короткий и на языке игрока: что для него изменилось, а не что мы
 // сделали. Версия хранится в localStorage — экран показывается один раз.
+import { useFocusTrap } from './a11y'
 import { useT } from './i18n'
 
 /** Поднимай при заметных для игрока изменениях. */
@@ -26,14 +27,22 @@ const NOTES: { ico: string; key: string }[] = [
 
 export default function WhatsNew({ onClose }: Props) {
   const t = useT()
+  const trap = useFocusTrap(onClose)
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ textAlign: 'center', marginBottom: 12 }}>{t('whats_new_title')}</h3>
+      <div
+        ref={trap}
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="whatsnew-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 id="whatsnew-title" style={{ textAlign: 'center', marginBottom: 12 }}>{t('whats_new_title')}</h3>
         <div className="wn-list">
           {NOTES.map((n) => (
             <div className="wn-row" key={n.key}>
-              <span className="wn-ico">{n.ico}</span>
+              <span className="wn-ico" aria-hidden="true">{n.ico}</span>
               <span>{t(n.key as any)}</span>
             </div>
           ))}

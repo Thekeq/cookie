@@ -3,11 +3,31 @@ import { createContext, useContext } from 'react'
 
 export type Lang = 'en' | 'uk' | 'ru'
 
+/** Язык, на который откатываемся, если ключа нет в активном словаре. */
+export const FALLBACK_LANG: Lang = 'en'
+
 export const LANGS: { code: Lang; label: string; flag: string }[] = [
   { code: 'en', label: 'English', flag: 'EN' },
   { code: 'uk', label: 'Українська', flag: 'UA' },
   { code: 'ru', label: 'Русский', flag: 'RU' },
 ]
+
+/** BCP-47 теги для Intl (NumberFormat, PluralRules, DateTimeFormat). */
+export const LOCALE_TAG: Record<Lang, string> = { en: 'en', uk: 'uk-UA', ru: 'ru-RU' }
+
+// Активный язык живёт ещё и вне React: форматтеры чисел (format.ts) зовутся из
+// обычных функций, куда контекст не дотянуть. Держим здесь один источник правды.
+let activeLang: Lang = FALLBACK_LANG
+
+export function getActiveLang(): Lang {
+  return activeLang
+}
+
+/** Зовётся из App при старте и при смене языка; синхронно, до рендера детей. */
+export function setActiveLang(lang: Lang) {
+  activeLang = lang
+  if (typeof document !== 'undefined') document.documentElement.lang = LOCALE_TAG[lang]
+}
 
 const dict = {
   // общее
@@ -20,6 +40,12 @@ const dict = {
   tab_profile: { en: 'Profile', uk: 'Профіль', ru: 'Профиль' },
   tab_admin: { en: 'Admin', uk: 'Адмін', ru: 'Админ' },
   error: { en: 'Error', uk: 'Помилка', ru: 'Ошибка' },
+  // подпись к красной точке-бейджу: одним цветом состояние кодировать нельзя
+  badge_new: { en: 'has something to claim', uk: 'є що забрати', ru: 'есть что забрать' },
+  balance_label: { en: 'Balance', uk: 'Баланс', ru: 'Баланс' },
+  nav_sections: { en: 'Sections', uk: 'Розділи', ru: 'Разделы' },
+  current_step: { en: 'current', uk: 'поточний', ru: 'текущий' },
+  step_done: { en: 'done', uk: 'виконано', ru: 'выполнено' },
   welcome: { en: 'Welcome to Cookie Merge! 🍪', uk: 'Ласкаво просимо до Cookie Merge! 🍪', ru: 'Добро пожаловать в Cookie Merge! 🍪' },
   offline_income: { en: 'Offline income', uk: 'Дохід офлайн', ru: 'Пассивный доход' },
   offline_title: { en: 'While you were away', uk: 'Поки тебе не було', ru: 'Пока тебя не было' },
@@ -377,10 +403,112 @@ const dict = {
 
 export type TKey = keyof typeof dict
 
-export function translate(lang: Lang, key: TKey, vars?: Record<string, string | number>): string {
-  let s: string = dict[key]?.[lang] ?? dict[key]?.en ?? key
-  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replace(`{${k}}`, String(v))
+// ---------------------------------------------------------------------------
+// Множественное число (ICU plural rules)
+//
+// «1 печенька / 2 печеньки / 5 печенек» одной строкой с {n} не выражается:
+// в ru/uk три формы, и правило нелинейное (21 — «печенька», 11 — «печенек»).
+// Категории считает Intl.PluralRules, словарь хранит по форме на категорию.
+// ---------------------------------------------------------------------------
+type PluralCat = 'zero' | 'one' | 'two' | 'few' | 'many' | 'other'
+type PluralForms = Partial<Record<PluralCat, string>> & { other: string }
+
+const plurals = {
+  n_cookies: {
+    en: { one: '{n} cookie', other: '{n} cookies' },
+    uk: { one: '{n} печенька', few: '{n} печеньки', many: '{n} печеньок', other: '{n} печеньки' },
+    ru: { one: '{n} печенька', few: '{n} печеньки', many: '{n} печенек', other: '{n} печеньки' },
+  },
+  n_days: {
+    en: { one: '{n} day', other: '{n} days' },
+    uk: { one: '{n} день', few: '{n} дні', many: '{n} днів', other: '{n} дня' },
+    ru: { one: '{n} день', few: '{n} дня', many: '{n} дней', other: '{n} дня' },
+  },
+  n_taps: {
+    en: { one: '{n} tap', other: '{n} taps' },
+    uk: { one: '{n} тап', few: '{n} тапи', many: '{n} тапів', other: '{n} тапа' },
+    ru: { one: '{n} тап', few: '{n} тапа', many: '{n} тапов', other: '{n} тапа' },
+  },
+  daily_streak_n: {
+    en: { one: 'Streak: {n} day', other: 'Streak: {n} days' },
+    uk: { one: 'Стрік: {n} день', few: 'Стрік: {n} дні', many: 'Стрік: {n} днів', other: 'Стрік: {n} дня' },
+    ru: { one: 'Стрик: {n} день', few: 'Стрик: {n} дня', many: 'Стрик: {n} дней', other: 'Стрик: {n} дня' },
+  },
+} satisfies Record<string, Record<Lang, PluralForms>>
+
+export type TPluralKey = keyof typeof plurals
+
+const pluralRules = new Map<Lang, Intl.PluralRules>()
+function rulesFor(lang: Lang): Intl.PluralRules {
+  let r = pluralRules.get(lang)
+  if (!r) {
+    r = new Intl.PluralRules(LOCALE_TAG[lang])
+    pluralRules.set(lang, r)
+  }
+  return r
+}
+
+// Пропущенные ключи логируем, но по одному разу на ключ+язык: словарь трогают
+// каждым релизом, и без лога дыра тихо уезжает в прод как английский текст.
+const warned = new Set<string>()
+function warnMissing(kind: string, key: string, lang: Lang, fellBackTo: Lang | null) {
+  const id = `${kind}:${lang}:${key}`
+  if (warned.has(id)) return
+  warned.add(id)
+  console.warn(
+    fellBackTo
+      ? `[i18n] нет перевода ${kind} "${key}" для "${lang}" — показываю "${fellBackTo}"`
+      : `[i18n] неизвестный ключ ${kind} "${key}" (${lang})`,
+  )
+}
+
+function interpolate(s: string, vars?: Record<string, string | number>): string {
+  if (!vars) return s
+  for (const [k, v] of Object.entries(vars)) s = s.split(`{${k}}`).join(String(v))
   return s
+}
+
+export function translate(lang: Lang, key: TKey, vars?: Record<string, string | number>): string {
+  const entry = dict[key] as Record<Lang, string> | undefined
+  let s: string
+  if (!entry) {
+    warnMissing('key', String(key), lang, null)
+    s = String(key)
+  } else if (entry[lang]) {
+    s = entry[lang]
+  } else {
+    warnMissing('key', String(key), lang, FALLBACK_LANG)
+    s = entry[FALLBACK_LANG] ?? String(key)
+  }
+  return interpolate(s, vars)
+}
+
+/**
+ * Перевод с учётом числа: `translatePlural(lang, 'n_cookies', 5)` → «5 печенек».
+ *
+ * `count` идёт в Intl.PluralRules как есть; подставляется в `{n}` либо
+ * `vars.n` (для сокращённых чисел вида «1.2K»), либо сам count в локали.
+ */
+export function translatePlural(
+  lang: Lang,
+  key: TPluralKey,
+  count: number,
+  vars?: Record<string, string | number>,
+): string {
+  const entry = plurals[key] as Record<Lang, PluralForms> | undefined
+  if (!entry) {
+    warnMissing('plural', String(key), lang, null)
+    return String(key)
+  }
+  let forms = entry[lang]
+  if (!forms) {
+    warnMissing('plural', String(key), lang, FALLBACK_LANG)
+    forms = entry[FALLBACK_LANG]
+  }
+  const cat = rulesFor(lang).select(count) as PluralCat
+  const s = forms[cat] ?? forms.other
+  const shown = vars?.n ?? (isFinite(count) ? count.toLocaleString(LOCALE_TAG[lang]) : '∞')
+  return interpolate(s, { ...vars, n: shown })
 }
 
 // Серверные ошибки приходят кодами "err_xxx" или "err_xxx|параметр" —
@@ -395,12 +523,14 @@ export function translateError(lang: Lang, detail: string | undefined): string {
 
 export function loadLang(): Lang {
   const saved = localStorage.getItem('lang')
-  if (saved === 'en' || saved === 'uk' || saved === 'ru') return saved
-  return 'en' // дефолт — английский
+  const lang: Lang = saved === 'en' || saved === 'uk' || saved === 'ru' ? saved : FALLBACK_LANG
+  setActiveLang(lang) // <html lang> и форматтеры чисел — сразу, до первого рендера
+  return lang
 }
 
 export function saveLang(lang: Lang) {
   localStorage.setItem('lang', lang)
+  setActiveLang(lang)
 }
 
 export const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>({
@@ -408,9 +538,28 @@ export const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>
   setLang: () => {},
 })
 
-export function useT() {
+/**
+ * Функция перевода. Старая сигнатура `t('key')` / `t('key', { n })` работает
+ * как раньше; для числовых форм — `t.plural('n_cookies', 5)`.
+ */
+export interface TFunc {
+  (key: TKey, vars?: Record<string, string | number>): string
+  plural(key: TPluralKey, count: number, vars?: Record<string, string | number>): string
+}
+
+export function useT(): TFunc {
   const { lang } = useContext(LangCtx)
-  return (key: TKey, vars?: Record<string, string | number>) => translate(lang, key, vars)
+  const t = ((key: TKey, vars?: Record<string, string | number>) =>
+    translate(lang, key, vars)) as TFunc
+  t.plural = (key, count, vars) => translatePlural(lang, key, count, vars)
+  return t
+}
+
+/** Отдельный хук, если в компоненте нужны только множественные формы. */
+export function useTPlural() {
+  const { lang } = useContext(LangCtx)
+  return (key: TPluralKey, count: number, vars?: Record<string, string | number>) =>
+    translatePlural(lang, key, count, vars)
 }
 
 // Хук перевода серверных ошибок: const te = useTErr(); toast(te(e.detail))

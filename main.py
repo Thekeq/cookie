@@ -11,15 +11,17 @@ import time
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from bot import webhook
 from bot.loader import bot, dp
 from bot.notifier import run_notifier
-from server import obs, settings
+from server import auth, obs, settings
+from server.deps import rate_limit
 from server.economy import ConflictError
 from server.routers import game, meta, admin, farm
 
@@ -124,6 +126,10 @@ app = FastAPI(title="Cookie Merge API",
               docs_url="/docs" if DEBUG else None,
               redoc_url=None,
               openapi_url="/openapi.json" if DEBUG else None,
+              # Лимитер вешается на приложение, а не на отдельные ручки: так
+              # новую ручку физически нельзя забыть прикрыть. Точечные лимиты
+              # внутри роутеров остаются — они знают цену конкретной работы.
+              dependencies=[Depends(rate_limit)],
               lifespan=lifespan)
 
 # Источники ограничиваем WEBAPP_URL: allow_origins=["*"] позволял любому сайту
@@ -137,20 +143,138 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type", "X-Lang",
                    "X-User-Revision", "X-Board-Revision", "X-Op-Id"],
+    # Без expose_headers браузер не отдаёт эти заголовки коду Mini App вовсе:
+    # серверная сессия приезжает в ответе, и прочитать её должно быть можно.
+    expose_headers=["X-Request-Id", auth.SESSION_HEADER,
+                    auth.SESSION_EXPIRES_HEADER],
 )
 
 
 MAX_BODY_BYTES = 64 * 1024
+# методы без тела не трогаем вовсе: лишний цикл чтения на каждом GET — это
+# накладные расходы на самом частом запросе игры
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+
+class BodySizeLimitMiddleware:
+    """Отказ на большом теле — по ФАКТИЧЕСКИ ПРОЧИТАННЫМ байтам.
+
+    Раньше здесь смотрели только заголовок Content-Length, и обходилось это
+    одной строчкой: `Transfer-Encoding: chunked` (а в HTTP/2 длина не
+    обязательна вовсе) — заголовка нет, проверять нечего, тело любого размера
+    доезжало до парсера JSON. SQLite синхронный и делит процесс с ботом,
+    поэтому такой запрос — это не «много памяти у одного», а остановка игры
+    для всех, кто в этот момент нажимает на печеньку.
+
+    Поэтому тело читается здесь и целиком (64 КБ — не та величина, ради
+    которой стоит городить потоковую обработку), а дальше отдаётся приложению
+    уже готовым куском. Ровно то же самое делает Starlette при `await
+    request.json()`, только без верхней границы.
+
+    Обычным `@app.middleware("http")` это не сделать: BaseHTTPMiddleware не
+    даёт подменить `receive`, а бросать исключение из середины чтения поздно —
+    ответ к тому моменту уже начат, и наружу вместо 413 уходит 500.
+    """
+
+    def __init__(self, app, max_bytes: int = MAX_BODY_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in _BODY_METHODS:
+            return await self.app(scope, receive, send)
+
+        # Content-Length, если он есть, отбиваем ДО чтения: незачем принимать
+        # мегабайты, про которые отправитель сам сказал, что их мегабайты
+        for name, value in scope.get("headers", ()):
+            if name == b"content-length" and value.isdigit():
+                if int(value) > self.max_bytes:
+                    return await self._too_large(scope, receive, send)
+                break
+
+        body, more = b"", True
+        while more:
+            message = await receive()
+            if message["type"] != "http.request":
+                # клиент отвалился на середине — отвечать некому
+                return await self.app(scope, _replay(body, closed=True), send)
+            body += message.get("body", b"")
+            if len(body) > self.max_bytes:
+                return await self._too_large(scope, receive, send)
+            more = message.get("more_body", False)
+        return await self.app(scope, _replay(body), send)
+
+    async def _too_large(self, scope, receive, send):
+        response = JSONResponse({"detail": "Payload too large"}, status_code=413)
+        await response(scope, receive, send)
+
+
+def _replay(body: bytes, closed: bool = False):
+    """Уже прочитанное тело в виде обычного ASGI-receive для приложения."""
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
+
+
+# Content-Security-Policy собирается из того, что РЕАЛЬНО грузит собранный
+# webapp/dist, а не из общих соображений: политика, которая ломает приложение,
+# живёт до первой жалобы и снимается целиком.
+#   script-src   — свои бандлы (/assets/*.js) и telegram-web-app.js. Инлайновых
+#                  скриптов в сборке нет, поэтому 'unsafe-inline' здесь не
+#                  нужен — а это главное, ради чего CSP вообще ставят.
+#   style-src    — шрифты Google + 'unsafe-inline': в коде 172 места со
+#                  style={{...}}, а инлайновый АТРИБУТ стиля CSP режет так же,
+#                  как тег <style>. Убрать это можно только переписав вёрстку.
+#   frame-ancestors — Telegram открывает Mini App в iframe со своего домена.
+#                  По той же причине здесь нет X-Frame-Options: DENY — он
+#                  убил бы веб-версию Telegram целиком.
+CSP = "; ".join((
+    "default-src 'self'",
+    "script-src 'self' https://telegram.org",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' data: https://fonts.gstatic.com",
+    "img-src 'self' data: blob:",
+    "media-src 'self'",
+    "connect-src 'self'",
+    "frame-ancestors https://telegram.org https://*.telegram.org",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "object-src 'none'",
+))
+# 180 дней: год ставят, когда домен точно останется за приложением навсегда,
+# и ошибка здесь не откатывается — браузер помнит запрет ходить по http
+# столько, сколько ему сказали, независимо от того, что мы отдадим потом.
+HSTS = "max-age=15552000; includeSubDomains"
 
 
 @app.middleware("http")
-async def limit_body_size(request, call_next):
-    """Ранний отказ на больших телах: SQLite синхронный и делит процесс с
-    ботом, поэтому многомегабайтный JSON парсится в ущерб всем остальным."""
-    cl = request.headers.get("content-length")
-    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-        return JSONResponse({"detail": "Payload too large"}, status_code=413)
-    return await call_next(request)
+async def security_headers(request: Request, call_next):
+    """Заголовки безопасности на КАЖДЫЙ ответ, включая ошибки и статику.
+
+    Дублируются в deploy/nginx-cookie.conf. Это не лишняя работа: nginx
+    защищает то, что раздаёт он, а приложение — то, что оно отдаёт при прямом
+    обращении (дев-режим, канарейка, порт 8000, открытый мимо прокси)."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Content-Security-Policy", CSP)
+    # HSTS имеет смысл только на https и только там его и ставим: на локальном
+    # http браузер его игнорирует, а вот забытый на дев-домене max-age
+    # запоминается всерьёз
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    if proto == "https":
+        response.headers.setdefault("Strict-Transport-Security", HSTS)
+    return response
 
 
 # Медленным считаем ответ дольше двух секунд: игрок в этот момент смотрит на
