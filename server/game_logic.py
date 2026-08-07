@@ -790,11 +790,13 @@ def click_multiplier(user_id: int) -> float:
         mult *= cfg.BOOST_CLICK_X2_MULT
     if "golden_frenzy" in boosts:
         mult *= cfg.GOLDEN_EFFECTS["frenzy"]["mult"]
-    # Ивент выходных умножает активный доход. Сознательно НЕ попадает в
-    # permanent_click_multiplier: тот кормит hourly_income, а через него —
-    # награды заказов и цены доски. Ровно так золотая печенька когда-то
-    # раздувала стоимость сундуков в семь раз.
-    return mult * event_multiplier()
+    # Ивент выходных умножает активный доход. Спрашиваем разрешение ПО ИМЕНИ
+    # источника: список усиленного лежит в cfg.EVENT_BOOSTED_SOURCES, и «что
+    # ускоряет ивент» читается из конфига, а не из списка вызовов.
+    # Сознательно НЕ попадает в permanent_click_multiplier: тот кормит
+    # hourly_income, а через него — награды заказов и цены доски. Ровно так
+    # золотая печенька когда-то раздувала стоимость сундуков в семь раз.
+    return mult * event_source_multiplier("click")
 
 
 # ---------- золотая печенька ----------
@@ -1094,29 +1096,246 @@ def _consume_recipe(user_id: int, now: float | None = None) -> float:
 
 
 # ---------- выходные-ивенты ----------
+#
+# Ивент детерминирован календарём: какой сценарий и когда — считается, а не
+# хранится. Хранить всё же приходится ДВЕ вещи, и обе не выводятся из календаря:
+#   1) снимок конфига на момент старта — правка EVENTS на живом ивенте не имеет
+#      права пересчитывать то, что игроки уже отыграли;
+#   2) отметку kill switch для конкретного прогона.
+# Отдельной таблицы под это нет, поэтому обе живут строками аналитики с
+# префиксом `event_cfg:` — ключ уникален по построению (в нём event_id),
+# значение одно число, TTL аналитики (30 дней) заведомо переживает выходные.
+# Правильный дом для них — маленькая таблица event_runs; см. отчёт.
+
+_EVENT_SNAPSHOT_FIELDS = ("mult", "goal_hours", "reward_hours")
+# как часто перечитывать снимок из базы: kill switch, поставленный на одном
+# воркере, должен доехать до остальных, но не ценой запроса на каждый клик
+_EVENT_SNAPSHOT_TTL = 60.0
+_event_snapshot_memo: dict[str, tuple[float, dict]] = {}
+
+
+def event_id_of(key: str, started_at: float) -> str:
+    """Идентификатор ПРОГОНА ивента: сценарий + его старт.
+
+    Один и тот же сценарий приходит каждые несколько недель, и «sugar_rush» без
+    даты не отличает июльские выходные от августовских — ни в аналитике, ни в
+    токене награды, ни в отметке kill switch."""
+    return f"{key}:{int(started_at)}"
+
+
+def _event_cfg_key(event_id: str, field: str) -> str:
+    return f"event_cfg:{event_id}:{field}"
+
+
+def _read_event_snapshot(event_id: str) -> dict:
+    """Снимок из базы. Пустой словарь — снимка ещё нет."""
+    names = tuple(_event_cfg_key(event_id, f)
+                  for f in _EVENT_SNAPSHOT_FIELDS + ("killed",))
+    holes = ", ".join("?" * len(names))
+    rows = db.q(f"SELECT event, value FROM events WHERE event IN ({holes}) "
+                "ORDER BY id", names)
+    out: dict[str, float] = {}
+    for r in rows:                      # первая запись выигрывает: снимок один
+        out.setdefault(r["event"].rsplit(":", 1)[-1], r["value"])
+    return out
+
+
+def _write_event_snapshot(event_id: str, snap: dict, now: float) -> None:
+    """Кладёт снимок, если его ещё нет. INSERT ... WHERE NOT EXISTS, а не
+    «прочитать и вставить»: два воркера, увидевшие старт ивента одновременно,
+    иначе записали бы по строке на поле."""
+    for field in _EVENT_SNAPSHOT_FIELDS:
+        name = _event_cfg_key(event_id, field)
+        db.exec("INSERT INTO events (user_id, event, value, created_at) "
+                "SELECT 0, ?, ?, ? WHERE NOT EXISTS ("
+                "  SELECT 1 FROM events WHERE event = ?)",
+                (name, float(snap[field]), now, name))
+
+
+def event_snapshot(key: str, started_at: float, now: float | None = None) -> dict:
+    """Замороженный конфиг прогона ивента: множитель, цель, награда, kill.
+
+    Берётся ОДИН раз — при первом обращении после старта — и дальше читается,
+    а не пересчитывается. Иначе правка EVENTS в понедельник задним числом
+    меняла бы субботнюю цель у тех, кто её уже почти закрыл.
+
+    Отказ базы не гасит ивент: снимок деградирует до текущего конфига."""
+    event_id = event_id_of(key, started_at)
+    hit = _event_snapshot_memo.get(event_id)
+    if hit and time.time() - hit[0] < _EVENT_SNAPSHOT_TTL:
+        return hit[1]
+    live = {"mult": cfg.EVENTS[key]["mult"],
+            "goal_hours": cfg.EVENT_GOAL_HOURS,
+            "reward_hours": cfg.EVENT_REWARD_HOURS}
+    snap = dict(live)
+    snap["killed"] = False
+    try:
+        stored = _read_event_snapshot(event_id)
+        if all(f in stored for f in _EVENT_SNAPSHOT_FIELDS):
+            snap = {f: stored[f] for f in _EVENT_SNAPSHOT_FIELDS}
+        else:
+            _write_event_snapshot(event_id, live, now or time.time())
+        snap["killed"] = bool(stored.get("killed", 0))
+    except Exception:  # noqa: S110 — снимок не имеет права ронять игру
+        pass
+    if len(_event_snapshot_memo) > 64:
+        _event_snapshot_memo.clear()
+    _event_snapshot_memo[event_id] = (time.time(), snap)
+    return snap
+
+
+def set_event_killed(event_id: str, killed: bool = True) -> None:
+    """Kill switch на конкретный прогон — без деплоя и на все процессы сразу.
+
+    Отметка durable, поэтому переживает рестарт: «выключили ивент» не должно
+    отменяться первым же перезапуском воркера. Уже выданные награды не
+    отбираются: они в книге."""
+    name = _event_cfg_key(event_id, "killed")
+    db.exec("DELETE FROM events WHERE event = ?", (name,))
+    if killed:
+        db.exec("INSERT INTO events (user_id, event, value, created_at) "
+                "VALUES (0, ?, 1, ?)", (name, time.time()))
+    _event_snapshot_memo.pop(event_id, None)
+
 
 def active_event(now: float | None = None) -> dict | None:
-    """Ивент выходных. Детерминирован от календаря — как и номер сезона,
-    поэтому не нужны ни таблица, ни фоновая задача, ни ручное включение."""
+    """Ивент выходных. Расписание — от календаря (как и номер сезона), числа —
+    из снимка, снятого на старте. Выключенный ивент не существует для игры:
+    ни множителя, ни цели, ни claim."""
     now = now or time.time()
+    if not cfg.EVENTS_ENABLED:
+        return None
     dt = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
     if dt.weekday() not in cfg.EVENT_WEEKDAYS:
         return None
     keys = sorted(cfg.EVENTS)
     # неделя года выбирает ивент: подряд идущие выходные не повторяются
     key = keys[dt.isocalendar()[1] % len(keys)]
+    if key in cfg.EVENT_DISABLED_KEYS:
+        return None
     ev = cfg.EVENTS[key]
     # окно = все дни EVENT_WEEKDAYS этой недели, до конца последнего
     start = dt - datetime.timedelta(days=dt.weekday() - min(cfg.EVENT_WEEKDAYS))
     start = start.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + datetime.timedelta(days=len(cfg.EVENT_WEEKDAYS))
-    return {"key": key, "mult": ev["mult"], "title_key": ev["title_key"],
-            "started_at": start.timestamp(), "ends_at": end.timestamp()}
+    started_at = start.timestamp()
+    snap = event_snapshot(key, started_at, now)
+    if snap["killed"]:
+        return None
+    return {"key": key, "event_id": event_id_of(key, started_at),
+            "mult": snap["mult"], "title_key": ev["title_key"],
+            "goal_hours": snap["goal_hours"],
+            "reward_hours": snap["reward_hours"],
+            "boosts": sorted(cfg.EVENT_BOOSTED_SOURCES),
+            "started_at": started_at, "ends_at": end.timestamp()}
 
 
 def event_multiplier(now: float | None = None) -> float:
+    """Множитель ивента как таковой — для витрины («сегодня x2»)."""
     ev = active_event(now)
     return ev["mult"] if ev else 1.0
+
+
+def event_source_multiplier(source: str, now: float | None = None) -> float:
+    """Множитель ивента ДЛЯ КОНКРЕТНОГО источника дохода.
+
+    Единственная законная точка входа для начисления: список усиленных
+    источников лежит в конфиге (cfg.EVENT_BOOSTED_SOURCES), а не в том, из
+    какой функции случайно позвали event_multiplier()."""
+    if source not in cfg.EVENT_BOOSTED_SOURCES:
+        return 1.0
+    return event_multiplier(now)
+
+
+def earned_between(user_id: int, since: float, until: float) -> float:
+    """Сколько игрок ЗАРАБОТАЛ за окно — по книге, а не по колонке.
+
+    total_earned знает только текущее значение, а «за выходные» и «за сутки
+    дуэли» это разница на границах окна, которую негде хранить. В книге эта
+    разница есть всегда: строки с counts_earned = 1 — ровно то, что попало в
+    total_earned. Индекс (user_id, created_at) делает выборку диапазонной."""
+    if until <= since:
+        return 0.0
+    row = db.q1("SELECT COALESCE(SUM(amount), 0) AS s FROM economy_ledger "
+                "WHERE user_id = ? AND currency = 'cookies' AND counts_earned = 1 "
+                "AND created_at >= ? AND created_at < ?", (user_id, since, until))
+    return float(row["s"] or 0.0) if row else 0.0
+
+
+def event_reward_op(event_id: str, user_id: int) -> str:
+    return f"event_goal:{event_id}:{user_id}"
+
+
+def event_state(user: dict, now: float | None = None) -> dict:
+    """Личный прогресс к цели ивента и её награда.
+
+    Цель и награда — В ЧАСАХ ДОХОДА: фиксированное число печенек через неделю
+    прокачки перестаёт быть целью. Часы взяты из СНИМКА прогона, поэтому правка
+    конфига посреди выходных не двигает уже начатую цель.
+
+    Прогресс не хранится: он считается по книге за окно ивента. Хранить его
+    отдельной колонкой значило бы завести второй источник правды о заработке —
+    и первый же пропущенный инкремент разошёлся бы с балансом."""
+    now = time.time() if now is None else now
+    ev = active_event(now)
+    if not ev:
+        return {"event": None}
+    uid = user["user_id"]
+    income = hourly_income(uid)
+    goal = max(cfg.EVENT_GOAL_MIN, income * ev["goal_hours"])
+    reward = max(cfg.EVENT_REWARD_MIN, income * ev["reward_hours"])
+    progress = earned_between(uid, ev["started_at"], min(now, ev["ends_at"]))
+    claimed = economy.already_recorded(event_reward_op(ev["event_id"], uid),
+                                       "cookies")
+    return {"event": ev, "goal": goal, "progress": progress, "reward": reward,
+            "claimed": claimed,
+            "can_claim": bool(progress >= goal and not claimed),
+            "pct": min(1.0, progress / goal) if goal > 0 else 0.0}
+
+
+def claim_event_reward(user: dict, now: float | None = None) -> dict:
+    """Забрать награду за личную цель ивента.
+
+    Токен операции привязан к прогону и игроку: ретрай ручки, второй таб и
+    снятый вручную флаг — всё это платит один раз. Проверка claimed до
+    начисления нужна только ради понятной ошибки: деньги защищает токен."""
+    now = time.time() if now is None else now
+    st = event_state(user, now)
+    if not st["event"]:
+        raise ValueError("err_no_event")
+    if st["claimed"]:
+        raise ValueError("err_claimed")
+    if st["progress"] < st["goal"]:
+        raise ValueError("err_not_ready")
+    ev = st["event"]
+    uid = user["user_id"]
+    add_cookies(uid, st["reward"], count_earned=False,
+                operation_id=event_reward_op(ev["event_id"], uid),
+                reason="event_goal", ref_type="event", ref_id=ev["event_id"])
+    track(uid, f"event_goal:{ev['key']}", st["reward"])
+    return {**event_state(db.get_user(uid), now), "reward": st["reward"],
+            "cookies": db.get_user(uid)["cookies"]}
+
+
+def _event_block(user: dict) -> dict:
+    """Кусок full_state про ивент: сам ивент плюс личная цель.
+
+    Цена вопроса — запрос по книге за окно ивента, и платится он ТОЛЬКО когда
+    ивент идёт: вне выходных active_event() отвечает по календарю, не трогая
+    базу вовсе. Поэтому проверка на активность стоит здесь, а не внутри
+    event_state: на буднях самая частая ручка игры не должна дорожать ради
+    блока, которого на экране всё равно нет.
+
+    Цель лежит отдельным ключом, а не рядом с остальным состоянием: `goal` и
+    `progress` на верхнем уровне — имена, за которые завтра начнут драться
+    другие механики."""
+    st = event_state(user)
+    if not st["event"]:
+        return {"event": None}
+    return {"event": st["event"],
+            "event_goal": {k: st[k] for k in
+                           ("goal", "progress", "reward", "claimed",
+                            "can_claim", "pct")}}
 
 
 def farm_offline_cap_hours(user: dict) -> float:
@@ -2733,9 +2952,14 @@ def full_state(user_id: int) -> dict:
         # потолок прокачки клика: кнопка апгрейда должна объяснять, почему
         # она погасла, а не просто отдавать ошибку по тапу
         "click_max_level": cfg.click_max_level(user["level"]),
-        # закваска и ивент выходных — оба видны на главном экране
+        # закваска и ивент выходных — оба видны на главном экране.
+        # У ивента отдаём ПОЛНОЕ состояние, а не только сам факт ивента: цель,
+        # прогресс и готовность награды рисуются тут же, и без них личная цель
+        # оставалась бы числом в конфиге, которого игрок никогда не видит.
+        # Ключ "event" сохраняет прежнюю форму внутри — старый клиент читает
+        # из него те же поля и не замечает добавленных.
         "recipe": recipe_status(user),
-        "event": active_event(),
+        **_event_block(user),
     }
     # версии читаются ПОСЛЕДНИМИ: выше по функции refresh_energy и last_seen_at
     # уже успели тронуть строку, и снятая заранее версия уехала бы в ответ

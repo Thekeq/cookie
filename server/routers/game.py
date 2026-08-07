@@ -626,3 +626,24 @@ async def duel_claim(tg: dict = Depends(tg_user)):
         return duels.claim(_ensure_user(tg))
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@router.get("/duel/history")
+async def duel_history(tg: dict = Depends(tg_user)):
+    """Последние закрытые дуэли. Отдельной ручкой, а не полем в /duel:
+    состояние текущей дуэли клиент поллит, а история меняется раз в сутки —
+    возить её в каждом опросе значит платить за неё постоянно."""
+    from server import duels
+    return {"items": duels.history(tg["id"])}
+
+
+# ---------- ивент выходного дня ----------
+
+@router.post("/event/claim")
+async def event_claim(tg: dict = Depends(tg_user)):
+    """Награда за личную цель ивента. Прогресс и цель клиент уже видит в
+    состоянии — здесь только начисление, идемпотентное по прогону."""
+    try:
+        return gl.claim_event_reward(_ensure_user(tg))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
