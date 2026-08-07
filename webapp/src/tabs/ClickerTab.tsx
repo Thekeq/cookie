@@ -11,7 +11,17 @@ interface Float {
   x: number
   y: number
   text: string
+  born: number
 }
+
+// Сколько живёт всплывающее «+N» и как часто их подметает общий таймер.
+// Раньше на КАЖДЫЙ тап заводился свой setTimeout: на удержании это десятки
+// отложенных задач одновременно, и каждая будила рендер отдельно. Один
+// сборщик снимает всё просроченное разом и заводится только когда есть что
+// снимать. Шаг подметания добавляет к жизни цифры максимум 200 мс — на глаз
+// это незаметно, а таймеров становится один вместо N.
+const FLOAT_TTL_MS = 800
+const FLOAT_SWEEP_MS = 200
 
 export default function ClickerTab() {
   // очередь кликов, батчи и комбо живут в App (GameCtx): переживают смену
@@ -49,6 +59,20 @@ export default function ClickerTab() {
     return () => clearInterval(timer)
   }, [state.user.max_energy, state.user.energy_regen])
 
+  // один сборщик просроченных «+N» вместо таймера на каждый тап. Зависимость
+  // ровно на «есть ли что подметать»: пока цифр нет, таймера тоже нет, и
+  // вкладка в простое не будит вебвью.
+  useEffect(() => {
+    if (floats.length === 0) return
+    const timer = setInterval(() => {
+      const cutoff = Date.now() - FLOAT_TTL_MS
+      setFloats((fs) => (fs.some((f) => f.born <= cutoff)
+        ? fs.filter((f) => f.born > cutoff)
+        : fs))          // нечего снимать — возвращаем ТОТ ЖЕ массив, иначе
+    }, FLOAT_SWEEP_MS)  // setState на каждый тик перерисовывал бы вкладку впустую
+    return () => clearInterval(timer)
+  }, [floats.length === 0])
+
   // тик времени жизни золотой печеньки
   useEffect(() => {
     if (!golden?.active) return
@@ -75,9 +99,9 @@ export default function ClickerTab() {
       x: e.clientX - rect.left,
       y: e.clientY - rect.top,
       text: `+${fmt(state.user.click_power * combo)}`,
+      born: Date.now(),
     }
     setFloats((fs) => [...fs.slice(-14), f])
-    setTimeout(() => setFloats((fs) => fs.filter((x) => x.id !== f.id)), 800)
   }
 
   const onGoldenClick = () => run('golden', async () => {

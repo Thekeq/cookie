@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { api, ApiError, startParam } from './api'
 import type { GameState } from './types'
 import { Lang, LangCtx, loadLang, saveLang, setActiveLang, useT, useTErr } from './i18n'
@@ -8,12 +8,35 @@ import Onboarding from './Onboarding'
 import DailyModal from './DailyModal'
 import OfflineModal from './OfflineModal'
 import WhatsNew, { markWhatsNewSeen, shouldShowWhatsNew } from './WhatsNew'
+// Кликер — вкладка первого кадра, он в основном бандле. Остальные пять едут
+// отдельными чанками: до первого тапа игрок их не видит, а тянут они за собой
+// мердж-доску, ферму, лидерборды, батлпасс и админку.
 import ClickerTab from './tabs/ClickerTab'
-import MergeTab from './tabs/MergeTab'
-import BakeryTab from './tabs/BakeryTab'
-import FarmTab from './tabs/FarmTab'
-import ProgressTab from './tabs/ProgressTab'
-import ProfileHubTab from './tabs/ProfileHubTab'
+
+const MergeTab = lazy(() => import('./tabs/MergeTab'))
+const BakeryTab = lazy(() => import('./tabs/BakeryTab'))
+const FarmTab = lazy(() => import('./tabs/FarmTab'))
+const ProgressTab = lazy(() => import('./tabs/ProgressTab'))
+const ProfileHubTab = lazy(() => import('./tabs/ProfileHubTab'))
+
+// Чанк начинают качать на pointerdown, а не на click: между нажатием и
+// отпусканием пальца есть ~100 мс, и на них обычно укладывается загрузка —
+// вкладка открывается без промежуточного спиннера. Промах по кнопке стоит
+// одного лишнего запроса за сессию, это дешевле мигающего экрана.
+const TAB_CHUNK: Record<string, () => Promise<unknown>> = {
+  merge: () => import('./tabs/MergeTab'),
+  bakery: () => import('./tabs/BakeryTab'),
+  farm: () => import('./tabs/FarmTab'),
+  progress: () => import('./tabs/ProgressTab'),
+  profile: () => import('./tabs/ProfileHubTab'),
+}
+const prefetchTab = (key: string) => {
+  TAB_CHUNK[key]?.().catch(() => {}) // не приехало — Suspense покажет спиннер
+}
+
+// Шаг единственного таймера приложения (см. «один таймер на всё» ниже).
+// 500 мс — общий делитель всех прежних периодов: 1с, 1.5с, 30с.
+const TICK_MS = 500
 
 interface Ctx {
   state: GameState
@@ -148,52 +171,73 @@ function Game() {
     }
   }, [sendClickBatch])
 
-  // батч-отправка раз в 1.5 сек — работает с любой открытой вкладкой
-  useEffect(() => {
-    if (!state || showOnboarding) return
-    const timer = setInterval(() => {
-      if (clickInflight.current) return
-      const p = sendClickBatch()
-      clickInflight.current = p
-      p.finally(() => (clickInflight.current = null))
-    }, 1500)
-    return () => clearInterval(timer)
-  }, [state !== null, showOnboarding, sendClickBatch])
-
-  // локальное затухание комбо: пауза в тапах > 4с — гаснет сразу на клиенте
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (combo > 1 && Date.now() - lastTapAt.current > 4000) setCombo(1)
-    }, 400)
-    return () => clearInterval(timer)
-  }, [combo])
-
-  // тик пассивного дохода: ферма (cps) + мердж-доска (в час) капают на глазах
-  useEffect(() => {
-    if (!state) return
-    const perSec = (state.farm?.cps || 0) + (state.passive_per_hour || 0) / 3600
-    if (perSec <= 0) return
-    const timer = setInterval(() => setLiveCookies((v) => v + perSec), 1000)
-    return () => clearInterval(timer)
-  }, [state?.farm?.cps, state?.passive_per_hour])
-
-  // энергия тоже восстанавливается на глазах: раньше число в шапке стояло
-  // мёртвым до ответа сервера, и «подожди, пока накопится» выглядело как баг
-  useEffect(() => {
-    if (!state) return
-    const regen = state.user.energy_regen || 0
-    if (regen <= 0) return
-    const timer = setInterval(() => setLiveEnergy((v) => v + regen), 1000)
-    return () => clearInterval(timer)
-  }, [state?.user.energy_regen])
   useEffect(() => setLiveEnergy(0), [state?.user.energy])
 
-  // сервер знает правду: раз в 30 сек синкаем накопленное (collect в /api/state)
+  // ---- один таймер на всё приложение ----
+  //
+  // Раньше здесь крутилось пять независимых setInterval: батч кликов (1.5с),
+  // затухание комбо (0.4с), тик печенек (1с), тик энергии (1с) и синк с
+  // сервером (30с). На дешёвом Android каждый таймер — это отдельный wakeup
+  // и отдельный проход рендера; вместе они не давали главному потоку
+  // простаивать вообще. Теперь тикает ОДИН интервал, а прежние периоды
+  // выражены кратностью его тика.
+  //
+  // Эффект монтируется ровно один раз: всё, что меняется от рендера к
+  // рендеру, лежит в ref-ах, иначе пересоздание интервала при каждом тапе
+  // (combo менялся) сбрасывало бы счётчик и 30-секундный синк не наступал
+  // бы никогда.
+  const perSecRef = useRef(0)
+  const energyRegenRef = useRef(0)
+  const liveRef = useRef(false)
   useEffect(() => {
-    if (!state || showOnboarding) return
-    const timer = setInterval(() => refresh().catch(() => {}), 30_000)
-    return () => clearInterval(timer)
-  }, [state !== null, showOnboarding, refresh])
+    perSecRef.current = state ? (state.farm?.cps || 0) + (state.passive_per_hour || 0) / 3600 : 0
+    energyRegenRef.current = state?.user.energy_regen || 0
+    liveRef.current = !!state && !showOnboarding
+  })
+
+  useEffect(() => {
+    let n = 0
+    let id: ReturnType<typeof setInterval> | null = null
+
+    const tick = () => {
+      n += 1
+      // комбо гаснет и на паузе в игре — проверка дешёвая, без setState,
+      // если значение не изменилось (React отбрасывает такой апдейт)
+      if (Date.now() - lastTapAt.current > 4000) setCombo((c) => (c > 1 ? 1 : c))
+      if (!liveRef.current) return
+
+      if (n % 2 === 0) {
+        // 1 с: пассивка (ферма + доска) и реген энергии капают на глазах
+        if (perSecRef.current > 0) setLiveCookies((v) => v + perSecRef.current)
+        if (energyRegenRef.current > 0) setLiveEnergy((v) => v + energyRegenRef.current)
+      }
+      if (n % 3 === 0 && !clickInflight.current) {
+        // 1.5 с: батч кликов — работает с любой открытой вкладкой
+        const p = sendClickBatch()
+        clickInflight.current = p
+        p.finally(() => (clickInflight.current = null))
+      }
+      if (n % 60 === 0) {
+        // 30 с: сервер знает правду (collect внутри /api/state)
+        refresh().catch(() => {})
+      }
+    }
+
+    // Свёрнутый вебвью всё равно душит таймеры, но не гарантированно и не
+    // сразу: пока он их душит не до конца, мы жжём батарею на тики, которые
+    // никто не увидит. Останавливаем сами; накопленное досчитает сервер, а
+    // на возврате уже стоит refresh() по visibilitychange (ниже).
+    const start = () => { if (id === null) id = setInterval(tick, TICK_MS) }
+    const stop = () => { if (id !== null) { clearInterval(id); id = null } }
+    const onVisibility = () => (document.visibilityState === 'visible' ? start() : stop())
+
+    start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [sendClickBatch, refresh])
 
   // Возврат в приложение. Свёрнутый вебвью душит таймеры, поэтому 30-секундный
   // синк не срабатывает, и игрок возвращался к устаревшему экрану: баланс,
@@ -309,12 +353,28 @@ function Game() {
           </div>
         </div>
         <div className="content">
-          {tab === 'clicker' && <ClickerTab />}
-          {tab === 'merge' && <MergeTab />}
-          {tab === 'bakery' && <BakeryTab />}
-          {tab === 'farm' && <FarmTab />}
-          {tab === 'progress' && <ProgressTab />}
-          {tab === 'profile' && <ProfileHubTab />}
+          {tab === 'clicker' ? (
+            <ClickerTab />
+          ) : (
+            // Тот же 🍪, что и на загрузке приложения: игрок уже видел этот
+            // экран и понимает, что идёт загрузка, а не что-то сломалось.
+            <Suspense
+              fallback={
+                // aria-hidden: подписи «загрузка» нет в словаре, а придумывать
+                // ключ мимо i18n.ts — оставить его непереведённым. Скринридер
+                // и так объявит новую вкладку, когда та смонтируется.
+                <div className="loading-screen" aria-hidden="true">
+                  <span className="spin">🍪</span>
+                </div>
+              }
+            >
+              {tab === 'merge' && <MergeTab />}
+              {tab === 'bakery' && <BakeryTab />}
+              {tab === 'farm' && <FarmTab />}
+              {tab === 'progress' && <ProgressTab />}
+              {tab === 'profile' && <ProfileHubTab />}
+            </Suspense>
+          )}
         </div>
         <nav className="tabbar" aria-label={t('nav_sections')}>
           {tabs.map((tb) => (
@@ -322,6 +382,8 @@ function Game() {
               key={tb.key}
               aria-current={tab === tb.key ? 'page' : undefined}
               className={tab === tb.key ? 'active' : ''}
+              onPointerDown={() => prefetchTab(tb.key)}
+              onFocus={() => prefetchTab(tb.key)}
               onClick={() => setTab(tb.key)}
             >
               <span className="ico" aria-hidden="true" style={{ position: 'relative' }}>
