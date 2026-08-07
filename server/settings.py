@@ -18,6 +18,7 @@
 import base64
 import hashlib
 import os
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -63,6 +64,24 @@ DEBUG = _b("DEBUG")
 # покрывать долгую сессию. Уменьшать нельзя — игрок начнёт получать 401 посреди
 # игры, ничего не сделав
 AUTH_MAX_AGE = _i("AUTH_MAX_AGE", 60 * 60 * 24)
+
+# Хосты, под которыми приложение согласно отвечать. Пустой список = «любой»:
+# TrustedHostMiddleware в таком виде не подключается вовсе, потому что
+# middleware со списком ["*"] — это строчка, которая выглядит как защита и ею
+# не является. Значение по умолчанию выводим из WEBAPP_URL: домен там уже
+# записан, и требовать его второй раз отдельной переменной означало бы, что
+# однажды они разъедутся.
+def _hosts() -> list[str]:
+    raw = _s("ALLOWED_HOSTS")
+    if raw:
+        return [h.strip() for h in raw.split(",") if h.strip()]
+    host = urlparse(WEBAPP_URL).hostname if WEBAPP_URL else ""
+    # localhost нужен проверкам состояния: они ходят на 127.0.0.1 мимо прокси,
+    # и без него /readyz начал бы отвечать 400 на собственной машине
+    return [host, "localhost", "127.0.0.1"] if host else []
+
+
+ALLOWED_HOSTS = _hosts()
 
 # ---------- Дев-режим ----------
 DEV_MODE = _b("DEV_MODE")

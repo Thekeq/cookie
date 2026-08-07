@@ -1455,6 +1455,186 @@ for _need, _what in (("RPO", "19.41 указан RPO — сколько данн
                                         "восстановления")):
     check(_what, _need in _rb_src)
 
+print("\n=== 20. Приватность: страницы, экспорт, удаление, журнал доступа ===")
+# Пункт 30 плана. Проверяется не «страница открывается», а три вещи, ошибка в
+# каждой из которых стоит дорого: текст обещает ровно те сроки, что стоят в
+# конфиге; удаление уносит игровое и НЕ трогает бухгалтерию; повторное нажатие
+# ничего не списывает второй раз.
+import hashlib as _hl
+import hmac as _hm
+import json as _js
+from urllib.parse import urlencode as _ue
+
+from server import auth as _auth
+from server import economy as _eco
+from server import game_config as cfg
+from server import game_logic as _gl
+from server.routers import legal as _legal
+
+_LC = TestClient(main_module.app)
+_LUID = 940_000_000 + os.getpid() % 1_000_000
+_LADMIN = _LUID + 1
+
+
+def _sign(uid, username="privacy", first_name="Privacy"):
+    """initData с подписью того же токена, который захватил server.auth."""
+    data = {"user": _js.dumps({"id": uid, "username": username,
+                               "first_name": first_name}),
+            "auth_date": str(int(time.time()))}
+    dcs = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret = _hm.new(b"WebAppData", _auth.BOT_TOKEN.encode(), _hl.sha256).digest()
+    data["hash"] = _hm.new(secret, dcs.encode(), _hl.sha256).hexdigest()
+    return {"Authorization": "tma " + _ue(data)}
+
+
+# ---- страницы ----
+_r = _LC.get("/privacy")
+_priv = _r.text
+check("20.1 /privacy отдаётся как HTML",
+      _r.status_code == 200
+      and _r.headers["content-type"].startswith("text/html"))
+check("20.2 /terms отдаётся как HTML",
+      _LC.get("/terms").status_code == 200)
+# страница обязана перечислять ровно то, что код собирает: идентификатор
+# Telegram, язык, счётчики, платежи Stars, аналитику
+check("20.3 перечислены реальные категории данных",
+      all(_s in _priv for _s in ("идентификатор", "username", "Stars",
+                                 "economy_ledger", "session")))
+check("20.4 названо реальное событие аналитики из кода",
+      "first_merge" in _priv and "tutorial_complete" in _priv)
+# сроки берутся из конфига, а не из текста: поменяют константу — поменяется
+# страница, и обещание не разъедется с поведением
+check("20.5 сроки хранения совпадают с константами конфига",
+      str(cfg.EVENTS_TTL_DAYS) in _priv and str(cfg.OPS_TTL_DAYS) in _priv
+      and str(cfg.BACKUP_KEEP) in _priv)
+check("20.6 сказано, что бэкапы шифрованные и удаление ждёт срок хранения",
+      "AES-256-GCM" in _priv and "срок" in _priv)
+check("20.7 сказано, что книгу и платежи удалить нельзя",
+      "append-only" in _priv and "обезличив" in _priv.lower())
+
+# ---- экспорт ----
+check("20.8 без подписи экспорт не отдаётся",
+      _LC.get("/api/legal/export").status_code == 401)
+check("20.9 вход игрока",
+      _LC.post("/api/auth", headers=_sign(_LUID)).status_code == 200)
+_gl.add_cookies(_LUID, 1234.0, count_earned=True,
+                operation_id=f"test_priv:{_LUID}", reason="test")
+db_module.shared().exec(
+    "INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+    "status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    (_LUID, "test_item", 10, f"chg_{_LUID}", "fulfilled", time.time()))
+db_module.shared().exec(
+    "INSERT INTO farm (user_id, building_key, count) VALUES (?, ?, ?)",
+    (_LUID, "oven", 2))
+_r = _LC.get("/api/legal/export", headers=_sign(_LUID))
+_exp = _r.json() if _r.status_code == 200 else {}
+check("20.10 экспорт отдаёт профиль и все связанные таблицы",
+      _r.status_code == 200 and _exp["account"]["user_id"] == _LUID
+      and set(_exp["data"]) >= {"events", "purchases", "farm",
+                                "economy_ledger", "referrals", "duels"})
+check("20.11 в экспорте видны и платежи, и книга операций",
+      len(_exp["data"]["purchases"]) == 1
+      and any(r["reason"] == "test" for r in _exp["data"]["economy_ledger"]))
+check("20.12 экспорт называет сроки хранения числами из конфига",
+      _exp["retention"]["analytics_events_days"] == cfg.EVENTS_TTL_DAYS
+      and _exp["retention"]["backup_snapshots"] == cfg.BACKUP_KEEP)
+
+# ---- удаление ----
+check("20.13 удаление без слова подтверждения отбивается",
+      _LC.post("/api/legal/delete", json={"confirm": "yes"},
+               headers=_sign(_LUID)).status_code == 400)
+_r = _LC.post("/api/legal/delete", json={"confirm": "DELETE"},
+              headers=_sign(_LUID))
+_del = _r.json() if _r.status_code == 200 else {}
+check("20.14 удаление проходит и отчитывается, что снесло",
+      _r.status_code == 200 and _del["already_deleted"] is False
+      and _del["deleted_rows"].get("farm") == 1)
+_row = db_module.shared().get_user(_LUID)
+check("20.15 строка игрока осталась обезличенной, а не удалённой",
+      _row is not None and _row["first_name"] == _legal.TOMBSTONE
+      and _row["username"] is None)
+check("20.16 прогресс и баланс обнулены",
+      float(_row["cookies"]) == 0 and float(_row["xp"]) == 0
+      and _row["total_clicks"] == 0 and _row["notify_blocked"] == 1)
+check("20.17 игровые строки удалены",
+      db_module.shared().q1("SELECT COUNT(*) c FROM farm WHERE user_id = ?",
+                            (_LUID,))["c"] == 0)
+# главное: удаление НЕ должно вычищать бухгалтерию
+check("20.18 книга операций и платежи остались",
+      db_module.shared().q1("SELECT COUNT(*) c FROM economy_ledger "
+                            "WHERE user_id = ?", (_LUID,))["c"] > 0
+      and db_module.shared().q1("SELECT COUNT(*) c FROM purchases "
+                                "WHERE user_id = ?", (_LUID,))["c"] == 1)
+# баланс погашен ЧЕРЕЗ книгу, иначе сверка кричала бы на этого игрока каждый день
+_rec = _eco.reconcile(_LUID)
+check("20.19 после удаления сверка не находит расхождения",
+      all(abs(v["drift"]) < 1e-6 for v in _rec.values()))
+check("20.20 факт удаления записан отдельной строкой",
+      db_module.shared().q1(
+          "SELECT COUNT(*) c FROM events WHERE user_id = ? AND event = ?",
+          (_LUID, "account_deleted"))["c"] == 1)
+# двойная отправка: вторая ничего не трогает и не списывает баланс ещё раз
+_ledger_before = db_module.shared().q1(
+    "SELECT COUNT(*) c FROM economy_ledger WHERE user_id = ?", (_LUID,))["c"]
+_r2 = _LC.post("/api/legal/delete", json={"confirm": "DELETE"},
+               headers=_sign(_LUID))
+check("20.21 повторное удаление идемпотентно",
+      _r2.status_code == 200 and _r2.json()["already_deleted"] is True)
+check("20.22 повтор не пишет в книгу второй раз",
+      db_module.shared().q1("SELECT COUNT(*) c FROM economy_ledger "
+                            "WHERE user_id = ?", (_LUID,))["c"] == _ledger_before)
+
+# ---- журнал административного доступа ----
+_saved_admin = _auth.ADMIN_ID
+_auth.ADMIN_ID = _LADMIN
+try:
+    check("20.23 чужой в админку не проходит и в журнал не попадает",
+          _LC.get("/api/admin/stats", headers=_sign(_LUID)).status_code == 403)
+    check("20.24 админ проходит",
+          _LC.get("/api/admin/stats",
+                  headers=_sign(_LADMIN, "adm", "Adm")).status_code == 200)
+    _log = _LC.get("/api/admin/access-log",
+                   headers=_sign(_LADMIN, "adm", "Adm")).json()
+    _paths = [r["event"] for r in _log["access_log"]]
+    check("20.25 обращение админа записано в журнал",
+          any("/api/admin/stats" in p for p in _paths))
+    check("20.26 журнал знает, кто именно смотрел",
+          all(r["admin_id"] == _LADMIN for r in _log["access_log"]))
+    check("20.27 отказ чужому в журнал не записан",
+          not any("403" in p for p in _paths)
+          and db_module.shared().q1(
+              "SELECT COUNT(*) c FROM events WHERE user_id = ? AND event LIKE ?",
+              (_LUID, "admin_access:%"))["c"] == 0)
+    check("20.28 журнал сам называет свой срок хранения",
+          _log["retention_days"] == cfg.EVENTS_TTL_DAYS)
+finally:
+    _auth.ADMIN_ID = _saved_admin
+
+check("20.29 второго механизма журналирования в админке не заведено",
+      "admin_access" not in _pathlib.Path("server", "routers", "admin.py"
+                                          ).read_text(encoding="utf-8")
+      and "legal.admin_audit" in _pathlib.Path("main.py").read_text(
+          encoding="utf-8"))
+
+# ---- процедура удаления из бэкапов ----
+_rb_src2 = _pathlib.Path("deploy", "RUNBOOK.md").read_text(encoding="utf-8")
+for _need, _what in (("BACKUP_KEEP", "20.30 срок жизни снимков назван константой"),
+                     ("7 суток", "20.31 сказано, за сколько удаление доезжает "
+                                 "до копий"),
+                     ("account_deleted", "20.32 описано, как повторить удаление "
+                                         "после восстановления"),
+                     ("economy_ledger", "20.33 сказано, что книга и платежи "
+                                        "не удаляются")):
+    check(_what, _need in _rb_src2)
+
+# уборка за собой: временная база общая на весь набор
+for _t in ("users", "events", "purchases", "farm", "economy_ledger",
+           "economy_ops", "economy_opening"):
+    if _t == "economy_ledger":
+        continue  # append-only: строку не удалить даже в тестах
+    db_module.shared().exec(f"DELETE FROM {_t} WHERE user_id IN (?, ?)",
+                            (_LUID, _LADMIN))
+
 for _f in (_plain, _enc, _dec, _cut, _bad_path, _dest, _up_script):
     if os.path.exists(_f):
         os.remove(_f)

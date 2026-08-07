@@ -23,7 +23,7 @@ from bot.notifier import run_notifier
 from server import auth, obs, settings
 from server.deps import rate_limit
 from server.economy import ConflictError
-from server.routers import game, meta, admin, farm
+from server.routers import game, meta, admin, farm, legal
 
 # Логи: раньше был только basicConfig(WARNING) в stdout, то есть про поломку
 # владелец узнавал от игроков. Теперь INFO с ротацией в файл — журнал платежей,
@@ -141,7 +141,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-Lang",
+    # X-Request-Id обязателен в списке: клиент ставит его на КАЖДЫЙ запрос
+    # (webapp/src/net.ts), а заголовок, которого нет в allow_headers, роняет
+    # предзапрос целиком — не сам заголовок, а весь запрос вместе с ним.
+    allow_headers=["Authorization", "Content-Type", "X-Lang", "X-Request-Id",
                    "X-User-Revision", "X-Board-Revision", "X-Op-Id"],
     # Без expose_headers браузер не отдаёт эти заголовки коду Mini App вовсе:
     # серверная сессия приезжает в ответе, и прочитать её должно быть можно.
@@ -225,6 +228,14 @@ def _replay(body: bytes, closed: bool = False):
 
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
+# Host из запроса попадает в ссылки и в редиректы, а до приложения он доезжает
+# ровно таким, каким его прислал клиент. Список хостов закрывает подстановку
+# чужого домена; подключаем ТОЛЬКО когда список непустой — middleware с ["*"]
+# выглядит как защита и ничего не проверяет.
+if settings.ALLOWED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware,
+                       allowed_hosts=settings.ALLOWED_HOSTS)
+
 
 # Content-Security-Policy собирается из того, что РЕАЛЬНО грузит собранный
 # webapp/dist, а не из общих соображений: политика, которая ломает приложение,
@@ -232,17 +243,19 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 #   script-src   — свои бандлы (/assets/*.js) и telegram-web-app.js. Инлайновых
 #                  скриптов в сборке нет, поэтому 'unsafe-inline' здесь не
 #                  нужен — а это главное, ради чего CSP вообще ставят.
-#   style-src    — шрифты Google + 'unsafe-inline': в коде 172 места со
-#                  style={{...}}, а инлайновый АТРИБУТ стиля CSP режет так же,
-#                  как тег <style>. Убрать это можно только переписав вёрстку.
+#   style-src    — 'unsafe-inline': в коде 172 места со style={{...}}, а
+#                  инлайновый АТРИБУТ стиля CSP режет так же, как тег <style>.
+#                  Убрать это можно только переписав вёрстку. Доменов Google
+#                  здесь больше нет: шрифты переехали в webapp/public/fonts,
+#                  и разрешение, которое ничему не нужно, — это просто дырка.
 #   frame-ancestors — Telegram открывает Mini App в iframe со своего домена.
 #                  По той же причине здесь нет X-Frame-Options: DENY — он
 #                  убил бы веб-версию Telegram целиком.
 CSP = "; ".join((
     "default-src 'self'",
     "script-src 'self' https://telegram.org",
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    "font-src 'self' data: https://fonts.gstatic.com",
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
     "img-src 'self' data: blob:",
     "media-src 'self'",
     "connect-src 'self'",
@@ -360,8 +373,12 @@ except ImportError:
 
 app.include_router(meta.router)
 app.include_router(game.router)
-app.include_router(admin.router)
+# admin_audit — журнал административного доступа. Вешается здесь, а не в
+# admin.py, чтобы новую админскую ручку нельзя было завести мимо журнала
+app.include_router(admin.router, dependencies=[Depends(legal.admin_audit)])
 app.include_router(farm.router)
+# /privacy, /terms, экспорт и удаление данных — ДО монтирования статики в корень
+app.include_router(legal.router)
 # webhook — до монтирования статики в корень (Mount("/") совпадает с любым
 # путём) и только при BOT_MODE=webhook; сам маршрут живёт в bot/webhook.py
 webhook.install(app)
