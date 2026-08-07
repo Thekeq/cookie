@@ -61,6 +61,19 @@ _HIST_KEY = cache.PREFIX + "m:" + _NS + "hist"
 
 _req_id: ContextVar[str] = ContextVar("req_id", default="")
 _req_user: ContextVar[int] = ContextVar("req_user", default=0)
+# Платформа и страна запроса — (platform, country). Живут тут, а не
+# прокидываются аргументами, ровно по той же причине, что и req_id: их пишет
+# аналитика из игровых модулей, которые про HTTP не знают вовсе, и передавать
+# их через десяток сигнатур значило бы получить их там, где кто-то не забыл.
+_req_client: ContextVar[tuple] = ContextVar("req_client", default=("", ""))
+
+# Значения приезжают снаружи и попадают в базу — чистим так же, как req_id.
+_CLIENT_SAFE = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+
+
+def clean_client_tag(raw: str, limit: int = 16) -> str:
+    """Метка платформы/страны в безопасном виде: строчная латиница, без мусора."""
+    return "".join(c for c in (raw or "").lower() if c in _CLIENT_SAFE)[:limit]
 
 # Идентификатор запроса приходит снаружи (reverse proxy обычно уже его ставит) и
 # попадает в логи, поэтому чистим его так же, как X-Op-Id: в журнал не должно
@@ -74,13 +87,16 @@ def new_request_id(raw: str = "") -> str:
     return clean or uuid.uuid4().hex[:16]
 
 
-def bind_request(req_id: str, user_id: int = 0):
+def bind_request(req_id: str, user_id: int = 0, platform: str = "",
+                 country: str = ""):
     """Привязать контекст к текущей задаче. Возвращает токены для сброса.
 
     Сбрасывать обязательно: воркер обслуживает следующий запрос в той же
     корутине не всегда, но contextvar без сброса живёт до конца задачи, и в
     фоновых строках лога остался бы чужой идентификатор."""
-    return _req_id.set(req_id), _req_user.set(user_id)
+    return (_req_id.set(req_id), _req_user.set(user_id),
+            _req_client.set((clean_client_tag(platform),
+                             clean_client_tag(country, 8))))
 
 
 def bind_user(user_id: int):
@@ -91,10 +107,19 @@ def bind_user(user_id: int):
 def reset_request(tokens):
     _req_id.reset(tokens[0])
     _req_user.reset(tokens[1])
+    # длина проверяется: bind_request зовут и старым способом (два токена) —
+    # например тесты и фоновые задачи, у которых клиента нет вовсе
+    if len(tokens) > 2:
+        _req_client.reset(tokens[2])
 
 
 def current_request_id() -> str:
     return _req_id.get()
+
+
+def current_client() -> tuple:
+    """(платформа, страна) текущего запроса; ('', '') вне запроса."""
+    return _req_client.get()
 
 
 class ContextFilter(logging.Filter):

@@ -1530,7 +1530,7 @@ _r = _LC.get("/api/legal/export", headers=_sign(_LUID))
 _exp = _r.json() if _r.status_code == 200 else {}
 check("20.10 экспорт отдаёт профиль и все связанные таблицы",
       _r.status_code == 200 and _exp["account"]["user_id"] == _LUID
-      and set(_exp["data"]) >= {"events", "purchases", "farm",
+      and set(_exp["data"]) >= {"analytics_events", "purchases", "farm",
                                 "economy_ledger", "referrals", "duels"})
 check("20.11 в экспорте видны и платежи, и книга операций",
       len(_exp["data"]["purchases"]) == 1
@@ -1571,7 +1571,7 @@ check("20.19 после удаления сверка не находит рас
       all(abs(v["drift"]) < 1e-6 for v in _rec.values()))
 check("20.20 факт удаления записан отдельной строкой",
       db_module.shared().q1(
-          "SELECT COUNT(*) c FROM events WHERE user_id = ? AND event = ?",
+          "SELECT COUNT(*) c FROM analytics_events WHERE user_id = ? AND event = ?",
           (_LUID, "account_deleted"))["c"] == 1)
 # двойная отправка: вторая ничего не трогает и не списывает баланс ещё раз
 _ledger_before = db_module.shared().q1(
@@ -1603,7 +1603,7 @@ try:
     check("20.27 отказ чужому в журнал не записан",
           not any("403" in p for p in _paths)
           and db_module.shared().q1(
-              "SELECT COUNT(*) c FROM events WHERE user_id = ? AND event LIKE ?",
+              "SELECT COUNT(*) c FROM analytics_events WHERE user_id = ? AND event LIKE ?",
               (_LUID, "admin_access:%"))["c"] == 0)
     check("20.28 журнал сам называет свой срок хранения",
           _log["retention_days"] == cfg.EVENTS_TTL_DAYS)
@@ -1627,8 +1627,279 @@ for _need, _what in (("BACKUP_KEEP", "20.30 срок жизни снимков �
                                         "не удаляются")):
     check(_what, _need in _rb_src2)
 
+print("\n=== 21. Аналитика: одна таблица, обязательные поля, выгрузка ===")
+# Раздел «Аналитика» плана. Проверяется не «строка записалась», а четыре вещи,
+# без каждой из которых таблица бесполезна: обязательные поля заполняются САМИ
+# (поле, которое просят заполнить руками, останется пустым); стык с книгой идёт
+# по operation_id; TTL не уносит невыгруженное; второй системы событий нет.
+from server import support as _sup
+
+_AUID = 950_000_000 + os.getpid() % 1_000_000
+_shared = db_module.shared()
+_shared.exec("DELETE FROM analytics_events WHERE user_id = ?", (_AUID,))
+_shared.exec("INSERT INTO users (user_id, lang, source_code, created_at) "
+             "VALUES (?, ?, ?, ?)", (_AUID, "uk", "tiktok_jan", time.time()))
+
+_eid = _gl.track("unit_test_event", _AUID, value=7, operation_id="op:unit:1",
+                 extra_field="hello")
+_row = _shared.q1("SELECT * FROM analytics_events WHERE event_id = ?", (_eid,))
+check("21.1 track() возвращает event_id и пишет строку",
+      bool(_eid) and _row is not None)
+check("21.2 обязательные поля заполнены без участия вызывающего",
+      _row["user_id"] == _AUID and _row["created_at"] > 0
+      and _row["config_version"] == cfg.CONFIG_VERSION
+      and _row["lang"] == "uk" and _row["variant"]
+      and _row["source"] == "link" and _row["campaign"] == "tiktok_jan")
+check("21.3 версия конфига — отпечаток КОНСТАНТ, а не случайная строка",
+      cfg.CONFIG_VERSION == cfg.config_version() and len(cfg.CONFIG_VERSION) == 12)
+check("21.4 стык с книгой идёт по operation_id",
+      _row["economy_operation_id"] == "op:unit:1")
+check("21.5 непредусмотренные свойства уезжают в props, а не теряются",
+      _js.loads(_row["props"])["extra_field"] == "hello")
+check("21.6 ветка эксперимента детерминирована",
+      _gl.experiment_variant(_AUID) == _gl.experiment_variant(_AUID))
+
+
+# ошибка аналитики не имеет права ронять игру
+def _boom(*_a, **_k):
+    raise RuntimeError("boom")
+
+
+_saved_exec = _gl.db.exec
+try:
+    _gl.db.exec = _boom
+    check("21.7 падение записи аналитики не выбрасывает наружу",
+          _gl.track("boom_event", _AUID) is None)
+finally:
+    _gl.db.exec = _saved_exec
+
+# ---- выгрузка ----
+_batch = _gl.export_batch(limit=100)
+check("21.8 выгрузка отдаёт сырые строки и курсор",
+      _batch["count"] > 0 and _batch["next_after_id"] > 0
+      and _batch["pending"] >= _batch["count"])
+check("21.9 props в выгрузке — объект, а не строка с json внутри",
+      all(isinstance(r["props"], (dict, type(None))) for r in _batch["rows"]))
+check("21.10 забор НИЧЕГО не помечает: оборвавшийся экспорт не теряет данные",
+      _shared.q1("SELECT exported_at FROM analytics_events WHERE event_id = ?",
+                 (_eid,))["exported_at"] == 0)
+_ack = _gl.mark_exported(_batch["next_after_id"])
+check("21.11 ack помечает выгруженным и уменьшает очередь",
+      _ack["marked"] > 0
+      and _shared.q1("SELECT exported_at FROM analytics_events "
+                     "WHERE event_id = ?", (_eid,))["exported_at"] > 0)
+check("21.12 повторный ack ничего не помечает второй раз",
+      _gl.mark_exported(_batch["next_after_id"])["marked"] == 0)
+
+# ---- TTL не уносит невыгруженное ----
+from bot import notifier as _notif
+
+_old = time.time() - (cfg.EVENTS_TTL_DAYS + 1) * 86400
+_shared.exec("INSERT INTO analytics_events (event_id, user_id, event, value, "
+             "created_at, exported_at) VALUES (?, ?, ?, 0, ?, 0)",
+             (f"ttl_pending_{_AUID}", _AUID, "old_pending", _old))
+_shared.exec("INSERT INTO analytics_events (event_id, user_id, event, value, "
+             "created_at, exported_at) VALUES (?, ?, ?, 0, ?, ?)",
+             (f"ttl_done_{_AUID}", _AUID, "old_exported", _old, time.time()))
+_notif._prune_events()
+check("21.13 TTL забирает выгруженное",
+      _shared.q1("SELECT COUNT(*) c FROM analytics_events WHERE event_id = ?",
+                 (f"ttl_done_{_AUID}",))["c"] == 0)
+check("21.14 TTL НЕ забирает невыгруженное — иначе D30 неизмерим по построению",
+      _shared.q1("SELECT COUNT(*) c FROM analytics_events WHERE event_id = ?",
+                 (f"ttl_pending_{_AUID}",))["c"] == 1)
+# ... но не бесконечно: запас есть, и по его истечении строка уходит громко
+_shared.exec("UPDATE analytics_events SET created_at = ? WHERE event_id = ?",
+             (_old - (cfg.ANALYTICS_EXPORT_GRACE_DAYS + 1) * 86400,
+              f"ttl_pending_{_AUID}"))
+_notif._prune_events()
+check("21.15 сверх запаса невыгруженное всё же удаляется (диск дороже)",
+      _shared.q1("SELECT COUNT(*) c FROM analytics_events WHERE event_id = ?",
+                 (f"ttl_pending_{_AUID}",))["c"] == 0)
+
+# ---- второй системы нет ----
+_gl_src = _pathlib.Path("server", "game_logic.py").read_text(encoding="utf-8")
+check("21.16 таблицы events в коде не осталось",
+      "FROM events" not in _gl_src and "INTO events" not in _gl_src
+      and "FROM events" not in _pathlib.Path(
+          "server", "routers", "legal.py").read_text(encoding="utf-8"))
+check("21.17 снимок конфига ивента уехал в app_state, а не в аналитику",
+      "app_state" in _gl_src)
+_ev_id = _gl.event_id_of("unit_evt", 1000)
+_gl.set_event_killed(_ev_id, True)
+check("21.18 kill switch ивента переживает чистилку аналитики",
+      _shared.q1("SELECT value FROM app_state WHERE name = ?",
+                 (f"event_cfg:{_ev_id}:killed",))["value"] == 1)
+_gl.set_event_killed(_ev_id, False)
+
+print("\n=== 22. Поддержка и anti-fraud (пункт 31) ===")
+# Главное здесь — не «ручка отвечает 200», а что инструмент ЗАПРЕЩАЕТ то, что
+# запрещает INCIDENTS §4: выдать мимо книги. И что массовая выдача идемпотентна:
+# повтор после обрыва не платит второй раз.
+_SUID = 960_000_000 + os.getpid() % 1_000_000
+_SUID2 = _SUID + 1
+for _u in (_SUID, _SUID2):
+    _shared.exec("INSERT INTO users (user_id, first_name, created_at) "
+                 "VALUES (?, ?, ?)", (_u, "Support", time.time()))
+_shared.exec(
+    "INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+    "status, created_at, granted_at, granted_payload) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    (_SUID, "cookies_pack", 50, f"chg_sup_{_SUID}", "fulfilled", time.time(),
+     time.time(), '{"cookies": 1000}'))
+_gl.add_cookies(_SUID, 1000, count_earned=False,
+                operation_id=f"purchase:chg_sup_{_SUID}",
+                reason="purchase_cookies", ref_type="charge",
+                ref_id=f"chg_sup_{_SUID}")
+
+_chain = _sup.payment_chain(_SUID)
+check("22.1 цепочка invoice -> payment -> grant -> refund собирается",
+      len(_chain) == 1
+      and list(_chain[0]["stages"]) == ["invoice", "payment", "grant", "refund"]
+      and _chain[0]["stages"]["payment"]["done"]
+      and _chain[0]["stages"]["grant"]["done"]
+      and _chain[0]["stages"]["refund"]["done"] is False)
+check("22.2 к платежу подтянуты движения книги (стык по operation_id)",
+      any(r["operation_id"] == f"purchase:chg_sup_{_SUID}"
+          for r in _chain[0]["ledger"]))
+
+# --- компенсация ---
+_before = float(_shared.get_user(_SUID)["cookies"])
+_comp = _sup.compensate(_SUID, "cookies", 500, "support_payment_lost",
+                        "INC-42", "тест")
+check("22.3 компенсация начисляет и возвращает баланс",
+      float(_shared.get_user(_SUID)["cookies"]) == _before + 500
+      and _comp["already_paid"] is False)
+check("22.4 компенсация ВСЕГДА проходит через книгу",
+      _shared.q1("SELECT COUNT(*) c FROM economy_ledger WHERE operation_id = ?",
+                 (_comp["operation_id"],))["c"] == 1)
+check("22.5 после компенсации сверка не находит расхождения",
+      all(abs(v["drift"]) < 1e-6 for v in _eco.reconcile(_SUID).values()))
+check("22.6 компенсация не идёт в заработок (иначе поднимет уровень и место)",
+      _shared.q1("SELECT counts_earned FROM economy_ledger "
+                 "WHERE operation_id = ?",
+                 (_comp["operation_id"],))["counts_earned"] == 0)
+_again = _sup.compensate(_SUID, "cookies", 500, "support_payment_lost", "INC-42")
+check("22.7 повтор по тому же инциденту не платит второй раз",
+      _again["already_paid"] is True
+      and float(_shared.get_user(_SUID)["cookies"]) == _before + 500)
+for _bad, _what in (
+        (("cookies", 500, "чинил руками", "INC-42"),
+         "22.8 свободная причина отвергается"),
+        (("prestige_points", 5, "support_goodwill", "INC-42"),
+         "22.9 валюта без денежного примитива отвергается"),
+        (("cookies", -500, "support_goodwill", "INC-42"),
+         "22.10 отнять этой ручкой нельзя"),
+        (("cookies", 500, "support_goodwill", "   "),
+         "22.11 компенсация без метки инцидента отвергается")):
+    try:
+        _sup.compensate(_SUID, *_bad)
+        check(_what, False)
+    except ValueError:
+        check(_what, True)
+# Не «слова UPDATE нет в файле» (оно есть в объяснении запрета), а «модуль
+# не выполняет ни одной пишущей команды»: единственный путь наружу — денежные
+# примитивы game_logic, а они пишут в книгу той же транзакцией
+_sup_src = _pathlib.Path("server", "support.py").read_text(encoding="utf-8")
+check("22.12 инструмент не выполняет ни одной записи в обход книги",
+      'db.exec(' not in _sup_src and 'db.q1w(' not in _sup_src)
+
+# --- массовая ---
+_dry = _sup.compensate_bulk([_SUID, _SUID2], "cookies", 100,
+                            "support_rollback", "INC-43")
+check("22.13 массовая выдача по умолчанию ничего не выдаёт (dry-run)",
+      _dry["dry_run"] is True and _dry["cohort_size"] == 2
+      and _shared.q1("SELECT COUNT(*) c FROM economy_ledger WHERE ref_id = ?",
+                     ("inc-43",))["c"] == 0)
+_bulk = _sup.compensate_bulk([_SUID, _SUID2], "cookies", 100,
+                             "support_rollback", "INC-43", dry_run=False)
+check("22.14 массовая выдача платит всей когорте",
+      _bulk["paid"] == 2 and _bulk["failed_count"] == 0)
+_bulk2 = _sup.compensate_bulk([_SUID, _SUID2], "cookies", 100,
+                              "support_rollback", "INC-43", dry_run=False)
+check("22.15 повторный запуск партии не платит второй раз",
+      _bulk2["paid"] == 0 and _bulk2["already_paid"] == 2)
+_bulk3 = _sup.compensate_bulk([_SUID, 10_101_010_101], "cookies", 100,
+                              "support_rollback", "INC-44", dry_run=False)
+check("22.16 несуществующий игрок не роняет всю партию",
+      _bulk3["paid"] == 1 and _bulk3["failed_count"] == 1)
+# когорта берётся из данных, а не из списка жалоб
+_cohort = _sup.cohort("ledger_reason", "support_rollback", 0, time.time() + 60)
+check("22.17 когорта инцидента поднимается из книги",
+      _SUID in _cohort and _SUID2 in _cohort)
+
+# --- флаги ---
+_shared.exec("UPDATE users SET total_clicks = ?, created_at = ? "
+             "WHERE user_id = ?", (10 ** 9, time.time() - 3600, _SUID2))
+_flags = {f["flag"] for f in _sup.flags_for(_SUID2)}
+check("22.18 нереальный темп кликов флагуется", "click_rate" in _flags)
+_shared.exec("UPDATE users SET cookie_debt = 5 WHERE user_id = ?", (_SUID2,))
+check("22.19 непогашенный долг после возврата флагуется",
+      "refund_debt" in {f["flag"] for f in _sup.flags_for(_SUID2)})
+_susp = _sup.suspicious(10)
+check("22.20 общий список подозрительных собирается по всей базе",
+      any(r["user_id"] == _SUID2 for r in _susp["click_rate"])
+      and "thresholds" in _susp)
+
+# --- ручки под общим журналом админки ---
+_auth.ADMIN_ID = _LADMIN
+try:
+    _r = _LC.get(f"/api/admin/player/{_SUID}",
+                 headers=_sign(_LADMIN, "adm", "Adm"))
+    _card = _r.json() if _r.status_code == 200 else {}
+    check("22.21 карточка игрока отдаётся админу",
+          _r.status_code == 200 and _card["user"]["user_id"] == _SUID
+          and "payments" in _card and "reconcile" in _card and "flags" in _card)
+    check("22.22 обращение к карточке записано в общий журнал с ЦЕЛЬЮ",
+          any("/api/admin/player/" in r["event"]
+              and r["target_user_id"] == _SUID
+              for r in _LC.get("/api/admin/access-log",
+                               headers=_sign(_LADMIN, "adm", "Adm")
+                               ).json()["access_log"]))
+    check("22.23 чужой в инструмент поддержки не проходит",
+          _LC.get(f"/api/admin/player/{_SUID}",
+                  headers=_sign(_LUID)).status_code == 403
+          and _LC.post("/api/admin/compensate", json={
+              "user_id": _SUID, "amount": 1, "reason": "support_goodwill",
+              "incident": "x"}, headers=_sign(_LUID)).status_code == 403)
+    _r = _LC.post("/api/admin/compensate", json={
+        "user_id": _SUID, "currency": "cookies", "amount": 10,
+        "reason": "нет такой", "incident": "INC-45"},
+        headers=_sign(_LADMIN, "adm", "Adm"))
+    check("22.24 ручка компенсации отбивает причину не из списка",
+          _r.status_code == 400)
+    _r = _LC.get("/api/admin/analytics/export?limit=5",
+                 headers=_sign(_LADMIN, "adm", "Adm"))
+    check("22.25 выгрузка аналитики доступна тем же путём, что и админка",
+          _r.status_code == 200 and "rows" in _r.json()
+          and _r.json()["ttl_days"] == cfg.EVENTS_TTL_DAYS)
+    check("22.26 второго механизма журналирования в админке по-прежнему нет",
+          "admin_access" not in _pathlib.Path(
+              "server", "routers", "admin.py").read_text(encoding="utf-8"))
+finally:
+    _auth.ADMIN_ID = _saved_admin
+
+# ---- рантбуки ----
+_inc_src = _pathlib.Path("deploy", "INCIDENTS.md").read_text(encoding="utf-8")
+for _need, _what in (
+        ("/api/admin/compensate", "22.27 INCIDENTS описывает компенсацию ручкой"),
+        ("dry_run", "22.28 INCIDENTS предупреждает про сухой прогон"),
+        ("/api/admin/fraud", "22.29 INCIDENTS описывает разбор подозрительного"),
+        ("export_analytics.py", "22.30 INCIDENTS знает про остановку выгрузки")):
+    check(_what, _need in _inc_src)
+_rb_src3 = _pathlib.Path("deploy", "RUNBOOK.md").read_text(encoding="utf-8")
+for _need, _what in (
+        ("export_analytics.py", "22.31 RUNBOOK описывает выгрузку аналитики"),
+        ("ANALYTICS_EXPORT_GRACE_DAYS",
+         "22.32 RUNBOOK называет запас, после которого сырое удаляется")):
+    check(_what, _need in _rb_src3)
+
+for _u in (_AUID, _SUID, _SUID2):
+    for _t in ("users", "analytics_events", "purchases", "economy_ops"):
+        db_module.shared().exec(f"DELETE FROM {_t} WHERE user_id = ?", (_u,))
+
 # уборка за собой: временная база общая на весь набор
-for _t in ("users", "events", "purchases", "farm", "economy_ledger",
+for _t in ("users", "analytics_events", "purchases", "farm", "economy_ledger",
            "economy_ops", "economy_opening"):
     if _t == "economy_ledger":
         continue  # append-only: строку не удалить даже в тестах

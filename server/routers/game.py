@@ -389,7 +389,7 @@ async def move(mv: MergeMove, tg: dict = Depends(require_revision)):
         record = gl.claim_item_record(db.get_user(tg["id"]), new_level)
         shiny_level = gl.roll_shiny(db.get_user(tg["id"]), new_level)
     if user["total_merges"] == 0:
-        gl.track(tg["id"], "first_merge")
+        gl.track("first_merge", tg["id"])
 
     state = gl.full_state(tg["id"])
     state["merged_level"] = new_level
@@ -423,7 +423,7 @@ async def trash(body: TrashIn, tg: dict = Depends(require_revision)):
         invested = row["paid"] or cfg.legacy_item_value(level)
         refund = invested * cfg.TRASH_REFUND
         gl.add_cookies(tg["id"], refund, count_earned=False)
-    gl.track(tg["id"], "trash_item", level)
+    gl.track("trash_item", tg["id"], value=level)
     state = gl.full_state(tg["id"])
     state["trash_refund"] = refund
     return state

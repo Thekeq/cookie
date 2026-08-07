@@ -612,8 +612,9 @@ check("gold league at lvl 14", r.json()["league"]["key"] == "gold")
 
 # --- аналитика: события пишутся ---
 check("events tracked",
-      db.q1("SELECT COUNT(*) c FROM events WHERE user_id = ?", (UID,))["c"] > 0)
-evs = {r["event"] for r in db.q("SELECT DISTINCT event FROM events WHERE user_id = ?", (UID,))}
+      db.q1("SELECT COUNT(*) c FROM analytics_events WHERE user_id = ?", (UID,))["c"] > 0)
+evs = {r["event"] for r in db.q("SELECT DISTINCT event FROM analytics_events "
+                                "WHERE user_id = ?", (UID,))}
 check("key events present", {"session", "first_order", "tutorial_complete"} <= evs, str(evs))
 
 
@@ -807,7 +808,7 @@ except pydantic.ValidationError:
 # --- cleanup ---
 for t in ("users", "board", "farm", "upgrades", "skins", "daily_quests",
           "ref_claims", "achievements", "boosts", "purchases", "orders",
-          "collection", "events", "click_batches", "bp_claims"):
+          "collection", "analytics_events", "click_batches", "bp_claims"):
     db.exec(f"DELETE FROM {t} WHERE user_id IN (?, ?)", (UID, UID2))
 db.exec("DELETE FROM referrals WHERE referrer_id = ? OR referred_id IN (?, ?)",
         (UID, UID, UID2))

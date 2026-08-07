@@ -27,6 +27,7 @@
 """
 import logging
 import time
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -47,9 +48,9 @@ log = logging.getLogger(__name__)
 TOMBSTONE = "[deleted]"
 
 # Куда писать след административного доступа. Отдельной таблицы нет намеренно:
-# админ в проекте один, объём — единицы строк в день, а events уже есть, уже
-# чистится по расписанию и уже видна админке. Цена решения честная и указана
-# на странице политики: журнал живёт столько же, сколько аналитика (30 суток),
+# админ в проекте один, объём — единицы строк в день, а analytics_events уже
+# есть, уже чистится по расписанию и уже видна админке. Цена решения честная и
+# указана на странице политики: журнал живёт столько же, сколько аналитика,
 # поэтому каждое обращение дублируется в лог приложения, у которого свой срок.
 ADMIN_ACCESS_EVENT = "admin_access"
 
@@ -59,13 +60,13 @@ WIPED_TABLES = (
     "board", "farm", "upgrades", "skins", "collection", "orders",
     "achievements", "daily_quests", "bp_claims", "ref_claims",
     "boosts", "entitlements", "click_batches", "economy_ops",
-    "events", "season_results",
+    "analytics_events", "season_results",
 )
 
 # Что читает экспорт: таблица -> колонка с идентификатором игрока. Дуэли и
 # рефералы ссылаются на игрока двумя колонками и разобраны отдельно.
 EXPORT_TABLES = (
-    ("events", "user_id"),
+    ("analytics_events", "user_id"),
     ("orders", "user_id"),
     ("collection", "user_id"),
     ("click_batches", "user_id"),
@@ -157,13 +158,9 @@ async def admin_audit(request: Request, admin: dict = Depends(tg_admin)) -> dict
     path = request.scope.get("route")
     path = getattr(path, "path", None) or request.url.path
     target = _access_target(request)
-    try:
-        db.exec("INSERT INTO events (user_id, event, value, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (admin["id"], f"{ADMIN_ACCESS_EVENT}:{request.method} {path}"[:180],
-                 target, time.time()))
-    except Exception as e:  # noqa: BLE001 — журнал не имеет права ронять админку
-        log.warning("журнал админского доступа не записан: %s", e)
+    if gl.track(f"{ADMIN_ACCESS_EVENT}:{request.method} {path}", admin["id"],
+                value=target, target_user_id=target) is None:
+        log.warning("журнал админского доступа не записан")
     log.info("админский доступ: admin=%s %s %s target=%s",
              admin["id"], request.method, path, target or "-")
     return admin
@@ -178,7 +175,7 @@ async def access_log(limit: int = 200):
     приложения по строке «админский доступ»."""
     limit = max(1, min(int(limit), 1000))
     rows = db.q("SELECT user_id AS admin_id, event, value AS target_user_id, "
-                "created_at FROM events WHERE event LIKE ? "
+                "created_at FROM analytics_events WHERE event LIKE ? "
                 "ORDER BY created_at DESC LIMIT ?",
                 (ADMIN_ACCESS_EVENT + ":%", limit))
     return {"access_log": rows, "count": len(rows),
@@ -233,6 +230,7 @@ def _retention() -> dict:
     ответ ручки, и таблица на странице политики."""
     return {
         "analytics_events_days": cfg.EVENTS_TTL_DAYS,
+        "analytics_export_grace_days": cfg.ANALYTICS_EXPORT_GRACE_DAYS,
         "idempotency_tokens_days": cfg.OPS_TTL_DAYS,
         "click_batches_hours": 1,
         "backup_snapshots": cfg.BACKUP_KEEP,
@@ -325,10 +323,13 @@ def _delete(uid: int) -> dict:
         if n:
             deleted["duels_waiting"] = n
 
-        # Отметка о самом удалении — ПОСЛЕ зачистки events, иначе её же и
-        # снесло бы. Это единственная строка аналитики, которая остаётся.
-        db.exec("INSERT INTO events (user_id, event, value, created_at) "
-                "VALUES (?, ?, ?, ?)", (uid, "account_deleted", 1, now))
+        # Отметка о самом удалении — ПОСЛЕ зачистки analytics_events, иначе её
+        # же и снесло бы. Это единственная строка аналитики, которая остаётся.
+        db.exec("INSERT INTO analytics_events (event_id, user_id, event, value, "
+                "created_at, config_version, exported_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (uuid.uuid4().hex, uid, "account_deleted", 1, now,
+                 cfg.CONFIG_VERSION))
 
     log.warning("аккаунт %s удалён по запросу игрока: строк удалено %s, "
                 "списано в книгу %s", uid, sum(deleted.values()), burned)
@@ -392,9 +393,13 @@ def _retention_rows_ru() -> str:
     r = _retention()
     return (
         "<table><tr><th>Что</th><th>Сколько хранится</th><th>Чем задано</th></tr>"
-        f"<tr><td>Аналитические события (<code>events</code>)</td>"
-        f"<td>{r['analytics_events_days']} суток, затем удаляются задачей "
-        f"<code>events_prune</code></td><td><code>EVENTS_TTL_DAYS</code></td></tr>"
+        f"<tr><td>Аналитические события (<code>analytics_events</code>)</td>"
+        f"<td>{r['analytics_events_days']} суток после выгрузки в наше "
+        f"аналитическое хранилище, затем удаляются задачей "
+        f"<code>events_prune</code>; ещё не выгруженные — не дольше "
+        f"{r['analytics_events_days'] + r['analytics_export_grace_days']} суток"
+        f"</td><td><code>EVENTS_TTL_DAYS</code>, "
+        f"<code>ANALYTICS_EXPORT_GRACE_DAYS</code></td></tr>"
         f"<tr><td>Токены повторной отправки с сохранёнными ответами "
         f"(<code>economy_ops</code>)</td><td>{r['idempotency_tokens_days']} суток"
         f"</td><td><code>OPS_TTL_DAYS</code></td></tr>"
@@ -419,9 +424,14 @@ def _retention_rows_en() -> str:
     r = _retention()
     return (
         "<table><tr><th>Data</th><th>Retention</th><th>Set by</th></tr>"
-        f"<tr><td>Analytics events (<code>events</code>)</td>"
-        f"<td>{r['analytics_events_days']} days, then deleted by the "
-        f"<code>events_prune</code> job</td><td><code>EVENTS_TTL_DAYS</code></td></tr>"
+        f"<tr><td>Analytics events (<code>analytics_events</code>)</td>"
+        f"<td>{r['analytics_events_days']} days after the row is exported to "
+        f"our own analytics storage, then deleted by the "
+        f"<code>events_prune</code> job; rows not yet exported are kept no "
+        f"longer than "
+        f"{r['analytics_events_days'] + r['analytics_export_grace_days']} days"
+        f"</td><td><code>EVENTS_TTL_DAYS</code>, "
+        f"<code>ANALYTICS_EXPORT_GRACE_DAYS</code></td></tr>"
         f"<tr><td>Retry tokens with stored responses (<code>economy_ops</code>)</td>"
         f"<td>{r['idempotency_tokens_days']} days</td>"
         f"<td><code>OPS_TTL_DAYS</code></td></tr>"
@@ -482,8 +492,15 @@ Telegram, статус, что именно было выдано и когда,
 
 <h3>4. Аналитика</h3>
 <p>Своя, внутри той же базы; сторонних счётчиков, рекламных SDK и
-трекинговых cookie нет. Пишется имя события, число и время, привязанные к
-идентификатору игрока. Полный список событий, который умеет писать код:
+трекинговых cookie нет. В строке события (<code>analytics_events</code>)
+записываются: имя события, число и серверное время, идентификатор игрока,
+версия игрового баланса, источник перехода (органика / рекламная ссылка /
+приглашение) и его код, язык интерфейса, <b>код страны — тот, что подставляет
+наш обратный прокси по IP-адресу; сам IP-адрес не сохраняется</b>, платформа
+Telegram (<code>ios</code>, <code>android</code>, <code>tdesktop</code>,
+<code>web</code>), ветка A/B-эксперимента и идентификатор операции в книге
+движений валюты, если событию соответствует начисление. Полный список событий,
+который умеет писать код:
 <code>session</code>, <code>first_merge</code>, <code>first_building</code>,
 <code>first_order</code>, <code>order_take</code>, <code>order_done</code>,
 <code>order_abandon</code>, <code>order_stale_dropped</code>,
@@ -606,7 +623,11 @@ data. <b>No card data, billing name, phone, e-mail, contacts or location</b> —
 Telegram processes the payment and we never receive them. From analytics:
 first-party event rows only (session, first_merge, first_building, first_order,
 order_take/done/abandon, trash_item, item_record, shiny_drop, quest_reroll,
-duel_start, tutorial_complete). There are no third-party analytics SDKs, ad
+duel_start, tutorial_complete), each carrying the server timestamp, the game
+config version, the acquisition source and its code, interface language, the
+country code supplied by our reverse proxy (the IP address itself is not
+stored), the Telegram platform, the A/B variant and the ledger operation id
+when the event has a payout. There are no third-party analytics SDKs, ad
 identifiers or tracking cookies. The only third-party request the UI makes is
 <code>telegram-web-app.js</code> from <code>telegram.org</code>, required by the
 platform itself; fonts and all other assets are served from our own server.</p>

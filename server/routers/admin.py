@@ -1,4 +1,11 @@
-"""Админка: промокоды, source-ссылки, статистика. Только для ADMIN_ID."""
+"""Админка: промокоды, source-ссылки, статистика, выгрузка аналитики и
+инструмент поддержки. Только для ADMIN_ID.
+
+Своего журналирования здесь нет и заводить его нельзя: `legal.admin_audit`
+висит на этом роутере целиком (main.py), поэтому КАЖДАЯ ручка отсюда уже
+записана — кто, каким методом, к какой ручке и к какому игроку. Второй механизм
+дал бы две несогласованные версии одного журнала.
+"""
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,6 +13,8 @@ from pydantic import BaseModel, Field
 
 from server.auth import tg_admin
 from server import game_config as cfg
+from server import support
+from server import game_logic as gl
 from server.game_logic import db
 from server.settings import BOT_USERNAME
 
@@ -226,7 +235,7 @@ async def stats():
     bp_done = db.q1("SELECT COUNT(*) c FROM users WHERE bp_xp >= ?",
                     (cfg.bp_total_xp(cfg.BP_MAX_LEVEL),))["c"]
     events_7d = db.q(
-        "SELECT event, COUNT(*) c FROM events WHERE created_at > ? "
+        "SELECT event, COUNT(*) c FROM analytics_events WHERE created_at > ? "
         "GROUP BY event ORDER BY c DESC LIMIT 20", (week_ago,))
     return {
         "users_total": total,
@@ -242,3 +251,156 @@ async def stats():
         "bp_completed": bp_done,
         "events_7d": events_7d,
     }
+
+
+# ---------- аналитика: выгрузка сырых событий ----------
+# Зачем ручкой, а не «сходить psql'ом». Выгрузка обязана быть ПОДТВЕРЖДАЕМОЙ:
+# TTL сносит строку только после того, как она уехала (analytics_events.
+# exported_at), и подтверждать это должен тот же путь, которым её забрали.
+# Ручной SELECT такого следа не оставляет, и первый же оборванный на середине
+# дамп означал бы тихую дыру в данных.
+#
+# Отсюда и две ручки вместо одной. Забор ничего не помечает; пометку ставит
+# отдельный ack ПОСЛЕ того, как приёмник записал данные у себя. Оборвалась
+# сеть на полпути — следующий забор отдаст те же строки заново, а дубликаты
+# приёмник задавит по event_id. Обратный порядок (пометить при отдаче) терял
+# бы события на каждом разрыве соединения, причём молча.
+
+@router.get("/analytics/export")
+async def analytics_export(after_id: int = 0, limit: int = 1000,
+                           pending_only: bool = True):
+    """Партия сырых событий по возрастанию id. Ничего не помечает.
+
+    `pending_only=false` — повторная выгрузка уже отданного (перезаливка
+    хранилища); курсор при этом всё тот же `after_id`."""
+    return gl.export_batch(after_id, limit, pending_only)
+
+
+class ExportAck(BaseModel):
+    # Подтверждать можно только то, что реально забрали, поэтому граница — id,
+    # а не «всё». ge=1: нулевого id не существует, и «ack 0» скорее означает
+    # пустую переменную в скрипте, чем осознанное действие
+    through_id: int = Field(ge=1)
+
+
+@router.post("/analytics/export/ack")
+async def analytics_export_ack(body: ExportAck):
+    """Подтвердить, что события до `through_id` включительно легли в хранилище."""
+    return gl.mark_exported(body.through_id)
+
+
+# ---------- поддержка и anti-fraud (пункт 31) ----------
+# Логика — в server/support.py, здесь только HTTP. Разделение не ради красоты:
+# массовую компенсацию зовут и из ручки, и из процесса (`python -c` в рантбуке,
+# когда админка недоступна), а функция, живущая внутри эндпоинта, из процесса
+# не зовётся.
+#
+# Журнал доступа отдельно тут не нужен: роутер целиком под legal.admin_audit, и
+# `user_id` из пути ручка журнала подхватывает сама (legal._access_target) —
+# «кто смотрел карточку какого игрока» пишется без единой строки здесь.
+
+
+@router.get("/player/{user_id}")
+async def player_card(user_id: int, ledger_limit: int = 100):
+    """Карточка игрока для разбора обращения: цепочка платежей, книга, сверка,
+    флаги, последние события аналитики."""
+    try:
+        return support.player_card(user_id, ledger_limit)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/player/{user_id}/payments")
+async def player_payments(user_id: int, limit: int = 50):
+    """Только цепочка `invoice -> payment -> grant -> refund`."""
+    return {"payments": support.payment_chain(user_id, limit)}
+
+
+class CompensateIn(BaseModel):
+    user_id: int
+    currency: str = Field(default="cookies", max_length=32)
+    amount: float = Field(gt=0)
+    # причина из закрытого списка support.COMPENSATION_REASONS: она уезжает в
+    # книгу, и свободный текст сделал бы инцидент неподсчитываемым
+    reason: str = Field(max_length=64)
+    # метка инцидента — она же ключ идемпотентности: повтор с той же меткой
+    # ничего не начислит второй раз
+    incident: str = Field(max_length=64)
+    note: str = Field(default="", max_length=200)
+
+
+@router.get("/compensate/reasons")
+async def compensate_reasons():
+    """Чем вообще можно компенсировать. Отдаём с сервера, чтобы список в
+    интерфейсе не разъезжался с тем, что примет ручка."""
+    return {"reasons": support.COMPENSATION_REASONS,
+            "currencies": list(support.COMPENSATION_CURRENCIES),
+            "max_amount": support.COMPENSATION_MAX,
+            "cohort_limit": support.COHORT_LIMIT}
+
+
+@router.post("/compensate")
+async def compensate(body: CompensateIn):
+    """Безопасная компенсация одному игроку — только через книгу операций."""
+    try:
+        return support.compensate(body.user_id, body.currency, body.amount,
+                                  body.reason, body.incident, body.note)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+class CohortIn(BaseModel):
+    # либо явный список, либо селектор по данным — см. support.cohort
+    kind: str = Field(default="", max_length=32)
+    value: str = Field(default="", max_length=128)
+    since: float = 0
+    until: float = 0
+
+
+@router.post("/compensate/cohort")
+async def compensate_cohort(body: CohortIn):
+    """Кого задел инцидент. Ничего не начисляет — только список."""
+    try:
+        ids = support.cohort(body.kind, body.value, body.since, body.until)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"user_ids": ids, "count": len(ids)}
+
+
+class BulkCompensateIn(CompensateIn):
+    # user_id из родителя не используется; когорта задаётся одним из двух
+    # способов, и оба заданными быть не могут
+    user_id: int = 0
+    user_ids: list[int] = Field(default_factory=list)
+    cohort: CohortIn | None = None
+    # По умолчанию НИЧЕГО не выдаётся, только считается. Массовая раздача —
+    # единственное необратимое действие в админке: книга append-only, отнять
+    # выданное нечем
+    dry_run: bool = True
+
+
+@router.post("/compensate/bulk")
+async def compensate_bulk(body: BulkCompensateIn):
+    """Массовая компенсация по когорте инцидента.
+
+    Идемпотентна по (инцидент, валюта, игрок): оборвавшуюся партию доигрывает
+    повторный запуск, уже заплатившим второй раз не достаётся."""
+    try:
+        ids = list(body.user_ids)
+        if body.cohort is not None:
+            c = body.cohort
+            ids += support.cohort(c.kind, c.value, c.since, c.until)
+        if not ids:
+            raise HTTPException(400, "err_empty_cohort")
+        return support.compensate_bulk(ids, body.currency, body.amount,
+                                       body.reason, body.incident, body.note,
+                                       dry_run=body.dry_run)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/fraud")
+async def fraud(limit: int = 50):
+    """Подозрительные аккаунты по всей базе. Флаг — повод посмотреть, а не
+    приговор: автоматических блокировок здесь нет намеренно."""
+    return support.suspicious(limit)

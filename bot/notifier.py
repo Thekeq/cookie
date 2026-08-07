@@ -209,10 +209,37 @@ async def run_sender(bot):
 
 
 def _prune_events():
-    """TTL аналитики: таблица events росла без ограничений (по событию 'session'
-    на каждое открытие приложения). Админка смотрит окна максимум 7 дней."""
-    db.exec("DELETE FROM events WHERE created_at < ?",
-            (time.time() - cfg.EVENTS_TTL_DAYS * 86400,))
+    """TTL аналитики — но только для того, что уже уехало наружу.
+
+    Прежняя чистилка сносила всё старше 30 суток безусловно, и это делало
+    D30-ретеншен неизмеримым ПО ПОСТРОЕНИЮ: когорта стиралась ровно в тот день,
+    когда её надо посчитать. Теперь TTL забирает строку лишь после того, как
+    выгрузка её подтвердила (`exported_at > 0`).
+
+    Второй DELETE — предел терпения. Без него остановившаяся выгрузка молча
+    растит таблицу до конца диска, а «место кончилось» дороже потерянной
+    аналитики. Поэтому невыгруженное всё же удаляется, но с запасом
+    ANALYTICS_EXPORT_GRACE_DAYS и ГРОМКО: строкой ошибки в логе и счётчиком, по
+    которому стоит алерт. Тихая потеря сырых событий — ровно тот отказ, который
+    замечают через квартал по расхождению в отчётах."""
+    now = time.time()
+    ttl = now - cfg.EVENTS_TTL_DAYS * 86400
+    db.exec("DELETE FROM analytics_events WHERE created_at < ? AND exported_at > 0",
+            (ttl,))
+    hard = ttl - cfg.ANALYTICS_EXPORT_GRACE_DAYS * 86400
+    lost = db.exec("DELETE FROM analytics_events "
+                   "WHERE created_at < ? AND exported_at = 0", (hard,))
+    if lost:
+        obs.inc("analytics_dropped_unexported_total", lost)
+        log.error("аналитика: удалено %d сырых событий, которые так и не были "
+                  "выгружены (старше %d+%d суток). Выгрузка не работает — см. "
+                  "deploy/RUNBOOK.md, раздел про выгрузку аналитики",
+                  lost, cfg.EVENTS_TTL_DAYS, cfg.ANALYTICS_EXPORT_GRACE_DAYS)
+    # Отставание очереди выгрузки — метрика, а не лог: алерт нужен ДО того, как
+    # начнутся потери, то есть пока строки ещё живы
+    backlog = db.q1("SELECT COUNT(*) c FROM analytics_events "
+                    "WHERE exported_at = 0 AND created_at < ?", (ttl,))["c"]
+    obs.set_gauge("analytics_export_backlog", backlog)
 
 
 def _backup_db():

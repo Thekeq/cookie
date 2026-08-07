@@ -43,6 +43,14 @@ log = logging.getLogger(__name__)
 # сколько раз повторить BEGIN IMMEDIATE, если база занята другим писателем
 TX_RETRIES = 5
 
+# Префикс ключей app_state, по которому миграция отделяет снимки конфига ивентов
+# от аналитики в старой таблице `events`. Подчёркивание оставлено одиночным
+# джокером LIKE, а не экранировано: ESCAPE ведёт себя по-разному на двух
+# движках, а событий вида «eventXcfg:...» не существует. Сам шаблон уходит
+# ПАРАМЕТРОМ — литеральный процент в тексте запроса сломал бы подстановку под
+# PostgreSQL, где плейсхолдеры переписываются в %s (см. _sql).
+EVENT_CFG_PREFIX = "event_cfg:%"
+
 # Ошибки, на которые смотрит КОД (а не только человек в логе). Классы у
 # драйверов разные, решения по ним одинаковые, поэтому ловить надо кортеж, а не
 # sqlite3.IntegrityError напрямую — иначе на PostgreSQL нарушение инварианта
@@ -228,12 +236,60 @@ class DataBase:
                 # остаток висит здесь, а не уводит баланс в минус
                 'cookie_debt': 'REAL NOT NULL DEFAULT 0',
             },
-            'events': {  # аналитика: одно событие = одна строка
+            # Небольшое ДОЛГОВЕЧНОЕ состояние приложения: снимок конфига
+            # прогона ивента и его kill switch (game_logic.event_snapshot).
+            #
+            # Раньше это жило в таблице `events` — то есть в аналитике. Пока
+            # аналитику никто не трогал, разница была незаметной; как только у
+            # аналитики появились TTL и выгрузка наружу, она стала
+            # принципиальной: kill switch, погашенный чистилкой по сроку, — это
+            # ивент, воскресший сам собой, а снимок конфига, уехавший в
+            # аналитическое хранилище строкой «событие event_cfg:...», — мусор
+            # в отчётах. Разные сроки жизни и разные читатели: разные таблицы.
+            'app_state': {
                 'id': 'INTEGER PRIMARY KEY',
-                'user_id': 'INTEGER',
-                'event': 'TEXT',
-                'value': 'REAL DEFAULT 0',
-                'created_at': 'REAL DEFAULT 0',
+                'name': 'TEXT NOT NULL',       # event_cfg:<прогон>:<поле>
+                'value': 'REAL NOT NULL DEFAULT 0',
+                'created_at': 'REAL NOT NULL DEFAULT 0',
+            },
+            # Аналитика: одно событие = одна строка. Пришла на смену таблице
+            # `events` (имя, число, время) — её полей не хватало ни на одно
+            # продуктовое решение: по ним нельзя сказать ни откуда игрок
+            # пришёл, ни какой конфиг у него стоял, ни в какой ветке
+            # эксперимента он был, ни какому движению денег событие
+            # соответствует. Перенос старых строк и снос старой таблицы —
+            # разовая миграция analytics:events_v2 (двух систем не остаётся).
+            'analytics_events': {
+                'id': 'INTEGER PRIMARY KEY',
+                # Ключ события, выданный на стороне записи. Нужен приёмнику
+                # выгрузки: экспорт можно повторить (упала сеть, перезапустили
+                # скрипт), и без внешнего ключа повтор дублирует события в
+                # хранилище, а дубли в аналитике неотличимы от роста.
+                'event_id': 'TEXT NOT NULL',
+                'user_id': 'INTEGER NOT NULL DEFAULT 0',
+                'event': 'TEXT NOT NULL',
+                'value': 'REAL NOT NULL DEFAULT 0',
+                # ВРЕМЯ СЕРВЕРА. Клиентскому времени тут места нет: часы на
+                # телефоне врут произвольно, а событие из будущего ломает любую
+                # когорту, в которую попадёт
+                'created_at': 'REAL NOT NULL DEFAULT 0',
+                'config_version': 'TEXT',      # cfg.CONFIG_VERSION на момент записи
+                'source': 'TEXT',              # organic | link | referral
+                'campaign': 'TEXT',            # код ссылки или ref:<id>
+                'lang': 'TEXT',
+                'country': 'TEXT',             # из заголовка обратного прокси
+                'platform': 'TEXT',            # android | ios | tdesktop | web
+                'variant': 'TEXT',             # ветка A/B: <эксперимент>/<ветка>
+                # Стык с книгой операций. Ledger уже несёт operation_id, и
+                # соединение идёт по нему, а не по параллельному ключу: иначе
+                # «сколько печенек принесло событие» пришлось бы считать
+                # дважды и получать два разных ответа
+                'economy_operation_id': 'TEXT',
+                'props': 'TEXT',               # остальные свойства, json
+                # Когда строка уехала наружу. 0 = ещё не выгружена, и TTL её не
+                # трогает: срок хранения не имеет права уносить данные, которых
+                # никто ни разу не видел
+                'exported_at': 'REAL NOT NULL DEFAULT 0',
             },
             'orders': {  # заказы пекарни: offer (выбор из 3) -> active -> done
                 'id': 'INTEGER PRIMARY KEY',
@@ -575,8 +631,26 @@ class DataBase:
             "ON daily_quests(user_id, day, quest_key)")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_season_earned ON users(season_earned)")
+        # аналитика: воронка строится по (событие, окно), разбор жалобы — по
+        # игроку. Индексы те же, что были у events, плюс два новых
         self.cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_name ON events(event, created_at)")
+            "CREATE INDEX IF NOT EXISTS idx_analytics_name "
+            "ON analytics_events(event, created_at)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analytics_user "
+            "ON analytics_events(user_id, created_at)")
+        # Курсор выгрузки: «отдай следующую тысячу невыгруженных по возрастанию
+        # id». Частичный индекс понимают оба движка, и он размером с очередь, а
+        # не с таблицей: после выгрузки строка из него выпадает
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analytics_pending "
+            "ON analytics_events(id) WHERE exported_at = 0")
+        # соединение с книгой операций: «что игрок получил за это событие».
+        # Тоже частичный — operation_id есть у меньшинства событий
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_analytics_op "
+            "ON analytics_events(economy_operation_id) "
+            "WHERE economy_operation_id IS NOT NULL")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, status)")
         # boosts читается из click_multiplier на КАЖДЫЙ батч кликов, под
@@ -618,7 +692,8 @@ class DataBase:
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_ops_created ON economy_ops(created_at)")
         self.cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)")
+            "CREATE INDEX IF NOT EXISTS idx_analytics_created "
+            "ON analytics_events(created_at)")
         # выборка кандидатов на пуш: пробег по всей таблице юзеров каждую минуту
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_notify "
@@ -714,6 +789,15 @@ class DataBase:
         # токен операции: на PostgreSQL второй worker заблокируется на этом
         # индексе, дождётся коммита первого и прочитает готовый ответ
         "economy_ops": {"cols": ("operation_id",)},
+        # Имя ключа состояния — одно на всю базу. Уникальность тут несёт
+        # смысл: снимок конфига ивента пишется гонкой двух воркеров через
+        # INSERT ... WHERE NOT EXISTS, и без индекса они оба вставили бы строку
+        "app_state": {"cols": ("name",), "index": "uq_app_state_name"},
+        # Ключ события аналитики. Уникальность нужна не игре, а ПРИЁМНИКУ
+        # выгрузки: он дедуплицирует повторную заливку по event_id, и если
+        # ключи начнут повторяться у нас, дедупликация съест разные события
+        "analytics_events": {"cols": ("event_id",),
+                             "index": "uq_analytics_event_id"},
         # Одно событие — одно сообщение. Планировщик идемпотентен НЕ потому, что
         # помнит, кого уже разобрал, а потому что ключ события уникален: проход
         # раз в 15 минут видит один и тот же готовый рецепт до самого сбора, и
@@ -1051,6 +1135,9 @@ class DataBase:
                     self.cursor.execute(stmt)
                 self._mark(key)
 
+        if self._migration("analytics:events_v2"):
+            self._migrate_events_to_analytics()
+            self._mark("analytics:events_v2")
         if self._migration("backfill_best_item_level"):
             self._backfill_best_item_level()
             self._mark("backfill_best_item_level")
@@ -1061,6 +1148,50 @@ class DataBase:
             self._backfill_entitlements()
             self._mark("backfill_entitlements")
         self.connection.commit()
+
+    def _migrate_events_to_analytics(self):
+        """Переносит старую таблицу `events` в `analytics_events` и сносит её.
+
+        Смысл в последнем шаге. Оставить обе таблицы означало бы две системы
+        аналитики: половина кода пишет в одну, половина в другую, а вопрос «что
+        случилось на прошлой неделе» получает два ответа. Поэтому старая
+        таблица именно УДАЛЯЕТСЯ, и делается это после копирования строк.
+
+        Полей у старых строк меньше — источника, платформы, варианта и версии
+        конфига в них не было. Они и остаются пустыми: выдумать их задним
+        числом нельзя, а поставить сегодняшнюю версию конфига месячной строке
+        значит соврать ровно в том поле, ради которого версия и заводилась.
+
+        event_id выводится из старого id ('legacy:<id>'), а не генерируется:
+        повторный прогон миграции (восстановились из копии, накатили заново) не
+        должен заливать приёмнику те же события под новыми ключами. Конкатенация
+        `||` — общий синтаксис обоих движков.
+
+        exported_at = 0: старые строки наружу не уезжали ни разу, и первая же
+        выгрузка обязана их забрать."""
+        if "event" not in self._columns("events"):
+            return                       # свежая база: переносить нечего
+        # Сначала — то, что аналитикой никогда не было: снимки конфига ивентов
+        # и отметки kill switch жили в этой же таблице. Уехав в аналитику, они
+        # были бы удалены её TTL (то есть ивент воскрес бы сам) и выгружены
+        # наружу как события, которых не было
+        state = self.exec(
+            "INSERT INTO app_state (name, value, created_at) "
+            "SELECT event, COALESCE(value, 0), COALESCE(created_at, 0) "
+            "FROM events WHERE event LIKE ?", (EVENT_CFG_PREFIX,))
+        moved = self.exec(
+            "INSERT INTO analytics_events (event_id, user_id, event, value, "
+            "created_at, exported_at) "
+            "SELECT 'legacy:' || id, COALESCE(user_id, 0), COALESCE(event, ''), "
+            "       COALESCE(value, 0), COALESCE(created_at, 0), 0 FROM events "
+            "WHERE event NOT LIKE ?", (EVENT_CFG_PREFIX,))
+        # DROP, а не переименование: имя `events` не должно остаться доступным
+        # ни коду, ни руке в psql — иначе первый же ручной INSERT воскресит
+        # вторую систему
+        self.cursor.execute("DROP TABLE IF EXISTS events")
+        print(f"[*] Миграция: аналитика переехала в analytics_events, "
+              f"перенесено строк {moved}, состояние ивентов в app_state "
+              f"({state}), старая таблица events удалена")
 
     def _backfill_entitlements(self):
         """Записывает уже поднятый premium-пасс как право источника 'legacy'.

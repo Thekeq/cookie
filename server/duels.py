@@ -206,7 +206,7 @@ def find(user: dict) -> dict:
                  now + cfg.DUEL_HOURS * 3600, foe["id"]))
             if taken == 0:                   # заявку перехватил кто-то ещё
                 raise ValueError("err_duel_taken")
-            gl.track(uid, "duel_start")
+            gl.track("duel_start", uid)
             # единственное место, где виден переход waiting -> active
             _notify("match_found", (uid, foe["user_a"]),
                     {"duel": foe["id"], "ends_at": now + cfg.DUEL_HOURS * 3600})

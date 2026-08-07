@@ -9,6 +9,7 @@ import uuid
 from server import cache
 from server import economy
 from server import game_config as cfg
+from server import obs
 
 # один экземпляр базы на процесс: книга операций обязана писаться в ТОЙ ЖЕ
 # транзакции, что и само движение денег, а значит и через то же соединение
@@ -34,14 +35,186 @@ def check_rate_limit(user_id: int, bucket: str, limit: int, window: float):
 
 
 # ---------- аналитика ----------
+# Одна функция записи на весь проект. Было `track(user_id, event, value)` в
+# таблицу `events` из трёх полей — этого не хватало ни на один продуктовый
+# вопрос: откуда игрок пришёл, какой конфиг у него стоял, в какой ветке
+# эксперимента он был и какому движению денег событие соответствует.
+#
+# Порядок аргументов теперь `track(event, user_id, ...)`: событие — главное,
+# и в вызове оно должно читаться первым. Все прежние вызовы перенесены.
+#
+# Правило прежнее и оно важнее набора полей: аналитика НЕ ИМЕЕТ ПРАВА ронять
+# игру. Любая ошибка записи глушится, игрок её не видит.
 
-def track(user_id: int, event: str, value: float = 0):
-    """Пишет событие аналитики. Одна вставка, никогда не роняет игровой код."""
+# Свойства, у которых есть своя колонка. Всё остальное из **props уезжает в
+# props одним json: колонка под каждое разовое свойство — это миграция на
+# каждый продуктовый вопрос, а вопросы придумывают быстрее, чем катят релизы.
+_TRACK_COLUMNS = ("value", "economy_operation_id", "source", "campaign",
+                  "lang", "country", "platform", "variant", "config_version")
+
+# Синонимы: у вызывающего на руках `operation_id` (так поле зовётся во всей
+# экономике), а в таблице колонка называется полным именем
+_TRACK_ALIASES = {"operation_id": "economy_operation_id",
+                  "op": "economy_operation_id",
+                  "source_code": "campaign"}
+
+
+def experiment_variant(user_id: int) -> str:
+    """Ветка A/B-эксперимента для игрока: `<эксперимент>/<ветка>`.
+
+    Детерминированно от (ключ эксперимента, user_id). Не случайно и не в базе:
+    раскладка обязана совпадать на всех воркерах и переживать рестарт, а
+    сохранённая в базе она вдобавок не переживает смену состава веток.
+
+    Ключ эксперимента входит в хэш, поэтому следующий эксперимент раскладывает
+    людей заново — иначе одна и та же половина аудитории вечно сидела бы в
+    экспериментальной ветке и накапливала отличие, не связанное с опытом."""
+    exp = getattr(cfg, "AB_EXPERIMENT", "") or ""
+    variants = tuple(getattr(cfg, "AB_VARIANTS", ()) or ("control",))
+    if not exp:
+        return "none/control"
+    digest = hashlib.sha256(f"{exp}:{int(user_id)}".encode()).digest()
+    return f"{exp}/{variants[int.from_bytes(digest[:8], 'big') % len(variants)]}"
+
+
+def _attribution(user: dict | None) -> tuple[str, str]:
+    """(источник, кампания) игрока.
+
+    Источник — КЛАСС канала, кампания — конкретный код. Разделение не
+    косметическое: «сколько дают ссылки против приглашений» и «какая именно
+    ссылка окупилась» — разные вопросы, и в одном поле они не живут."""
+    user = user or {}
+    if user.get("source_code"):
+        return "link", str(user["source_code"])
+    if user.get("referrer_id"):
+        return "referral", f"ref:{user['referrer_id']}"
+    return "organic", ""
+
+
+def track(event: str, user_id: int, **props) -> str | None:
+    """Пишет событие аналитики. Возвращает event_id (или None, если не легло).
+
+    Обязательные поля собираются ЗДЕСЬ, а не на вызывающем: поле, которое
+    просят заполнить руками, рано или поздно останется пустым, а пустая
+    половина колонок делает бесполезной всю таблицу.
+
+    Что откуда:
+      * `event_id` — свой uuid; по нему приёмник выгрузки давит повторы;
+      * время — серверное, клиентскому тут места нет;
+      * версия конфига — `cfg.CONFIG_VERSION`, отпечаток боевых констант;
+      * источник/кампания и язык — из строки игрока;
+      * страна и платформа — из контекста запроса (заголовки обратного прокси
+        и Mini App), см. obs.bind_request;
+      * ветка эксперимента — детерминированно от user_id;
+      * `economy_operation_id` — передаёт вызывающий там, где у события есть
+        движение денег. Соединять с книгой по нему, а не по времени: время
+        совпадает у сотни игроков, токен операции — ни у кого.
+
+    Любое из этих полей можно перебить явным аргументом: у планировщика и у
+    бота контекста запроса нет, а язык и источник они знают сами."""
     try:
-        db.exec("INSERT INTO events (user_id, event, value, created_at) "
-                "VALUES (?, ?, ?, ?)", (user_id, event, value, time.time()))
+        now = time.time()
+        user = db.get_user(user_id) if user_id else None
+        source, campaign = _attribution(user)
+        platform, country = obs.current_client()
+        row = {
+            "value": 0.0,
+            "economy_operation_id": None,
+            "source": source,
+            "campaign": campaign,
+            "lang": (user or {}).get("lang") or "",
+            "country": country,
+            "platform": platform,
+            "variant": experiment_variant(user_id),
+            "config_version": cfg.CONFIG_VERSION,
+        }
+        extra = {}
+        for key, value in props.items():
+            column = _TRACK_ALIASES.get(key, key)
+            if column in _TRACK_COLUMNS:
+                row[column] = value
+            else:
+                extra[key] = value
+        event_id = uuid.uuid4().hex
+        db.exec(
+            "INSERT INTO analytics_events (event_id, user_id, event, value, "
+            "created_at, config_version, source, campaign, lang, country, "
+            "platform, variant, economy_operation_id, props, exported_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (event_id, int(user_id or 0), str(event)[:180],
+             float(row["value"] or 0), now, row["config_version"],
+             row["source"], row["campaign"], row["lang"], row["country"],
+             row["platform"], row["variant"], row["economy_operation_id"],
+             json.dumps(extra, ensure_ascii=False, default=str) if extra else None))
+        return event_id
     except Exception:  # noqa: S110 — аналитика не имеет права ронять игру
-        pass
+        return None
+
+
+# ---------- выгрузка сырой аналитики ----------
+# Сырые события обязаны уезжать наружу ДО того, как их заберёт TTL: иначе
+# тридцатидневный срок хранения делает D30-ретеншен неизмеримым по построению.
+# Поэтому чистилка (bot/notifier._prune_events) сносит только то, у чего
+# проставлен exported_at, а проставляет его вот этот путь.
+#
+# Двухшаговость обязательна. Забор ничего не помечает, пометку ставит отдельный
+# `mark_exported` ПОСЛЕ того, как приёмник записал партию у себя. Оборвалась
+# сеть на середине — следующий забор отдаст те же строки, и приёмник задавит
+# повтор по event_id. Обратный порядок (пометить при отдаче) терял бы события
+# на каждом разрыве соединения, причём молча.
+#
+# Живёт здесь, а не в роутере: выгрузку зовут и ручкой админки, и скриптом с
+# машины (tools/export_analytics.py). Функция внутри эндпоинта из процесса не
+# зовётся, и второй вызывающий неизбежно завёл бы вторую, слегка другую логику
+# пометки — то есть дыру в данных ровно там, где её никто не ищет.
+
+EXPORT_BATCH_MAX = 5000
+
+
+def export_batch(after_id: int = 0, limit: int = 1000,
+                 pending_only: bool = True) -> dict:
+    """Партия сырых событий по возрастанию id. НИЧЕГО не помечает."""
+    limit = max(1, min(int(limit), EXPORT_BATCH_MAX))
+    after_id = max(0, int(after_id))
+    cond = "AND exported_at = 0 " if pending_only else ""
+    rows = db.q(f"SELECT * FROM analytics_events WHERE id > ? {cond}"
+                f"ORDER BY id LIMIT ?", (after_id, limit))
+    for r in rows:
+        # props уезжает объектом, а не строкой: приёмнику иначе пришлось бы
+        # разбирать json, вложенный в json, и делать это по-своему
+        if r.get("props"):
+            try:
+                r["props"] = json.loads(r["props"])
+            except (TypeError, ValueError):
+                r["props"] = {"_raw": r["props"]}
+    stat = db.q1("SELECT COUNT(*) c, MIN(created_at) oldest "
+                 "FROM analytics_events WHERE exported_at = 0")
+    now = time.time()
+    return {
+        "rows": rows,
+        "count": len(rows),
+        # Курсор следующей партии — максимум id ИЗ ОТДАННОГО, а не
+        # «after_id + limit»: id не плотные (откат транзакции оставляет дыру),
+        # и арифметика по ним пропускала бы строки
+        "next_after_id": rows[-1]["id"] if rows else after_id,
+        "pending": stat["c"],
+        "oldest_pending_age_days": (round((now - stat["oldest"]) / 86400, 2)
+                                    if stat["oldest"] else 0),
+        "ttl_days": cfg.EVENTS_TTL_DAYS,
+        "grace_days": cfg.ANALYTICS_EXPORT_GRACE_DAYS,
+    }
+
+
+def mark_exported(through_id: int) -> dict:
+    """Подтвердить, что события до `through_id` включительно легли в хранилище.
+
+    С этого момента их имеет право забрать TTL — и только с этого."""
+    marked = db.exec("UPDATE analytics_events SET exported_at = ? "
+                     "WHERE id <= ? AND exported_at = 0",
+                     (time.time(), int(through_id)))
+    left = db.q1("SELECT COUNT(*) c FROM analytics_events "
+                 "WHERE exported_at = 0")["c"]
+    return {"marked": marked, "pending": left}
 
 
 # ---------- сезоны ----------
@@ -466,7 +639,7 @@ def reroll_quest(user: dict, key: str) -> str:
                 "VALUES (?, ?, ?) "
                 "ON CONFLICT (user_id, day, quest_key) DO NOTHING",
                 (user["user_id"], day, new_key))
-    track(user["user_id"], "quest_reroll")
+    track("quest_reroll", user["user_id"])
     return new_key
 
 
@@ -1132,23 +1305,26 @@ def _read_event_snapshot(event_id: str) -> dict:
     names = tuple(_event_cfg_key(event_id, f)
                   for f in _EVENT_SNAPSHOT_FIELDS + ("killed",))
     holes = ", ".join("?" * len(names))
-    rows = db.q(f"SELECT event, value FROM events WHERE event IN ({holes}) "
+    rows = db.q(f"SELECT name, value FROM app_state WHERE name IN ({holes}) "
                 "ORDER BY id", names)
     out: dict[str, float] = {}
     for r in rows:                      # первая запись выигрывает: снимок один
-        out.setdefault(r["event"].rsplit(":", 1)[-1], r["value"])
+        out.setdefault(r["name"].rsplit(":", 1)[-1], r["value"])
     return out
 
 
 def _write_event_snapshot(event_id: str, snap: dict, now: float) -> None:
     """Кладёт снимок, если его ещё нет. INSERT ... WHERE NOT EXISTS, а не
     «прочитать и вставить»: два воркера, увидевшие старт ивента одновременно,
-    иначе записали бы по строке на поле."""
+    иначе записали бы по строке на поле.
+
+    Живёт в app_state, а не в аналитике: это долговечное состояние приложения,
+    и TTL аналитики, дотянувшись до него, отменил бы заморозку конфига."""
     for field in _EVENT_SNAPSHOT_FIELDS:
         name = _event_cfg_key(event_id, field)
-        db.exec("INSERT INTO events (user_id, event, value, created_at) "
-                "SELECT 0, ?, ?, ? WHERE NOT EXISTS ("
-                "  SELECT 1 FROM events WHERE event = ?)",
+        db.exec("INSERT INTO app_state (name, value, created_at) "
+                "SELECT ?, ?, ? WHERE NOT EXISTS ("
+                "  SELECT 1 FROM app_state WHERE name = ?)",
                 (name, float(snap[field]), now, name))
 
 
@@ -1191,10 +1367,10 @@ def set_event_killed(event_id: str, killed: bool = True) -> None:
     отменяться первым же перезапуском воркера. Уже выданные награды не
     отбираются: они в книге."""
     name = _event_cfg_key(event_id, "killed")
-    db.exec("DELETE FROM events WHERE event = ?", (name,))
+    db.exec("DELETE FROM app_state WHERE name = ?", (name,))
     if killed:
-        db.exec("INSERT INTO events (user_id, event, value, created_at) "
-                "VALUES (0, ?, 1, ?)", (name, time.time()))
+        db.exec("INSERT INTO app_state (name, value, created_at) "
+                "VALUES (?, 1, ?)", (name, time.time()))
     _event_snapshot_memo.pop(event_id, None)
 
 
@@ -1312,7 +1488,11 @@ def claim_event_reward(user: dict, now: float | None = None) -> dict:
     add_cookies(uid, st["reward"], count_earned=False,
                 operation_id=event_reward_op(ev["event_id"], uid),
                 reason="event_goal", ref_type="event", ref_id=ev["event_id"])
-    track(uid, f"event_goal:{ev['key']}", st["reward"])
+    # operation_id той же награды: событие и движение денег соединяются по
+    # токену операции, а не по времени — время у сотни игроков одинаковое
+    track(f"event_goal:{ev['key']}", uid, value=st["reward"],
+          operation_id=event_reward_op(ev["event_id"], uid),
+          event_key=ev["event_id"])
     return {**event_state(db.get_user(uid), now), "reward": st["reward"],
             "cookies": db.get_user(uid)["cookies"]}
 
@@ -2113,7 +2293,7 @@ def _drop_stale_order(user: dict, o: dict) -> float:
                         operation_id=f"order_comp:{o['id']}",
                         reason="order_compensation",
                         ref_type="order", ref_id=str(o["id"]))
-    track(uid, "order_stale_dropped")
+    track("order_stale_dropped", uid)
     return back
 
 
@@ -2210,7 +2390,7 @@ def take_order(user: dict, slot: int, order_id: int | None = None,
             raise economy.ConflictError(uid)
         row = dict(row, goal=p["goal"], version=row["version"] + 1)
         db.exec("DELETE FROM orders WHERE user_id = ? AND status = 'offer'", (uid,))
-    track(uid, "order_take")
+    track("order_take", uid)
     return _pack_order(dict(row, status="active"), income)
 
 
@@ -2230,7 +2410,7 @@ def abandon_order(user: dict, order_id: int | None = None,
                    (row["id"],)) == 0:
             raise ValueError("err_no_item")   # успел сняться параллельно
         _bump_orders_day(uid, day)
-    track(uid, "order_abandon")
+    track("order_abandon", uid)
     return orders_state(db.get_user(uid))
 
 
@@ -2310,9 +2490,11 @@ def claim_order(user: dict, order_id: int | None = None,
                                         user["level"]) * rest,
                bp_xp)
         _bump_orders_day(uid, day, completed=True)
-    track(uid, "order_done")
+    track("order_done", uid, value=reward,
+          operation_id=f"order_claim:{row['id']}",
+          template=row["template"], bp_xp=bp_xp)
     if first:
-        track(uid, "first_order")
+        track("first_order", uid, value=reward)
     return {"reward_cookies": reward, "reward_bp_xp": bp_xp}
 
 
@@ -2359,7 +2541,7 @@ def claim_item_record(user: dict, item_level: int) -> dict | None:
         if cookies:
             add_cookies(uid, cookies)
         add_xp(uid, xp, bp_xp)
-    track(uid, "item_record", item_level)
+    track("item_record", uid, value=item_level)
     return {"level": item_level, "xp": xp, "cookies": cookies}
 
 
@@ -2396,7 +2578,7 @@ def roll_shiny(user: dict, item_level: int) -> int | None:
             return None
         db.exec("UPDATE users SET shiny_pity = 0, "
                 "user_revision = user_revision + 1 WHERE user_id = ?", (uid,))
-    track(uid, "shiny_drop", target)
+    track("shiny_drop", uid, value=target)
     return target
 
 
@@ -2467,7 +2649,7 @@ def claim_tutorial(user: dict) -> dict:
                    "WHERE user_id = ? AND tutorial_done = 0", (user["user_id"],)) == 0:
             raise ValueError("err_claimed")
         add_cookies(user["user_id"], reward, count_earned=False)
-    track(user["user_id"], "tutorial_complete")
+    track("tutorial_complete", user["user_id"])
     return {"reward": reward}
 
 

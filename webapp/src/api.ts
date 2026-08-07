@@ -84,6 +84,11 @@ async function request(method: string, path: string, body?: unknown,
     // язык интерфейса — сервер локализует тексты (магазин, ачивки) и пуши
     'X-Lang': localStorage.getItem('lang') || 'en',
   }
+  // Платформа Mini App (ios / android / tdesktop / web). Сервер её ниоткуда
+  // больше не узнаёт: в initData её нет, а User-Agent внутри WebView Telegram
+  // говорит про браузер, а не про клиент. Уходит только в аналитику.
+  const platform = (window as any).Telegram?.WebApp?.platform
+  if (typeof platform === 'string' && platform) headers['X-Tg-Platform'] = platform
   if (withRevision && boardRevision >= 0) headers['X-Board-Revision'] = String(boardRevision)
   if (opId) headers['X-Op-Id'] = opId
   try {

@@ -145,7 +145,10 @@ app.add_middleware(
     # (webapp/src/net.ts), а заголовок, которого нет в allow_headers, роняет
     # предзапрос целиком — не сам заголовок, а весь запрос вместе с ним.
     allow_headers=["Authorization", "Content-Type", "X-Lang", "X-Request-Id",
-                   "X-User-Revision", "X-Board-Revision", "X-Op-Id"],
+                   "X-User-Revision", "X-Board-Revision", "X-Op-Id",
+                   # платформа Mini App: единственный источник «ios/android/
+                   # tdesktop/web», сервер её ниоткуда больше не узнаёт
+                   "X-Tg-Platform"],
     # Без expose_headers браузер не отдаёт эти заголовки коду Mini App вовсе:
     # серверная сессия приезжает в ответе, и прочитать её должно быть можно.
     expose_headers=["X-Request-Id", auth.SESSION_HEADER,
@@ -309,7 +312,16 @@ async def observe_request(request: Request, call_next):
     сотне тысяч игроков Prometheus сложился бы от кардинальности — это самый
     типичный способ уронить мониторинг собственными руками."""
     req_id = obs.new_request_id(request.headers.get("x-request-id", ""))
-    tokens = obs.bind_request(req_id)
+    # Платформа приходит от Mini App (Telegram.WebApp.platform), страна — от
+    # обратного прокси/CDN: сам сервер её не знает, а geoip по IP в приложении
+    # означал бы хранить IP, чего политика приватности не обещает. Обе метки
+    # уезжают в аналитику через контекст запроса; чужому значению здесь верят
+    # ровно настолько, насколько его чистит obs.clean_client_tag.
+    tokens = obs.bind_request(
+        req_id,
+        platform=request.headers.get("x-tg-platform", ""),
+        country=(request.headers.get("cf-ipcountry")
+                 or request.headers.get("x-country", "")))
     obs.add_gauge("http_requests_in_flight", 1)
     started = time.perf_counter()
     status = 500

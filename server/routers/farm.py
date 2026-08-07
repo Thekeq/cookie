@@ -138,7 +138,7 @@ def _buy_building(body: "KeyIn", tg: dict) -> dict:
         gl.quest_progress(tg["id"], "buildings", 1)
         gl.order_progress(tg["id"], "buildings", 1, spent=cost)
     if not owned and not gl.farm_counts(tg["id"]).keys() - {body.key}:
-        gl.track(tg["id"], "first_building")
+        gl.track("first_building", tg["id"])
     return _farm_payload(tg)
 
 

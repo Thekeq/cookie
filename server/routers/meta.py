@@ -85,7 +85,7 @@ async def auth(tg: dict = Depends(tg_user)):
     farm_income = gl.collect_farm(db.get_user(tg["id"]), _now)
     # довыдаём Stars-покупки, зависшие в 'paid' после сбоя между оплатой и выдачей
     gl.fulfill_pending(tg["id"])
-    gl.track(tg["id"], "session")  # аналитика сессий
+    gl.track("session", tg["id"])  # аналитика сессий
 
     state = gl.full_state(tg["id"])
     state["just_registered"] = just_registered
