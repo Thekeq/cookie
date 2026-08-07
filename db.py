@@ -177,6 +177,12 @@ class DataBase:
                 'last_notified_at': 'REAL DEFAULT 0',
                 'last_seen_at': 'REAL DEFAULT 0',           # последний запрос к API
                 'notify_blocked': 'INTEGER DEFAULT 0',      # юзер заблокировал бота
+                # смещение часового пояса игрока в минутах от UTC. Телеграм его
+                # не отдаёт — присылает клиент. NULL (а не 0) значит «не знаем»:
+                # тихие часы для такого игрока считаются по языку, и отличить
+                # «не знаем» от честного UTC+0 обязательно, иначе половина
+                # аудитории получала бы пуши в свои четыре утра
+                'tz_offset_min': 'INTEGER',
                 # --- подписка на канал ---
                 'channel_claimed': 'INTEGER DEFAULT 0',
                 # --- золотая печенька ---
@@ -510,6 +516,40 @@ class DataBase:
                 'owner': 'TEXT',                            # host:pid последнего запуска
                 'last_error': 'TEXT',
             },
+            # Очередь пушей: планировщик КЛАДЁТ задачу, воркер её ОТПРАВЛЯЕТ.
+            # Раньше отправка была одним проходом по всей таблице игроков раз в
+            # 15 минут, и состояния у неё не было нигде: 100k пушей при 25 msg/s
+            # это больше часа, то есть проход не укладывается в собственный
+            # интервал, а всё, до чего он не дошёл, теряется вместе с процессом.
+            # Строка здесь — единица работы: её видно, её можно повторить, и
+            # ровно она отвечает на вопрос «почему этот игрок получил (или не
+            # получил) это сообщение».
+            'notification_queue': {
+                'id': 'INTEGER PRIMARY KEY',
+                'user_id': 'INTEGER NOT NULL',
+                'kind': 'TEXT NOT NULL',            # recipe_ready, duel_result, ...
+                # категория частотного лимита: kind'ов на неё несколько
+                # (recipe_ready и recipe_burning — одна категория 'recipe').
+                # Отдельной колонкой, а не списком в коде: лимит считается
+                # запросом по уже отправленному, и группировать надо в БД
+                'category': 'TEXT NOT NULL DEFAULT "other"',
+                'payload': 'TEXT',                  # json: параметры текста и цель диплинка
+                'scheduled_at': 'REAL NOT NULL DEFAULT 0',
+                # scheduled -> sending -> sent -> opened; отказы: failed (кончились
+                # попытки), blocked (бота заблокировали), cancelled (событие
+                # протухло до отправки). 'sending' — заявка воркера: она нужна,
+                # чтобы два воркера не взяли одну строку, и снимается по lease,
+                # если воркера убили посреди отправки
+                'status': 'TEXT NOT NULL DEFAULT "scheduled"',
+                'dedup_key': 'TEXT NOT NULL',
+                'attempts': 'INTEGER NOT NULL DEFAULT 0',
+                'claimed_at': 'REAL NOT NULL DEFAULT 0',
+                'claimed_by': 'TEXT',               # host:pid воркера
+                'sent_at': 'REAL NOT NULL DEFAULT 0',
+                'opened_at': 'REAL NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'created_at': 'REAL NOT NULL DEFAULT 0',
+            },
             'season_results': {  # снапшот топа прошедших сезонов + выданные награды
                 'id': 'INTEGER PRIMARY KEY',
                 'season_id': 'INTEGER',
@@ -583,6 +623,39 @@ class DataBase:
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_notify "
             "ON users(notify_blocked, last_seen_at, last_notified_at)")
+        # Очередь пушей. Первый индекс — самый горячий запрос всей системы
+        # уведомлений: воркер берёт партию по (статус, время) каждую секунду.
+        # Без него это скан очереди, а очередь на сотне тысяч игроков больше
+        # самой таблицы игроков.
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notify_due "
+            "ON notification_queue(status, scheduled_at)")
+        # частотный лимит: сколько пушей игрок уже получил за сутки и по каким
+        # категориям. Спрашивается перед КАЖДОЙ отправкой
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notify_user_sent "
+            "ON notification_queue(user_id, sent_at)")
+        # чистилка очереди ходит по возрасту строки
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notify_created "
+            "ON notification_queue(created_at)")
+        # Планировщик пушей: три выборки кандидатов, каждая раз в 15 минут по
+        # всей таблице игроков. Частичный индекс по закваскам понимают оба
+        # движка (SQLite с 3.8, PostgreSQL всегда), и он невелик: закваска
+        # стоит у единиц процентов аудитории одновременно.
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_recipe "
+            "ON users(recipe_started_at) WHERE recipe_key IS NOT NULL")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_farm_idle "
+            "ON users(notify_blocked, farm_collected_at)")
+        # дуэли и заказы планировщик смотрит по статусу, а не по игроку:
+        # существующие индексы обоих таблиц начинаются с user_id и для такого
+        # запроса бесполезны
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_duels_status ON duels(status, ends_at)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at)")
         self._dedupe_and_unique(db_file)
         self._install_invariants()
         self.connection.commit()
@@ -641,6 +714,14 @@ class DataBase:
         # токен операции: на PostgreSQL второй worker заблокируется на этом
         # индексе, дождётся коммита первого и прочитает готовый ответ
         "economy_ops": {"cols": ("operation_id",)},
+        # Одно событие — одно сообщение. Планировщик идемпотентен НЕ потому, что
+        # помнит, кого уже разобрал, а потому что ключ события уникален: проход
+        # раз в 15 минут видит один и тот же готовый рецепт до самого сбора, и
+        # без этого индекса игрок получал бы про него пуш каждые 15 минут.
+        # Ключ несёт и сам момент события (recipe_started_at, id дуэли, номер
+        # сезона) — иначе следующая закваска того же игрока считалась бы той же
+        "notification_queue": {"cols": ("dedup_key",),
+                               "index": "uq_notification_dedup"},
     }
 
     # Схлопывание дублей С УЧЁТОМ ДАННЫХ: там, где лишнюю строку нельзя просто
@@ -1337,6 +1418,50 @@ class DataBase:
             self.connection.commit()
         return dict(row) if row else None
 
+    def qw(self, sql, params=()):
+        """Пишущий стейтмент с RETURNING: СПИСОК строк.
+
+        То же, что q1w, но на пачку. Нужен ровно там, где «пометить своим» и
+        «прочитать содержимое» обязаны быть ОДНИМ стейтментом: партия из очереди
+        пушей, взятая двумя запросами (SELECT, потом UPDATE), достаётся сразу
+        двум воркерам, и игрок получает два одинаковых сообщения."""
+        cur = self.cursor
+        with self._measure("write"):
+            cur.execute(self._sql(sql), params)
+            rows = cur.fetchall()
+        if not self._tx_depth:
+            self.connection.commit()
+        return [dict(r) for r in rows]
+
+    # ---------- очередь уведомлений ----------
+
+    def claim_notifications(self, limit: int, now: float,
+                            owner: str) -> list[dict]:
+        """Взять партию готовых к отправке задач. Каждая строка достаётся ровно
+        одному воркеру — на этом держится вся развязка планировщика и отправки.
+
+        Диалектных различий здесь ровно одно, и оно про ОЖИДАНИЕ. В SQLite
+        писатель на файл один: пока идёт этот UPDATE, второй воркер до очереди
+        не доберётся вовсе, и разойтись по разным строкам им негде и незачем.
+        PostgreSQL пишет параллельно, и без `FOR UPDATE SKIP LOCKED` второй
+        воркер встал бы на строках первого и дождался бы... ровно тех же строк,
+        уже не подходящих под условие. То есть работал бы всегда один воркер.
+
+        `LIMIT` внутри подзапроса, а не в самом UPDATE: `UPDATE ... LIMIT`
+        SQLite понимает только в специальной сборке, а `WHERE id IN (SELECT ...
+        LIMIT ?)` — везде. `RETURNING` умеют оба движка (SQLite с 3.35), и он
+        здесь не удобство: без него содержимое взятых строк пришлось бы читать
+        отдельным SELECT'ом, а к этому моменту их уже мог бы переписать
+        сборщик просроченных заявок."""
+        skip = " FOR UPDATE SKIP LOCKED" if self.DIALECT == "postgres" else ""
+        return self.qw(
+            "UPDATE notification_queue SET status = 'sending', "
+            "attempts = attempts + 1, claimed_at = ?, claimed_by = ? "
+            "WHERE id IN (SELECT id FROM notification_queue "
+            "WHERE status = 'scheduled' AND scheduled_at <= ? "
+            f"ORDER BY scheduled_at LIMIT ?{skip}) "
+            "RETURNING *", (now, owner, now, limit))
+
     # ---------- юзеры ----------
 
     def get_user(self, user_id):
@@ -1367,7 +1492,8 @@ class DataBase:
     # устаревала бы сама по себе — клиент вернул бы её обратно и получил 409
     # на первое же осмысленное действие. Ревизия считает изменения СМЫСЛА,
     # а не изменения строки.
-    SILENT_COLUMNS = frozenset({"last_seen_at", "last_notified_at", "notify_blocked"})
+    SILENT_COLUMNS = frozenset({"last_seen_at", "last_notified_at",
+                                "notify_blocked", "tz_offset_min"})
 
     def update_user(self, user_id, **fields):
         cols = ", ".join(f"{k} = ?" for k in fields)

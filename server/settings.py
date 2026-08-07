@@ -152,6 +152,11 @@ BACKUP_ENCRYPT_KEY = _s("BACKUP_ENCRYPT_KEY")
 # Раз во сколько часов проверять восстановлением. Ноль — не проверять.
 BACKUP_DRILL_INTERVAL_H = _i("BACKUP_DRILL_INTERVAL_H", 24)
 
+# ---------- Уведомления ----------
+# Аварийный выключатель очереди: с NOTIFY_QUEUE=0 нотификатор возвращается к
+# старому прямому проходу по игрокам. По умолчанию очередь включена.
+NOTIFY_QUEUE = _b("NOTIFY_QUEUE", True)
+
 _SECRET_KEYS = ("BOT_TOKEN", "DATABASE_URL", "REDIS_URL", "WEBHOOK_SECRET",
                 "METRICS_TOKEN", "SENTRY_DSN", "BACKUP_ENCRYPT_KEY")
 

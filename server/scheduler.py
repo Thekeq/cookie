@@ -133,7 +133,34 @@ def health(now: float | None = None) -> dict:
         out["stale"] = stale
     if failing:
         out["failing"] = failing
+    backlog = _notify_backlog(now)
+    if backlog:
+        out["notify_backlog"] = backlog
     return out
+
+
+def _notify_backlog(now: float) -> dict | None:
+    """Просроченная очередь пушей — единственная работа БЕЗ задачи планировщика.
+
+    Воркер отправки намеренно живёт без замка и без интервала (иначе он был бы
+    один на кластер и навсегда упёрся в 25 msg/s), а значит его остановка не
+    видна ни в одной строке job_runs. Снаружи это выглядело бы как здоровая
+    система, которая просто перестала писать игрокам, — ровно тот отказ, что
+    находится по жалобам, а не по мониторингу.
+
+    Молчим, пока очередь разбирается: «нечего сказать» и «всё плохо» обязаны
+    выглядеть по-разному. Ошибку не пробрасываем — /healthz не имеет права
+    падать из-за сводки."""
+    try:
+        from server import notifications
+        st = notifications.stats(now)
+        age = st.get("oldest_due_age", 0)
+        if age <= notifications.LEASE_S:
+            return None
+        return {"oldest_due_age": age, "scheduled": st.get("scheduled", 0)}
+    except Exception as e:                    # noqa: BLE001
+        log.warning("сводка по очереди пушей не собралась: %s", e)
+        return None
 
 
 def reset(key: str | None = None):
