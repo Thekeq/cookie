@@ -568,6 +568,107 @@ check("13.4 /healthz отвечает 200", _r.status_code == 200 and _j["ok"] i
 check("13.5 в /healthz видно роль, кеш и планировщик",
       _j["role"] and "backend" in _j["cache"] and "jobs" in _j["scheduler"])
 
+print("\n=== 13bis. Слушающий сокет от systemd (окно рестарта) ===")
+import asyncio
+import socket as _socket
+import threading as _threading
+
+import uvicorn
+
+
+def _with_listen_env(**env):
+    """Окружение socket activation вокруг inherited_socket.
+
+    Переменные ставятся и снимаются здесь целиком: функция их СЪЕДАЕТ (так же
+    делает sd_listen_fds), и остаток от одной проверки испортил бы следующую."""
+    saved = {k: os.environ.get(k) for k in ("LISTEN_PID", "LISTEN_FDS")}
+    try:
+        for k in ("LISTEN_PID", "LISTEN_FDS"):
+            os.environ.pop(k, None)
+        for k, v in env.items():
+            os.environ[k] = str(v)
+        return main_module.inherited_socket()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+check("13bis.1 без systemd сокет не выдумывается (порт откроем сами)",
+      _with_listen_env() is None)
+# LISTEN_PID адресован КОНКРЕТНОМУ процессу, а переменные наследуются: без
+# сверки с pid ребёнок принял бы за слушающий сокет свой посторонний fd 3
+check("13bis.2 чужой LISTEN_PID игнорируется",
+      _with_listen_env(LISTEN_PID=os.getpid() + 1, LISTEN_FDS=1) is None)
+try:
+    _with_listen_env(LISTEN_PID=os.getpid(), LISTEN_FDS=2)
+    check("13bis.3 несколько сокетов — отказ, а не молчаливый выбор", False)
+except SystemExit:
+    check("13bis.3 несколько сокетов — отказ, а не молчаливый выбор", True)
+check("13bis.4 переменные съедены и потомкам не достаются",
+      "LISTEN_PID" not in os.environ and "LISTEN_FDS" not in os.environ)
+
+# Главное свойство, ради которого всё и делается: слушатель пережил окно без
+# сервера, и запрос, пришедший в это окно, обслуживается, а не получает отказ.
+# Слушателя тут держит сам тест — на боевой машине его держит cookie-api.socket.
+_lsn = _socket.socket()
+_lsn.bind(("127.0.0.1", 0))
+_lsn.listen(1024)
+_lport = _lsn.getsockname()[1]
+
+_client = _socket.create_connection(("127.0.0.1", _lport), timeout=10)
+_client.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n"
+                b"Connection: close\r\n\r\n")
+check("13bis.5 соединение в окно рестарта принято ядром, а не отвергнуто",
+      True)  # sendall выше не бросил ECONNREFUSED — сервера при этом нет
+
+_answer = {}
+
+
+def _read_answer():
+    data = b""
+    try:
+        while True:
+            chunk = _client.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError as e:
+        data = f"error: {e}".encode()
+    _answer["raw"] = data
+    _api_server.should_exit = True
+
+
+_api_config = uvicorn.Config(main_module.app, log_level="warning",
+                             timeout_graceful_shutdown=1)
+_api_server = uvicorn.Server(_api_config)
+_threading.Thread(target=_read_answer, daemon=True).start()
+# сокет пересоздаётся по дескриптору ровно как в inherited_socket
+asyncio.run(_api_server.serve(sockets=[_socket.socket(fileno=_lsn.fileno())]))
+_raw = _answer.get("raw", b"")
+check("13bis.6 запрос из очереди обслужен поднявшимся процессом",
+      _raw.startswith(b"HTTP/1.1 200"))
+check("13bis.7 это ответ приложения, а не пустой сокет", b"\"ok\"" in _raw)
+_client.close()
+
+# Юниты: сокет без ссылки из сервиса — это порт, который никто не слушает,
+# а сервис без сокета под socket activation молча стартует мимо очереди
+import pathlib as _pl
+
+_sock_unit = _pl.Path("deploy", "cookie-api.socket").read_text(encoding="utf-8")
+_api_unit = _pl.Path("deploy", "cookie-api.service").read_text(encoding="utf-8")
+check("13bis.8 сокет-юнит слушает порт из .env",
+      f"ListenStream=0.0.0.0:{_settings.PORT}" in _sock_unit)
+check("13bis.9 сервис требует сокет, а не надеется на него",
+      "Requires=cookie-api.socket" in _api_unit
+      and "After=cookie-api.socket" in _api_unit)
+check("13bis.10 один процесс на все соединения, а не копия на запрос",
+      "Accept=no" in _sock_unit)
+check("13bis.11 очередь рассчитана на окно рестарта, а не на дефолт",
+      "Backlog=" in _sock_unit)
+
 print("\n=== 14. Webhook: маршрут, секрет, регистрация ===")
 import asyncio
 import pathlib as _pathlib

@@ -8,6 +8,7 @@ import hmac
 import logging
 import mimetypes
 import os
+import socket
 import time
 from contextlib import asynccontextmanager
 
@@ -542,6 +543,38 @@ async def run_bot():
     await dp.start_polling(bot)
 
 
+def inherited_socket() -> socket.socket | None:
+    """Слушающий сокет, открытый systemd, а не нами (socket activation).
+
+    Зачем. Порт держит юнит cookie-api.socket, и он переживает рестарт
+    сервиса: соединения, пришедшие в окно деплоя, копятся в очереди ядра, а не
+    получают отказ. Игрок ждёт лишние пару секунд вместо 502 — своей страницы
+    «идут работы» показать всё равно некому, веб-сервера перед uvicorn в
+    боевой схеме нет, а Cloudflare отдаёт свою.
+
+    LISTEN_PID сверяется со своим pid намеренно: переменные наследуются
+    потомками, и без проверки чужой процесс принял бы за свой посторонний
+    дескриптор. После чтения переменные убираются — так же делает
+    sd_listen_fds.
+
+    Первый переданный дескриптор всегда 3 (SD_LISTEN_FDS_START). Семейство и
+    тип берутся из самого дескриптора: назови мы их сами и ошибись — адрес
+    разбирался бы не тем разбором, а не упал бы честно.
+
+    Без systemd (локальный запуск, Windows) возвращается None, и порт
+    открывается как раньше, по HOST/PORT."""
+    if os.environ.pop("LISTEN_PID", None) != str(os.getpid()):
+        return None
+    count = int(os.environ.pop("LISTEN_FDS", "0") or 0)
+    if count != 1:
+        raise SystemExit(f"systemd передал сокетов: {count}, ожидался один")
+    sock = socket.socket(fileno=3)
+    # воркерам сокет достаётся через fork/spawn — иначе дети остались бы без него
+    sock.set_inheritable(True)
+    logging.info("Слушающий сокет получен от systemd: %s", sock.getsockname())
+    return sock
+
+
 async def run_api():
     """HTTP-сервер этого процесса.
 
@@ -557,7 +590,8 @@ async def run_api():
     config = uvicorn.Config(app, host=settings.HOST, port=settings.PORT,
                             log_level="warning",
                             timeout_graceful_shutdown=settings.GRACEFUL_TIMEOUT)
-    await uvicorn.Server(config).serve()
+    sock = inherited_socket()
+    await uvicorn.Server(config).serve(sockets=[sock] if sock else None)
 
 
 def serve_api_workers():
@@ -565,7 +599,8 @@ def serve_api_workers():
 
     Сокет открывает мастер и передаёт детям, поэтому порт занят один раз, а
     ядро само раскладывает соединения по воркерам — ни балансировщика, ни
-    отдельных портов не нужно.
+    отдельных портов не нужно. Под systemd сокет открыт ещё раньше, самим
+    systemd, и мастер только принимает его (см. inherited_socket).
 
     Приложение передаётся СТРОКОЙ "main:app", а не объектом: дети создаются
     через fork/spawn и на Windows (spawn) объект приложения не переживает
@@ -581,7 +616,7 @@ def serve_api_workers():
                             workers=settings.WEB_CONCURRENCY,
                             log_level="warning",
                             timeout_graceful_shutdown=settings.GRACEFUL_TIMEOUT)
-    sock = config.bind_socket()
+    sock = inherited_socket() or config.bind_socket()
     try:
         Multiprocess(config, sockets=[sock]).run()
     finally:

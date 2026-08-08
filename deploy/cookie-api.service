@@ -5,6 +5,12 @@
 Description=Cookie Merge — API
 After=network-online.target
 Wants=network-online.target
+# Порт открывает сокет-юнит, а не этот процесс: слушатель переживает рестарт
+# сервиса, и соединения в окно деплоя ждут в очереди ядра вместо отказа
+# (подробности — в cookie-api.socket). Requires, а не Wants: без сокета
+# процессу нечего слушать, и молчаливый старт «без порта» хуже отказа.
+Requires=cookie-api.socket
+After=cookie-api.socket
 
 [Service]
 Type=simple

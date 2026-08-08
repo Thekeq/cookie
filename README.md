@@ -114,16 +114,41 @@ p99 в три секунды означает, что каждый сотый т
 - `DATABASE_URL` — на SQLite писатель в файле один, и воркеры будут ждать друг
   друга на блокировке (это предупреждение, а не отказ).
 
-Юниты systemd лежат в `deploy/`: `cookie-api.service` и
-`cookie-scheduler.service`, оба читают общий `/opt/cookie/.env`, роль задают
-через `Environment=`.
+Юниты systemd лежат в `deploy/`: `cookie-api.service`, `cookie-api.socket` и
+`cookie-scheduler.service`. Сервисы читают общий `/opt/cookie/.env`, роль
+задают через `Environment=`; сокет-юнит держит порт отдельно от процесса — см.
+«Деплой без 502» ниже.
 
 ```
-sudo cp deploy/cookie-*.service /etc/systemd/system/
+sudo cp deploy/cookie-*.service deploy/cookie-api.socket /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now cookie-api.socket
 sudo systemctl enable --now cookie-api cookie-scheduler
-systemctl status cookie-api cookie-scheduler
+systemctl status cookie-api.socket cookie-api cookie-scheduler
 ```
+
+### Деплой без 502
+
+Порт держит **не процесс, а `cookie-api.socket`**. Слушатель переживает
+`systemctl restart cookie-api`, и соединения, пришедшие в окно рестарта, ждут
+в очереди ядра, а не получают отказ: игрок видит запрос на пару секунд дольше
+вместо `502 Bad gateway` от Cloudflare. Отдельной страницы «идут работы» тут
+быть не может — своего веб-сервера перед uvicorn в схеме нет, и пока процесс
+мёртв, отвечать нечем в принципе.
+
+Приложение само порт больше не открывает: `main.inherited_socket()` забирает
+дескриптор 3 у systemd (сверяя `LISTEN_PID` со своим pid — переменные
+наследуются потомками) и отдаёт его uvicorn. Без systemd — локально, на
+Windows — функция возвращает `None`, и порт открывается по `HOST`/`PORT`, как
+раньше. `ListenStream` в юните обязан совпадать с `PORT` из `.env`.
+
+Чего это не чинит: деплой, после которого процесс не поднимается **совсем**.
+Тогда запросы ждут в очереди до таймаута Cloudflare и игрок получает `524`
+вместо `502`. Лечится откатом (`canary.py rollback --main`), а не ожиданием.
+
+Ещё одно следствие: `systemctl stop cookie-api` теперь не закрывает порт, и
+первый же запрос поднимает сервис обратно. Чтобы остановить по-настоящему —
+`systemctl stop cookie-api.socket cookie-api`.
 
 Логи при нескольких воркерах пишутся в отдельный файл на процесс
 (`cookie.<pid>.log`): ротация — это переименование, и N процессов, ротирующих
