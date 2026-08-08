@@ -3,7 +3,6 @@ import { api, shareRefLink } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
 
-const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
 
 interface LBRow {
   rank: number
@@ -31,7 +30,7 @@ const MEDALS = ['🥇', '🥈', '🥉']
 export default function LeaderboardTab() {
   const t = useT()
   const te = useTErr()
-  const { state, toast } = useGame()
+  const { state, toast, botUsername } = useGame()
   const [data, setData] = useState<LBData | null>(null)
 
   useEffect(() => {
@@ -81,8 +80,9 @@ export default function LeaderboardTab() {
             </span>
             <button
               className="claim-chip"
+              disabled={!botUsername}
               onClick={() =>
-                shareRefLink(BOT_USERNAME, state.user.user_id, t('share_rank_text', { n: data.me.rank! }))
+                shareRefLink(botUsername, state.user.user_id, t('share_rank_text', { n: data.me.rank! }))
               }
             >
               {t('share_ach')}

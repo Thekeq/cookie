@@ -28,13 +28,13 @@ main.py               # бот (polling) + API (uvicorn) + notifier одним �
    ```
    BOT_TOKEN = "токен от @BotFather"   # старый токен засветился — перевыпусти!
    ADMIN_ID = 1076078800
-   BOT_USERNAME = "имя_бота_без_@"     # для реф- и source-ссылок
+   BOT_USERNAME = "имя_бота_без_@"     # для реф- и source-ссылок; фронт берёт его
+                                       # из /api/auth, пересобирать его не нужно
    WEBAPP_URL = "https://<твой-туннель-или-домен>"
    PORT = 8000
    CHANNEL_USERNAME = "имя_канала"     # опционально: награда за подписку в профиле
    ```
 2. Собери фронт: `cd webapp && npm install && npm run build`
-   (для реф-ссылок на фронте: `VITE_BOT_USERNAME=имя_бота npm run build`)
 3. `python main.py` — поднимет бота и API на :8000, фронт раздаётся с корня.
 4. Для теста в Telegram нужен HTTPS: `cloudflared tunnel --url http://localhost:8000`
    (или ngrok), полученный URL → в `WEBAPP_URL` **и** в настройки Mini App у @BotFather

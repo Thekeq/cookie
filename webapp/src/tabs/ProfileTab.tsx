@@ -11,11 +11,8 @@ import { useBusy } from '../useBusy'
 import PrestigeModal from '../PrestigeModal'
 import Spinner from './Spinner'
 
-// username бота для реф-ссылок; при деплое поменяй на своего
-const BOT_USERNAME = (import.meta as any).env?.VITE_BOT_USERNAME || 'YourCookieBot'
-
 export default function ProfileTab() {
-  const { state, refresh, toast } = useGame()
+  const { state, refresh, toast, botUsername } = useGame()
   const t = useT()
   const te = useTErr()
   const { lang, setLang } = useContext(LangCtx)
@@ -108,7 +105,7 @@ export default function ProfileTab() {
   })
 
   const shareAch = (title: string) => {
-    shareRefLink(BOT_USERNAME, state.user.user_id, t('share_ach_text', { a: title }))
+    shareRefLink(botUsername, state.user.user_id, t('share_ach_text', { a: title }))
   }
 
   const openChannel = () => {
@@ -198,7 +195,11 @@ export default function ProfileTab() {
         <div className="hint" style={{ margin: '6px 0 10px' }}>
           {t('invite_hint', { a: fmt(refs?.reward_referrer ?? 1000), b: fmt(refs?.reward_referred ?? 500) })}
         </div>
-        <button className="btn" onClick={() => shareRefLink(BOT_USERNAME, state.user.user_id, t('share_text'))}>
+        {/* без имени бота ссылка вела бы на https://t.me/?startapp=... — гасим
+            кнопку, чтобы промах в настройке сервера был виден, а не расходился
+            битыми приглашениями */}
+        <button className="btn" disabled={!botUsername}
+                onClick={() => shareRefLink(botUsername, state.user.user_id, t('share_text'))}>
           {t('share_link')}
         </button>
 

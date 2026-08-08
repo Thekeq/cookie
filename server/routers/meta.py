@@ -11,7 +11,7 @@ from server import game_logic as gl
 from server.auth import tg_user
 from server.deps import op_token
 from server.game_logic import db
-from server.settings import CHANNEL_USERNAME
+from server.settings import BOT_USERNAME, CHANNEL_USERNAME
 
 router = APIRouter(prefix="/api")
 
@@ -90,6 +90,17 @@ async def auth(tg: dict = Depends(tg_user)):
     state = gl.full_state(tg["id"])
     state["just_registered"] = just_registered
     state["passive_collected"] = passive + farm_income
+    # Имя бота фронт получает отсюда, а не из своего VITE_BOT_USERNAME. Vite
+    # зашивает env в бандл НА СБОРКЕ и видит только префикс VITE_, поэтому
+    # BOT_USERNAME из корневого .env до реф-ссылок не доходил вовсе и каждая
+    # сборка уезжала с хардкодным фолбэком в ссылке. Источник теперь один — тот
+    # же settings, что у source-ссылок админки и deep-link'ов в пушах, — и смена
+    # имени бота не требует пересборки фронта.
+    #
+    # Именно в /auth, а не в full_state: тот возвращается из КАЖДОЙ изменяющей
+    # ручки, и константа ездила бы в каждом ответе. Здесь она уезжает один раз
+    # за сессию, ровно туда, где фронт её и запоминает.
+    state["bot_username"] = BOT_USERNAME
     return state
 
 
