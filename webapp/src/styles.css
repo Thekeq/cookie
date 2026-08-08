@@ -540,8 +540,11 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
 
 /* ---------- батл-пасс ---------- */
 .bp-track { display: flex; flex-direction: column; gap: 8px; }
+/* minmax(0, 1fr), а не 1fr: у грид-колонки min-width по умолчанию auto, и
+   награда из четырёх частей распирала трек за правый край экрана */
 .bp-level {
-  display: grid; grid-template-columns: 44px 1fr 1fr; gap: 8px; align-items: center;
+  display: grid; grid-template-columns: 44px minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px; align-items: center;
 }
 .bp-num {
   width: 40px; height: 40px; border-radius: 50%; background: var(--card);
@@ -553,14 +556,30 @@ h2, h3 { font-family: var(--font-display); letter-spacing: 0.01em; }
   background: linear-gradient(180deg, var(--glaze), var(--accent));
   border-color: transparent; color: #2a1a04;
 }
+/* награда собирается из нескольких частей (печенье, энергия, клетка, оффлайн,
+   скин) — колонка узкая, поэтому части переносятся строками, а не режутся */
 .bp-reward {
   background: var(--card); border-radius: 12px; padding: 8px; font-size: 12px;
   text-align: center; border: 1px solid var(--card-edge);
   transition: border-color 0.15s;
+  display: flex; flex-wrap: wrap; gap: 2px 6px;
+  align-items: center; justify-content: center;
+  min-height: 36px; line-height: 1.25;
 }
 .bp-reward.claimable { border-color: var(--good); cursor: pointer; }
 .bp-reward.claimed { opacity: 0.4; }
 .bp-reward.locked { opacity: 0.55; }
+
+/* карточка конверсии: премиум-уровни уже наиграны, пас ещё не куплен */
+.bp-offer { border-color: var(--accent); }
+.bp-offer .levels {
+  font-family: var(--font-display); font-weight: 700;
+  font-size: 20px; color: var(--accent); margin-top: 2px;
+}
+.bp-offer ul {
+  list-style: none; margin: 8px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 4px; font-size: 14px;
+}
 
 /* ---------- достижения / списки ---------- */
 .ach { display: flex; align-items: center; gap: 10px; }

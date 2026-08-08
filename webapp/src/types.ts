@@ -185,13 +185,38 @@ export interface Achievement {
   claimed: boolean
 }
 
+/** Награда уровня паса. Ключи приходят всегда, нулевые части просто не рисуем. */
+export interface BPReward {
+  cookies: number
+  energy: number
+  /** +клетки доски на сезон (0 или 1) */
+  cells: number
+  /** +часы потолка оффлайн-дохода на сезон */
+  offline_hours: number
+  /** ключ эксклюзивного скина, например "golden" */
+  skin: string | null
+  /** клетку сверх потолка доски сервер меняет на печенье (только в ответе claim) */
+  cookies_substituted?: boolean
+}
+
 export interface BPLevel {
   level: number
-  free: { cookies: number; energy: number }
-  premium: { cookies: number; energy: number }
+  free: BPReward
+  premium: BPReward
   reached: boolean
   free_claimed: boolean
   premium_claimed: boolean
+}
+
+/** Сумма premium-наград на уже взятых уровнях: ровно это выдадут в момент
+ *  покупки (ретроактивный клейм умеет сервер). У владельца премиума levels = 0. */
+export interface BPLockedPremium {
+  levels: number
+  cookies: number
+  energy: number
+  cells: number
+  offline_hours: number
+  skins: number
 }
 
 export interface ShopItem {

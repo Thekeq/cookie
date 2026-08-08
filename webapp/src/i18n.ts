@@ -137,6 +137,10 @@ const dict = {
   bp_buy: { en: 'Buy Premium for', uk: 'Купити Premium за', ru: 'Купить Premium за' },
   bp_free: { en: 'Free', uk: 'Безкоштовно', ru: 'Бесплатно' },
   bp_premium_on: { en: 'Premium Pass activated! 🎖️', uk: 'Premium Пас активовано! 🎖️', ru: 'Premium Пасс активирован! 🎖️' },
+  bp_locked_title: { en: '🎁 Premium rewards are piling up', uk: '🎁 Premium-нагороди вже накопичуються', ru: '🎁 Premium-награды уже копятся' },
+  bp_locked_hint: { en: 'You get all of this the moment you buy Premium:', uk: 'Усе це впаде на рахунок одразу після покупки:', ru: 'Всё это упадёт на счёт сразу после покупки:' },
+  bp_offline_cap: { en: '+{n}h offline cap', uk: '+{n} год ліміту офлайну', ru: '+{n} ч лимита оффлайна' },
+  bp_cells_maxed: { en: 'board is already at max cells — cookies instead', uk: 'дошка вже максимальна — замість клітинки печиво', ru: 'доска уже максимальная — вместо клетки печенье' },
 
   // магазин Stars
   stars_hint: { en: 'Purchases with Telegram Stars ⭐ — pay in two taps', uk: 'Покупки за Telegram Stars ⭐ — оплата у два тапи', ru: 'Покупки за Telegram Stars ⭐ — оплата в пару тапов' },
@@ -434,6 +438,21 @@ const plurals = {
     en: { one: 'Streak: {n} day', other: 'Streak: {n} days' },
     uk: { one: 'Стрік: {n} день', few: 'Стрік: {n} дні', many: 'Стрік: {n} днів', other: 'Стрік: {n} дня' },
     ru: { one: 'Стрик: {n} день', few: 'Стрик: {n} дня', many: 'Стрик: {n} дней', other: 'Стрик: {n} дня' },
+  },
+  bp_n_levels: {
+    en: { one: '{n} premium level', other: '{n} premium levels' },
+    uk: { one: '{n} premium-рівень', few: '{n} premium-рівні', many: '{n} premium-рівнів', other: '{n} premium-рівня' },
+    ru: { one: '{n} premium-уровень', few: '{n} premium-уровня', many: '{n} premium-уровней', other: '{n} premium-уровня' },
+  },
+  bp_n_cells: {
+    en: { one: '+{n} board cell', other: '+{n} board cells' },
+    uk: { one: '+{n} клітинка дошки', few: '+{n} клітинки дошки', many: '+{n} клітинок дошки', other: '+{n} клітинки дошки' },
+    ru: { one: '+{n} клетка доски', few: '+{n} клетки доски', many: '+{n} клеток доски', other: '+{n} клетки доски' },
+  },
+  bp_n_skins: {
+    en: { one: '{n} exclusive skin', other: '{n} exclusive skins' },
+    uk: { one: '{n} ексклюзивний скін', few: '{n} ексклюзивні скіни', many: '{n} ексклюзивних скінів', other: '{n} ексклюзивного скіна' },
+    ru: { one: '{n} эксклюзивный скин', few: '{n} эксклюзивных скина', many: '{n} эксклюзивных скинов', other: '{n} эксклюзивного скина' },
   },
 } satisfies Record<string, Record<Lang, PluralForms>>
 

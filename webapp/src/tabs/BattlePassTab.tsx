@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react'
 import { api, hapticSuccess, openInvoice } from '../api'
 import { fmt, useGame } from '../App'
 import { useT, useTErr } from '../i18n'
+import type { TFunc } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
-import type { BPLevel } from '../types'
+import type { BPLevel, BPLockedPremium, BPReward } from '../types'
 import { useBusy } from '../useBusy'
 import Spinner from './Spinner'
 
@@ -17,6 +18,25 @@ interface BPData {
   premium: boolean
   premium_price_stars: number
   levels: BPLevel[]
+  locked_premium: BPLockedPremium
+}
+
+/**
+ * Ненулевые части награды строками: «🍪 12K», «+⚡100», «+🔲1», «+⏳3ч», «+🎨».
+ *
+ * Только иконки и числа: в треке две колонки по половине экрана, и слово
+ * «клетка» не влезает в них ни на одном из трёх языков. Тот же список идёт в
+ * тост после клейма — там подписи не нужны, потому что игрок только что видел
+ * ту же ячейку и узнаёт её по иконкам.
+ */
+function rewardParts(r: BPReward, t: TFunc): string[] {
+  const parts: string[] = []
+  if (r.cookies) parts.push(`🍪 ${fmt(r.cookies)}`)
+  if (r.energy) parts.push(`+⚡${r.energy}`)
+  if (r.cells) parts.push(`+🔲${r.cells}`)
+  if (r.offline_hours) parts.push(`+⏳${t('hours_short', { n: r.offline_hours })}`)
+  if (r.skin) parts.push('+🎨')
+  return parts
 }
 
 export default function BattlePassTab() {
@@ -40,7 +60,10 @@ export default function BattlePassTab() {
         const r = await api.postOnce('/api/battlepass/claim', { level, track })
         hapticSuccess()
         sfxBuy()
-        toast(`+${fmt(r.reward.cookies)} 🍪`)
+        // Подмену клетки на печенье обязательно проговариваем: без подписи игрок
+        // видит печеньки там, где в треке нарисована клетка, и считает это багом.
+        toast(rewardParts(r.reward, t).join(' ')
+          + (r.reward.cookies_substituted ? ` · ${t('bp_cells_maxed')}` : ''))
         load()
         refresh()
       } catch (e: any) {
@@ -74,6 +97,17 @@ export default function BattlePassTab() {
 
   const progressInLevel = bp.xp_in_level ?? bp.bp_xp - bp.bp_level * bp.xp_per_level
 
+  // Накопленное за уже взятые уровни — момент конверсии: пас продаёт не «награды
+  // когда-нибудь», а вот эту готовую пачку, которая выдаётся в секунду покупки.
+  // Здесь карточка широкая, поэтому в отличие от трека пишем словами.
+  const lp = bp.locked_premium
+  const lockedItems: string[] = []
+  if (lp.cookies) lockedItems.push(`🍪 ${fmt(lp.cookies)}`)
+  if (lp.energy) lockedItems.push(`⚡ +${lp.energy}`)
+  if (lp.cells) lockedItems.push(`🔲 ${t.plural('bp_n_cells', lp.cells)}`)
+  if (lp.offline_hours) lockedItems.push(`⏳ ${t('bp_offline_cap', { n: lp.offline_hours })}`)
+  if (lp.skins) lockedItems.push(`🎨 ${t.plural('bp_n_skins', lp.skins)}`)
+
   return (
     <div>
       <div className="card">
@@ -98,7 +132,8 @@ export default function BattlePassTab() {
             </div>
           )
         })()}
-        {!bp.premium && (
+        {/* пока копить нечего — обычная кнопка; иначе продаёт карточка ниже */}
+        {!bp.premium && lp.levels === 0 && (
           <button className="btn" style={{ marginTop: 10 }}
                   disabled={busy === 'premium'} onClick={buyPremium}>
             {busy === 'premium'
@@ -107,6 +142,23 @@ export default function BattlePassTab() {
           </button>
         )}
       </div>
+
+      {!bp.premium && lp.levels > 0 && (
+        <div className="card bp-offer">
+          <b>{t('bp_locked_title')}</b>
+          <div className="levels">{t.plural('bp_n_levels', lp.levels)}</div>
+          <div className="hint" style={{ marginTop: 6 }}>{t('bp_locked_hint')}</div>
+          <ul>
+            {lockedItems.map((it) => <li key={it}>{it}</li>)}
+          </ul>
+          <button className="btn" style={{ marginTop: 12 }}
+                  disabled={busy === 'premium'} onClick={buyPremium}>
+            {busy === 'premium'
+              ? <Spinner />
+              : <>{t('bp_buy')} ⭐ {bp.premium_price_stars}</>}
+          </button>
+        </div>
+      )}
 
       <div className="row hint" style={{ padding: '0 4px 6px', fontWeight: 700 }}>
         <span style={{ width: 44 }}></span>
@@ -127,8 +179,8 @@ export default function BattlePassTab() {
             >
               {busy === bpKey(l.level, 'free') ? <Spinner /> : (
                 <>
-                  🍪 {fmt(l.free.cookies)}
-                  {l.free_claimed ? ' ✓' : ''}
+                  {rewardParts(l.free, t).map((p) => <span key={p}>{p}</span>)}
+                  {l.free_claimed ? <span>✓</span> : null}
                 </>
               )}
             </div>
@@ -145,9 +197,8 @@ export default function BattlePassTab() {
             >
               {busy === bpKey(l.level, 'premium') ? <Spinner /> : (
                 <>
-                  🍪 {fmt(l.premium.cookies)}
-                  {l.premium.energy ? ` +⚡${l.premium.energy}` : ''}
-                  {l.premium_claimed ? ' ✓' : ''}
+                  {rewardParts(l.premium, t).map((p) => <span key={p}>{p}</span>)}
+                  {l.premium_claimed ? <span>✓</span> : null}
                 </>
               )}
             </div>
