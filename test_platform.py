@@ -1257,6 +1257,45 @@ check("18.2 наборы идут отдельными процессами",
 check("18.3 из окружения прогона вычищается боевая база",
       'env.pop("DATABASE_URL"' in _runner_src)
 
+# Пакет, который стоит на рабочей машине, но не записан в requirements.txt, —
+# это набор проверок, который на чистой машине не запускается ВООБЩЕ. Ровно так
+# и вышло с httpx: fastapi.testclient построен на нём, локально он приехал
+# попутчиком другой библиотеки, а в CI семь наборов из одиннадцати падали на
+# первой строке импорта — то есть красным был не код, а список зависимостей.
+import re
+import sys as _sys
+
+_req_src = _pathlib.Path("requirements.txt").read_text(encoding="utf-8")
+_req_names = {re.split(r"[=<>\[]", line, 1)[0].strip().lower()
+              for line in _req_src.splitlines()
+              if line.strip() and not line.startswith("#")}
+# имя пакета и имя модуля совпадают не всегда
+_dist_of = {"dotenv": "python-dotenv", "sentry_sdk": "sentry-sdk"}
+# свои модули — это не только корень: наборы кладут в sys.path deploy/ и
+# tools/ и импортируют оттуда по короткому имени
+_local = {p.name for p in _pathlib.Path(".").iterdir() if p.is_dir()}
+for _folder in (".", "deploy", "tools", "bot", "server"):
+    _local |= {p.stem for p in _pathlib.Path(_folder).glob("*.py")}
+_missing = set()
+for _src_file in sorted(_pathlib.Path(".").glob("test_*.py")) + [
+        _pathlib.Path("main.py"), _pathlib.Path("db.py")]:
+    for _line in _src_file.read_text(encoding="utf-8").splitlines():
+        _m = re.match(r"\s*(?:from|import)\s+([A-Za-z_][\w]*)", _line)
+        if not _m:
+            continue
+        _mod = _m.group(1)
+        if _mod in _sys.stdlib_module_names or _mod in _local:
+            continue
+        if _dist_of.get(_mod, _mod).lower() not in _req_names:
+            _missing.add(_mod)
+check(f"18.3a всё, что импортируют проверки, записано в requirements "
+      f"(не хватает: {sorted(_missing) or 'ничего'})", not _missing)
+# Версия starlette решает, какой тестовый клиент нужен, а fastapi пускает
+# слишком широкий диапазон: без пина CI и рабочая машина ставят РАЗНОЕ
+check("18.3b starlette пинуется явно, а не как придётся",
+      any(n == "starlette" for n in _req_names)
+      and "starlette==" in _req_src)
+
 _ci = _pathlib.Path(".github", "workflows", "ci.yml")
 check("18.4 есть workflow на пуш и на pull request", _ci.exists())
 _ci_src = _ci.read_text(encoding="utf-8")
