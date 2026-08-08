@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { fmt, fmtRate, useGame } from '../App'
+import { formatIncome } from '../format'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError } from '../sound'
 import { askConfirm } from '../telegram'
@@ -93,7 +94,7 @@ export default function FarmTab() {
             <div className="hint">{t('farm_hint', { n: farm.offline_cap_hours })}</div>
           </div>
           <div style={{ fontWeight: 800, color: 'var(--good)', whiteSpace: 'nowrap' }}>
-            +{fmtRate(farm.cps)}/s
+            +{formatIncome(farm.cps)}
           </div>
         </div>
       </div>
@@ -125,8 +126,12 @@ export default function FarmTab() {
               <b style={{ fontSize: 14 }}>
                 {t(('b_' + b.key) as any)} {b.owned > 0 && <span className="hint">×{b.owned}</span>}
               </b>
+              {/* за копию — в секундах: это цена вопроса «взять ещё одну».
+                  Итог по зданию — в обеих единицах, чтобы его можно было
+                  сложить глазами с доходом доски, который считается в часах */}
               <div className="hint">
-                +{fmtRate(b.cps_each)}/s {b.owned > 0 && `(= ${fmtRate(b.cps_each * b.owned)}/s)`}
+                +{fmtRate(b.cps_each)}{t('per_sec')}
+                {b.owned > 0 && ` (= ${formatIncome(b.cps_each * b.owned)})`}
               </div>
             </div>
             {b.maxed ? (

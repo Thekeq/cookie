@@ -268,39 +268,33 @@ export function askConfirm(message: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 // themeParams
 //
-// Приложение раньше жило в своей палитре независимо от клиента. Теперь цвета
-// темы приезжают в CSS-переменные: все параметры как есть (--tg-*), а часть
-// подменяет фирменные переменные (поверхности и текст). Карамельный акцент
-// остаётся акцентом игры — на него завязаны градиенты и свечения, менять его
-// на синюю кнопку клиента значит рассыпать всю сцену; для тех, кому он нужен,
-// есть --tg-button-color.
+// Цвета ходят В КЛИЕНТ, а не из него. Раньше было наоборот: themeParams
+// подменяли --bg/--bg2/--dough/--text, и на светлой схеме пекарня становилась
+// белым листом с коричневыми прямоугольниками — по картинке нельзя было
+// сказать, во что играешь. Кондитерская — это место, и место не меняет цвет
+// оттого, что сменилась тема телефона.
+//
+// Клиентские значения по-прежнему приезжают в CSS как --tg-*: они доступны
+// всему, что захочет с ними считаться, просто больше ничего не подменяют.
 // ---------------------------------------------------------------------------
 
-/** themeParams → переменные палитры (остальные едут только как --tg-*). */
-const PALETTE: Record<string, string> = {
-  bg_color: '--bg',
-  secondary_bg_color: '--bg2',
-  section_bg_color: '--dough',
-  text_color: '--text',
-  hint_color: '--hint',
-  destructive_text_color: '--bad',
-}
+/** Какао игры. Держать в согласии с --bg / --bg2 в styles.css. */
+const OVEN_BG = '#17100a'
+const OVEN_HEADER = '#221609'
 
 export function applyTheme() {
   const root = document.documentElement
-  // светлая/тёмная схема: styles.css правит по ней контраст карточек
-  root.dataset.tgTheme = tg?.colorScheme === 'light' ? 'light' : 'dark'
   const params = tg?.themeParams || {}
   for (const [key, value] of Object.entries(params)) {
     if (typeof value !== 'string' || !value) continue
     root.style.setProperty('--tg-' + key.replace(/_/g, '-'), value)
-    const mapped = PALETTE[key]
-    if (mapped) root.style.setProperty(mapped, value)
   }
   try {
-    // фон за пределами вебвью и шапка клиента — под тот же фон
-    if (params.bg_color) tg?.setBackgroundColor?.(params.bg_color)
-    tg?.setHeaderColor?.(params.secondary_bg_color ? 'secondary_bg_color' : 'bg_color')
+    // Шапка клиента и поле за пределами вебвью красятся под игру: иначе между
+    // светлой шапкой Telegram и тёмной сценой остаётся шов, который читается
+    // как «страница не догрузилась».
+    tg?.setBackgroundColor?.(OVEN_BG)
+    tg?.setHeaderColor?.(OVEN_HEADER)
   } catch {
     // метода нет или версия клиента ниже — цвета останутся клиентскими
   }

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api, haptic, hapticSuccess } from '../api'
 import { fmt, useGame } from '../App'
 import { useFocusTrap } from '../a11y'
+import { formatIncome } from '../format'
 import { useT, useTErr } from '../i18n'
 import { sfxBuy, sfxError, sfxMerge } from '../sound'
 import { COOKIE_SKINS } from '../cookieSkins'
@@ -304,8 +305,11 @@ export default function MergeTab() {
             <div className="hint">{t('passive_hint')}</div>
           </div>
           <div style={{ textAlign: 'right' }}>
-            <div style={{ fontWeight: 800, color: 'var(--good)' }}>
-              +{fmt(state.passive_per_hour)}{t('per_hour')}
+            {/* те же две единицы, что и на ферме, и в том же порядке: доска
+                считается в часах, ферма в секундах, и рядом это выглядело как
+                разница в тысячи раз там, где её нет */}
+            <div style={{ fontWeight: 800, color: 'var(--good)', whiteSpace: 'nowrap' }}>
+              +{formatIncome(state.passive_per_hour / 3600)}
             </div>
             <button
               className="claim-chip"

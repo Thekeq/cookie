@@ -72,6 +72,7 @@ const dict = {
   passive_income: { en: 'Passive income', uk: 'Пасивний дохід', ru: 'Пассивный доход' },
   passive_hint: { en: 'Cookies lvl 3+ generate income', uk: 'Печиво 3+ рівня приносить дохід', ru: 'Печеньки 3+ уровня приносят доход' },
   per_hour: { en: '/h', uk: '/год', ru: '/ч' },
+  per_sec: { en: '/s', uk: '/с', ru: '/с' },
   board_full: { en: 'Board is full', uk: 'Дошка заповнена', ru: 'Доска заполнена' },
   buy_cookie: { en: 'Buy cookie', uk: 'Купити печиво', ru: 'Купить печеньку' },
   merge_hint: { en: 'Drag a cookie onto the same one to merge. Max unlocked:', uk: 'Перетягни печиво на таке саме — вони зіллються. Максимум відкрито:', ru: 'Перетащи печеньку на такую же — они сольются. Максимум открыт:' },

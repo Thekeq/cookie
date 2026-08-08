@@ -7,7 +7,7 @@
 //
 // Сигнатуры совместимы со старыми fmt/fmtRate из App.tsx — App их реэкспортит
 // под прежними именами, так что вкладки менять не нужно.
-import { getActiveLang, LOCALE_TAG } from './i18n'
+import { getActiveLang, LOCALE_TAG, translate } from './i18n'
 
 // суффиксы до дециллиона: поздние цены доски реально уходят за 1e15,
 // и «605062015.2B» вместо «605.1Qa» читалось как поломка
@@ -44,4 +44,17 @@ export function formatRate(n: number): string {
     return (Math.round(n * 10) / 10).toLocaleString(tag, { maximumFractionDigits: 1 })
   }
   return formatNumber(n)
+}
+
+// Доход обеих веток — в ОДНИХ единицах. Ферма считалась в секундах, доска в
+// часах, и рядом это выглядело так: «+346/с» против «+1.5M/ч». Числа
+// различаются в три с половиной тысячи раз, поэтому ферма читалась как
+// подработка на сдачу, хотя приносит столько же. Сравнивать игрок должен
+// уметь глазами, а не в уме: обе цифры пишутся всегда и в одном порядке —
+// сначала секунда (её видно по тикающему счётчику), следом час (в нём
+// считаются оффлайн-сбор, закваска и приз за дуэль).
+export function formatIncome(perSecond: number): string {
+  const lang = getActiveLang()
+  return formatRate(perSecond) + translate(lang, 'per_sec')
+    + ' · ' + formatNumber(perSecond * 3600) + translate(lang, 'per_hour')
 }
