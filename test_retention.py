@@ -188,8 +188,13 @@ check("merge to lvl13 works", r.status_code == 200
 
 # --- перебаланс: прогрессивный БП, кап XP, динамический магазин, престиж-порог ---
 # прогрессивная цена уровня БП
-check("bp lvl1 costs 420", cfg.bp_xp_for_level(1) == 420)
-check("bp lvl30 costs 12600", cfg.bp_xp_for_level(30) == 12600)
+check("bp lvl1 costs one step", cfg.bp_xp_for_level(1) == cfg.BP_XP_STEP)
+check("bp lvl30 costs thirty steps",
+      cfg.bp_xp_for_level(30) == 30 * cfg.BP_XP_STEP)
+# замкнутая сумма и пошаговая цена — одна и та же прогрессия, и разъехаться им
+# нельзя: игрок получил бы уровень, которого не набирал
+check("bp total matches the sum of steps",
+      cfg.bp_total_xp(30) == sum(cfg.bp_xp_for_level(i) for i in range(1, 31)))
 check("bp cumulative consistent",
       cfg.bp_total_xp(30) == sum(cfg.bp_xp_for_level(l) for l in range(1, 31)))
 check("bp_level_for_xp", cfg.bp_level_for_xp(cfg.bp_total_xp(5)) == 5

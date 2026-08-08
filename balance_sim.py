@@ -229,7 +229,7 @@ def simulate(name: str, sim_hours: float) -> dict:
                 if st["best_item"] < b.get("req_record", 0):
                     continue      # ферма выше середины требует прогресса доски
                 owned = st["buildings"].get(key, 0)
-                if owned >= cfg.FARM_MAX_COPIES:
+                if owned >= cfg.farm_max_copies(key):
                     continue      # здание упёрлось в потолок копий
                 cost = cfg.building_cost(key, owned)
                 ratio = b["cps"] / cost
@@ -425,7 +425,7 @@ def simulate(name: str, sim_hours: float) -> dict:
             if st["level"] < b["req_level"] or st["best_item"] < b.get("req_record", 0):
                 continue
             owned = st["buildings"].get(key, 0)
-            if owned >= cfg.FARM_MAX_COPIES:
+            if owned >= cfg.farm_max_copies(key):
                 continue
             h = cfg.building_cost(key, owned) / (b["cps"] * 3600)
             best = h if best is None else min(best, h)

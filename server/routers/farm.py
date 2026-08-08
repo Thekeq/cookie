@@ -50,8 +50,8 @@ def _farm_payload(tg: dict) -> dict:
             # оба требования и потолок копий уходят на фронт: кнопка обязана
             # объяснить, почему она погасла, а не отдавать ошибку по тапу
             "req_record": req_record,
-            "max_copies": cfg.FARM_MAX_COPIES,
-            "maxed": owned >= cfg.FARM_MAX_COPIES,
+            "max_copies": cfg.farm_max_copies(key),
+            "maxed": owned >= cfg.farm_max_copies(key),
             "unlocked": user["level"] >= b["req_level"] and record >= req_record,
             # причину замка считает сервер: у фронта нет рекорда тира под рукой,
             # а два разных замка нельзя показывать одной подписью «нужен уровень»
@@ -122,8 +122,9 @@ def _buy_building(body: "KeyIn", tg: dict) -> dict:
         if (user["best_item_level"] or 0) < req_record:
             raise HTTPException(400, f"err_req_record|{req_record}")
         owned = gl.farm_counts(tg["id"]).get(body.key, 0)
-        if owned >= cfg.FARM_MAX_COPIES:
-            raise HTTPException(400, f"err_max_copies|{cfg.FARM_MAX_COPIES}")
+        cap = cfg.farm_max_copies(body.key)
+        if owned >= cap:
+            raise HTTPException(400, f"err_max_copies|{cap}")
         cost = cfg.building_cost(body.key, owned)
         if user["cookies"] < cost:
             raise HTTPException(400, "err_no_cookies")
