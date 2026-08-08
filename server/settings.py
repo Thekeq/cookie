@@ -54,6 +54,23 @@ BOT_TOKEN = _s("BOT_TOKEN")
 BOT_USERNAME = _s("BOT_USERNAME").lstrip("@")
 ADMIN_ID = _i("ADMIN_ID")
 CHANNEL_USERNAME = _s("CHANNEL_USERNAME").lstrip("@")
+# Short name Mini App'а из BotFather (/newapp). У Telegram ДВЕ формы startapp-
+# ссылки, и перепутать их — это BOT_INVALID при открытии, а не тихий промах:
+#   t.me/<bot>?startapp=<p>        — только если включён Main Mini App
+#                                    (BotFather → Bot Settings → Configure Mini App)
+#   t.me/<bot>/<app>?startapp=<p>  — приложение, созданное через /newapp
+# Пусто = первая форма. Ссылки строились обеими сразу: пуши зашивали «/app»,
+# а реф- и source-ссылки шли без него, так что при любой настройке бота
+# половина ссылок была нерабочей. Теперь форма одна и живёт в bot_deep_link.
+BOT_APP_NAME = _s("BOT_APP_NAME").strip("/")
+
+
+def bot_deep_link(param: str) -> str:
+    """t.me-ссылка на Mini App со start-параметром. Пусто, если бот не настроен."""
+    if not BOT_USERNAME:
+        return ""
+    path = f"{BOT_USERNAME}/{BOT_APP_NAME}" if BOT_APP_NAME else BOT_USERNAME
+    return f"https://t.me/{path}?startapp={param}"
 
 # ---------- Mini App / HTTP ----------
 WEBAPP_URL = _s("WEBAPP_URL").rstrip("/")

@@ -345,10 +345,23 @@ _mode, _url = notif.deep_link("order_waiting", 7)
 check("nq: webapp button when WEBAPP_URL is set",
       _mode == "webapp" and _url.endswith("?tgWebAppStartParam=tab-bakery-n7"), _url)
 srv_settings.WEBAPP_URL, srv_settings.BOT_USERNAME = "", "cookiebot"
+# Обе формы startapp-ссылки, потому что перепутать их — это BOT_INVALID при
+# открытии, а не тихий промах. Без short name ссылка обязана быть бесприставочной
+# (Main Mini App), с ним — через /<app>. Раньше «/app» был зашит в notifications,
+# а реф- и source-ссылки строились без него, то есть при ЛЮБОЙ настройке бота
+# половина ссылок вела в никуда.
+_saved_app = srv_settings.BOT_APP_NAME
+srv_settings.BOT_APP_NAME = ""
 _mode2, _url2 = notif.deep_link("order_waiting", 7)
 check("nq: t.me deep link without WEBAPP_URL",
-      _mode2 == "url" and _url2 == "https://t.me/cookiebot/app?startapp=tab-bakery-n7",
+      _mode2 == "url" and _url2 == "https://t.me/cookiebot?startapp=tab-bakery-n7",
       _url2)
+srv_settings.BOT_APP_NAME = "play"
+check("nq: BOT_APP_NAME switches the link to the named Mini App form",
+      notif.deep_link("order_waiting", 7)[1]
+      == "https://t.me/cookiebot/play?startapp=tab-bakery-n7",
+      notif.deep_link("order_waiting", 7)[1])
+srv_settings.BOT_APP_NAME = _saved_app
 
 # 6. Тексты есть на всех трёх языках и подставляются
 _missing = [k for k, v in notif.TEXTS.items() if set(v) != {"en", "uk", "ru"}]

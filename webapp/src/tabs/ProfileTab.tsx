@@ -12,7 +12,7 @@ import PrestigeModal from '../PrestigeModal'
 import Spinner from './Spinner'
 
 export default function ProfileTab() {
-  const { state, refresh, toast, botUsername } = useGame()
+  const { state, refresh, toast, refLink } = useGame()
   const t = useT()
   const te = useTErr()
   const { lang, setLang } = useContext(LangCtx)
@@ -105,7 +105,7 @@ export default function ProfileTab() {
   })
 
   const shareAch = (title: string) => {
-    shareRefLink(botUsername, state.user.user_id, t('share_ach_text', { a: title }))
+    shareRefLink(refLink, t('share_ach_text', { a: title }))
   }
 
   const openChannel = () => {
@@ -195,11 +195,10 @@ export default function ProfileTab() {
         <div className="hint" style={{ margin: '6px 0 10px' }}>
           {t('invite_hint', { a: fmt(refs?.reward_referrer ?? 1000), b: fmt(refs?.reward_referred ?? 500) })}
         </div>
-        {/* без имени бота ссылка вела бы на https://t.me/?startapp=... — гасим
-            кнопку, чтобы промах в настройке сервера был виден, а не расходился
-            битыми приглашениями */}
-        <button className="btn" disabled={!botUsername}
-                onClick={() => shareRefLink(botUsername, state.user.user_id, t('share_text'))}>
+        {/* сервер не отдал ссылку — бот не настроен; гасим кнопку, чтобы промах
+            в настройке был виден, а не расходился битыми приглашениями */}
+        <button className="btn" disabled={!refLink}
+                onClick={() => shareRefLink(refLink, t('share_text'))}>
           {t('share_link')}
         </button>
 

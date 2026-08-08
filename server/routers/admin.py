@@ -16,7 +16,7 @@ from server import game_config as cfg
 from server import support
 from server import game_logic as gl
 from server.game_logic import db
-from server.settings import BOT_USERNAME
+from server.settings import bot_deep_link
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(tg_admin)])
 
@@ -72,7 +72,7 @@ class SourceCreate(BaseModel):
 async def list_sources():
     rows = db.q("SELECT * FROM sources ORDER BY created_at DESC")
     for r in rows:
-        r["link"] = f"https://t.me/{BOT_USERNAME}?startapp=src_{r['code']}"
+        r["link"] = bot_deep_link(f"src_{r['code']}")
     return {"sources": rows}
 
 
@@ -85,7 +85,7 @@ async def create_source(body: SourceCreate):
         raise HTTPException(400, "Такой код уже есть")
     db.exec("INSERT INTO sources (code, title, created_at) VALUES (?, ?, ?)",
             (code, body.title, time.time()))
-    return {"ok": True, "link": f"https://t.me/{BOT_USERNAME}?startapp=src_{code}"}
+    return {"ok": True, "link": bot_deep_link(f"src_{code}")}
 
 
 # ---------- рассылка (фоном, чтобы не держать HTTP-запрос) ----------

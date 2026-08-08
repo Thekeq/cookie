@@ -303,9 +303,8 @@ def deep_link(kind: str, notification_id: int = 0) -> tuple[str, str]:
     param = start_param(kind, notification_id)
     if settings.WEBAPP_URL:
         return "webapp", f"{settings.WEBAPP_URL}?tgWebAppStartParam={param}"
-    if settings.BOT_USERNAME:
-        return "url", f"https://t.me/{settings.BOT_USERNAME}/app?startapp={param}"
-    return "", ""
+    link = settings.bot_deep_link(param)
+    return ("url", link) if link else ("", "")
 
 
 def button_text(kind: str, lang: str) -> str:

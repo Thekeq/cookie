@@ -135,8 +135,8 @@ export interface GameState {
   claimable_level: number | null
   max_item_unlocked: number
   just_registered?: boolean
-  // только в ответе /api/auth: имя бота для реф-ссылок (см. Ctx.botUsername)
-  bot_username?: string
+  // только в ответе /api/auth: готовая реф-ссылка игрока (см. Ctx.refLink)
+  ref_link?: string
   season: { id: number; ends_at: number }
   daily: DailyState
   quests_claimable: number

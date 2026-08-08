@@ -45,9 +45,9 @@ interface Ctx {
   refresh: () => Promise<void>
   toast: (msg: string, isError?: boolean) => void
   isAdmin: boolean
-  /** имя бота для реф-ссылок; приходит с сервера один раз в /api/auth и живёт
-   *  здесь, потому что /api/state его не возвращает и перетёр бы поле в state */
-  botUsername: string
+  /** готовая реф-ссылка игрока; приходит с сервера один раз в /api/auth и
+   *  живёт здесь, потому что /api/state её не возвращает и перетёр бы поле */
+  refLink: string
   /** единый живой баланс для всех вкладок: сервер + пассивный тик + предикт кликов */
   liveBalance: number
   /** текущий множитель комбо (живёт здесь — переживает смену вкладок) */
@@ -91,7 +91,7 @@ function Game() {
   const [tab, setTab] = useState(startTarget()?.tab ?? 'clicker')
   const [toastMsg, setToastMsg] = useState<{ text: string; err: boolean } | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
-  const [botUsername, setBotUsername] = useState('')
+  const [refLink, setRefLink] = useState('')
   const [showOnboarding, setShowOnboarding] = useState(!localStorage.getItem('onboarded'))
   // попап ежедневной награды — один раз за сессию, если есть что забрать
   const [dailyShown, setDailyShown] = useState(false)
@@ -279,7 +279,7 @@ function Game() {
       .post('/api/auth')
       .then((s: GameState) => {
         setState(s)
-        if (s.bot_username) setBotUsername(s.bot_username)
+        if (s.ref_link) setRefLink(s.ref_link)
         if (s.just_registered) toast(t('welcome'))
         if (s.passive_collected && s.passive_collected > 1)
           setOfflineIncome(s.passive_collected)
@@ -325,7 +325,7 @@ function Game() {
   if (showOnboarding)
     return (
       <GameCtx.Provider
-        value={{ state, setState, refresh, toast, isAdmin, botUsername,
+        value={{ state, setState, refresh, toast, isAdmin, refLink,
                  liveBalance: state.user.cookies, combo, tapClick, flushClicks }}
       >
         <Onboarding onDone={() => setShowOnboarding(false)} />
@@ -349,7 +349,7 @@ function Game() {
 
   return (
     <GameCtx.Provider
-      value={{ state, setState, refresh, toast, isAdmin, botUsername, liveBalance,
+      value={{ state, setState, refresh, toast, isAdmin, refLink, liveBalance,
                combo, tapClick, flushClicks }}
     >
       <div className="app">

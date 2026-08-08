@@ -58,8 +58,9 @@ export function openInvoice(link: string, onPaid: () => void) {
   }
 }
 
-export function shareRefLink(botUsername: string, userId: number, text: string) {
-  const link = `https://t.me/${botUsername}?startapp=ref_${userId}`
+// Ссылку собирает сервер (settings.bot_deep_link) и присылает в /api/auth:
+// у startapp-ссылки две формы, и какая настроена у бота — знает только он.
+export function shareRefLink(link: string, text: string) {
   const url = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`
   if (tg?.openTelegramLink) tg.openTelegramLink(url)
   else window.open(url, '_blank')

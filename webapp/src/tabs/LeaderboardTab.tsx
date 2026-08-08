@@ -30,7 +30,7 @@ const MEDALS = ['🥇', '🥈', '🥉']
 export default function LeaderboardTab() {
   const t = useT()
   const te = useTErr()
-  const { state, toast, botUsername } = useGame()
+  const { state, toast, refLink } = useGame()
   const [data, setData] = useState<LBData | null>(null)
 
   useEffect(() => {
@@ -80,9 +80,9 @@ export default function LeaderboardTab() {
             </span>
             <button
               className="claim-chip"
-              disabled={!botUsername}
+              disabled={!refLink}
               onClick={() =>
-                shareRefLink(botUsername, state.user.user_id, t('share_rank_text', { n: data.me.rank! }))
+                shareRefLink(refLink, t('share_rank_text', { n: data.me.rank! }))
               }
             >
               {t('share_ach')}
