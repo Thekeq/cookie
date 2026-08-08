@@ -209,6 +209,11 @@ async def battlepass(tg: dict = Depends(tg_user)):
         "xp_per_level": cfg.bp_xp_for_level(next_lvl),
         "premium": bool(user["bp_premium"]),
         "premium_price_stars": cfg.BP_PREMIUM_STARS,
+        # владельцу пасса копить нечего — он забирает по мере роста уровня
+        "locked_premium": (gl.bp_locked_premium(tg["id"], bp_level, claimed_prem, income)
+                           if not user["bp_premium"]
+                           else {"levels": 0, "cookies": 0.0, "energy": 0,
+                                 "cells": 0, "offline_hours": 0.0, "skins": 0}),
         "levels": levels,
     }
 
@@ -237,8 +242,8 @@ def _bp_claim(body: "BPClaim", tg: dict) -> dict:
         raise HTTPException(400, "err_bp_locked")
     if body.track == "premium" and not user["bp_premium"]:
         raise HTTPException(400, "err_need_premium")
-    reward = cfg.bp_reward(body.level, body.track == "premium",
-                           gl.hourly_income(tg["id"]))
+    income = gl.hourly_income(tg["id"])
+    reward = cfg.bp_reward(body.level, body.track == "premium", income)
     with db.tx():  # отметка о клейме и награда — одним куском
         # право на награду решает вставка строки, а не проверка в питоне: второй
         # клейм того же уровня проигрывает по rowcount. Раньше json-список
@@ -250,11 +255,11 @@ def _bp_claim(body: "BPClaim", tg: dict) -> dict:
                    (tg["id"], user["season_id"], body.track, body.level,
                     time.time())) == 0:
             raise HTTPException(400, "err_claimed")
-        if reward["cookies"]:
-            gl.add_cookies(tg["id"], reward["cookies"], count_earned=False)
-        if reward.get("energy"):
-            gl.grant_energy(tg["id"], reward["energy"], "energy_bp_reward")
-    return {"reward": reward, "cookies": db.get_user(tg["id"])["cookies"]}
+        # выдача целиком живёт в game_logic: клетки и оффлайн-кап — сезонные
+        # поля users, и трогать их из роутера значило бы держать правило дефицита
+        # в двух местах сразу
+        granted = gl.bp_grant_reward(tg["id"], reward, income)
+    return {"reward": granted, "cookies": db.get_user(tg["id"])["cookies"]}
 
 
 # ---------- магазин (Stars) ----------

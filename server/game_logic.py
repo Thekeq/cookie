@@ -244,9 +244,16 @@ SEASON_RESET_CHUNK = 500        # юзеров за один проход рол
 # живут строками bp_claims с season_id в ключе, поэтому новый сезон — просто
 # другой набор строк, сбрасывать нечего. Колонки остались в схеме нетронутыми,
 # чтобы откат кода на прошлую версию не потерял историю.
+#
+# bp_bonus_cells/bp_offline_hours гаснут здесь вместе с пассом: это сезонная
+# аренда дефицита, а не покупка навсегда (навсегда — только offline_bonus_hours
+# из магазина, её этот сброс не трогает). Клетка, оставшаяся после сезона, тихо
+# ломала бы дефицит доски: за три сезона премиума игрок собрал бы всю сетку 5x5
+# мимо уровней и друзей.
 _SEASON_RESET_SQL = (
     "UPDATE users SET season_id = ?, season_earned = 0, bp_xp = 0, "
-    "bp_premium = bp_premium_next, bp_premium_next = 0 ")
+    "bp_premium = bp_premium_next, bp_premium_next = 0, "
+    "bp_bonus_cells = 0, bp_offline_hours = 0 ")
 
 
 def _ensure_season_snapshot(season: int):
@@ -396,8 +403,120 @@ def _recompute_bp_premium(user_id: int):
     have = {r["season_id"] for r in db.q(
         "SELECT DISTINCT season_id FROM entitlements "
         "WHERE user_id = ? AND kind = 'bp_premium'", (user_id,))}
-    db.update_user(user_id, bp_premium=1 if season in have else 0,
-                   bp_premium_next=1 if nxt in have else 0)
+    keeps = season in have
+    fields = {"bp_premium": 1 if keeps else 0,
+              "bp_premium_next": 1 if nxt in have else 0}
+    if not keeps:
+        # Пасс — подписка на дефицит, а не разовая выдача: с потерей права
+        # уходят и клетки, и оффлайн-кап, и эксклюзивный скин. Иначе схема
+        # «купить, забрать все накопленные уровни, вернуть Stars» оставляла бы
+        # игроку на весь сезон две клетки и удвоенный оффлайн бесплатно.
+        # Строки bp_claims при этом НЕ трогаем: удалить их — значит разрешить
+        # забрать те же печеньки второй раз после повторной покупки.
+        fields["bp_bonus_cells"] = 0
+        fields["bp_offline_hours"] = 0
+        holes = ",".join("?" * len(cfg.BP_EXCLUSIVE_SKIN))
+        db.exec(f"DELETE FROM skins WHERE user_id = ? AND skin_key IN ({holes})",
+                (user_id, *cfg.BP_EXCLUSIVE_SKIN))
+        # снятый скин мог быть надет — иначе на печеньке осталась бы картинка,
+        # которой у игрока больше нет
+        if (user.get("active_skin") or "") in cfg.BP_EXCLUSIVE_SKIN:
+            fields["active_skin"] = "classic"
+    db.update_user(user_id, **fields)
+    if not keeps:
+        bump_board(user_id)     # клеток стало меньше — картинка доски устарела
+
+
+def bp_grant_reward(user_id: int, reward: dict, income_per_hour: float) -> dict:
+    """Выдаёт награду одного уровня пасса. Зовётся ВНУТРИ транзакции клейма:
+    отметка о взятии и выдача обязаны быть одним куском, иначе повторный запрос
+    после разрыва связи платит дважды.
+
+    Возвращает фактически выданное — оно может отличаться от запрошенного на
+    подмене мёртвой клетки (см. ниже), и фронту нужно показать то, что реально
+    легло на счёт, а не то, что нарисовано в треке."""
+    granted = dict(reward)
+    user = db.get_user(user_id)
+
+    # Клетка сверх BOARD_SIZE не существует: сетка 5x5 рисуется целиком, а
+    # 12 базовых + 9 за уровни + 4 за друзей дают ровно 25. У игрока, уже
+    # собравшего доску, награда была бы молча съедена — поэтому она
+    # подменяется печеньками. Это не эквивалент (сезонная клетка стоит
+    # дороже), а компенсация: равноценно платить нельзя, такая сумма стала бы
+    # печатным станком в руках как раз самых прокачанных игроков.
+    if reward.get("cells"):
+        earned = cfg.merge_cells_unlocked(user["level"], ref_count(user_id),
+                                          bp_bonus_cells(user))
+        if earned >= cfg.BOARD_SIZE:
+            granted["cells"] = 0
+            granted["cookies"] = granted.get("cookies", 0) + \
+                income_per_hour * cfg.BP_CELL_FALLBACK_HOURS
+            granted["cookies_substituted"] = True
+        else:
+            # именно инкрементом в SQL, а не через прочитанный снимок: уровни 8 и
+            # 16 забираются двумя независимыми запросами, и на read-modify-write
+            # оба прочитали бы один и тот же ноль — игрок терял бы клетку.
+            # Уникальность строки bp_claims защищает от повтора ОДНОГО уровня,
+            # но не от гонки двух разных
+            # user_revision двигаем руками: его дописывает db.update_user, а
+            # здесь запрос сырой — без бампа клиент продолжил бы ходить по
+            # снимку, в котором клеток ещё меньше
+            db.exec("UPDATE users SET bp_bonus_cells = "
+                    "COALESCE(bp_bonus_cells, 0) + ?, "
+                    "user_revision = user_revision + 1 WHERE user_id = ?",
+                    (reward["cells"], user_id))
+            bump_board(user_id)   # клетка меняет картинку доски, ревизия обязана уехать
+
+    if reward.get("offline_hours"):
+        db.exec("UPDATE users SET bp_offline_hours = "
+                "COALESCE(bp_offline_hours, 0) + ?, "
+                "user_revision = user_revision + 1 WHERE user_id = ?",
+                (reward["offline_hours"], user_id))
+
+    if reward.get("skin"):
+        db.exec("INSERT INTO skins (user_id, skin_key) VALUES (?, ?) "
+                "ON CONFLICT (user_id, skin_key) DO NOTHING",
+                (user_id, reward["skin"]))
+
+    if granted.get("cookies"):
+        add_cookies(user_id, granted["cookies"], count_earned=False)
+    if granted.get("energy"):
+        grant_energy(user_id, granted["energy"], "energy_bp_reward")
+    return granted
+
+
+def bp_locked_premium(user_id: int, bp_level: int, claimed: set[int],
+                      income_per_hour: float) -> dict:
+    """Сколько премиум-наград уже НАКОПИЛОСЬ на взятых уровнях и пропадает зря.
+
+    Клейм ретроактивен (см. _bp_claim: забрать можно любой уровень <= текущего),
+    поэтому у игрока без пасса к середине сезона лежит готовая куча, о которой он
+    не знает. Момент покупки — именно этот: не «купи пасс», а «забери 14 уровней
+    прямо сейчас». Считаем ровно то, что упадёт на счёт сразу после оплаты."""
+    total = {"levels": 0, "cookies": 0.0, "energy": 0, "cells": 0,
+             "offline_hours": 0.0, "skins": 0}
+    # Сколько клеток в этой куче реально ляжет на доску. Считать обязательно:
+    # витрина покупки не имеет права обещать то, что bp_grant_reward тут же
+    # подменит печеньками, — у игрока, собравшего все 25, «+2 клетки» в
+    # предложении были бы прямым обманом на экране оплаты
+    user = db.get_user(user_id)
+    headroom = cfg.BOARD_SIZE - cfg.merge_cells_unlocked(
+        user["level"], ref_count(user_id), bp_bonus_cells(user)) if user else 0
+    for lvl in range(1, bp_level + 1):
+        if lvl in claimed:
+            continue
+        r = cfg.bp_reward(lvl, True, income_per_hour)
+        total["levels"] += 1
+        total["cookies"] += r["cookies"]
+        total["energy"] += r["energy"]
+        total["offline_hours"] += r["offline_hours"]
+        total["skins"] += 1 if r["skin"] else 0
+        if r["cells"] and headroom > 0:
+            total["cells"] += r["cells"]
+            headroom -= r["cells"]
+        elif r["cells"]:
+            total["cookies"] += income_per_hour * cfg.BP_CELL_FALLBACK_HOURS
+    return total
 
 
 def my_last_season_result(user_id: int) -> dict | None:
@@ -773,6 +892,8 @@ def skin_emoji(key: str) -> str:
         return cfg.COOKIE_SKINS_SHOP[key]["emoji"]
     if key in cfg.REF_EXCLUSIVE_SKIN:
         return cfg.REF_EXCLUSIVE_SKIN[key]["emoji"]
+    if key in cfg.BP_EXCLUSIVE_SKIN:
+        return cfg.BP_EXCLUSIVE_SKIN[key]["emoji"]
     return cfg.COOKIE_SKINS_SHOP["classic"]["emoji"]
 
 
@@ -1187,8 +1308,14 @@ def collect_all(user_id: int, now: float | None = None) -> dict:
 
 
 def offline_bonus_hours(user: dict) -> float:
-    """Постоянная добавка к оффлайн-капу из Stars-покупки offline_cap_*."""
-    return user.get("offline_bonus_hours") or 0
+    """Добавка к оффлайн-капу: вечная из Stars-покупки offline_cap_* ПЛЮС
+    сезонная из премиум-пасса (BP_PREMIUM_OFFLINE_LEVELS).
+
+    Именно плюс, а не max(): покупка за 400⭐ и пасс за 100⭐ — разные товары, и
+    владелец обоих обязан получить больше, чем владелец одного. Внутри же самих
+    покупок offline_cap_* по-прежнему max() (см. apply_shop_effect) — там тиры
+    одного товара, и складывать их значило бы продать 12 часов дважды."""
+    return (user.get("offline_bonus_hours") or 0) + (user.get("bp_offline_hours") or 0)
 
 
 # ---------- оффлайн-рецепты ----------
@@ -1950,11 +2077,21 @@ def compact_board(user_id: int, earned_cells: int) -> int:
     return len(rows)
 
 
+def bp_bonus_cells(user: dict) -> int:
+    """Сезонные клетки премиум-пасса. Сгорают в ролловер вместе с пассом."""
+    return user.get("bp_bonus_cells") or 0
+
+
 def merge_cells_unlocked_for(user: dict) -> int:
-    """Сколько клеток доски открыто: база + уровни + друзья. Уже занятые клетки
-    не отбираем (грандфазер старых досок) — по мере переплавки лишних печенек
-    доска сама сходится к честному лимиту."""
-    earned = cfg.merge_cells_unlocked(user["level"], ref_count(user["user_id"]))
+    """Сколько клеток доски открыто: база + уровни + друзья + пасс. Уже занятые
+    клетки не отбираем (грандфазер старых досок) — по мере переплавки лишних
+    печенек доска сама сходится к честному лимиту.
+
+    Тот же грандфазер закрывает и конец сезона: клетка пасса гаснет, но печенька,
+    которая на ней стоит, не пропадает и не выкидывается — просто новую туда уже
+    не положить, пока лишнее не переплавят."""
+    earned = cfg.merge_cells_unlocked(user["level"], ref_count(user["user_id"]),
+                                      bp_bonus_cells(user))
     items = compact_board(user["user_id"], earned)
     return min(cfg.BOARD_SIZE, max(earned, items))
 
@@ -1962,9 +2099,11 @@ def merge_cells_unlocked_for(user: dict) -> int:
 def board_cells_state(user: dict) -> dict:
     """Инфо для фронта: сколько открыто и как открыть следующие."""
     refs = ref_count(user["user_id"])
+    bonus = bp_bonus_cells(user)
     return {
         "unlocked": merge_cells_unlocked_for(user),
-        "earned": cfg.merge_cells_unlocked(user["level"], refs),
+        "earned": cfg.merge_cells_unlocked(user["level"], refs, bonus),
+        "bp_cells": bonus,
         "total": cfg.BOARD_SIZE,
         "next_unlock_level": min((lvl for lvl in cfg.MERGE_CELL_LEVELS
                                   if lvl > user["level"]), default=None),

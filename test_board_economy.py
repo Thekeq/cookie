@@ -680,6 +680,290 @@ except ValueError:
     check("order not claimable twice", db.get_user(UID)["cookies"] == _paid_once)
 
 
+# ================= премиум-пасс платит дефицитом, а не печеньками =================
+#
+# Пасс за 100⭐ выдавал ТОЛЬКО печеньки, а печенька — производная часового дохода
+# (см. scaled_reward), поэтому пасс был арифметически хуже ящика печенек за 300⭐:
+# ящик отдаёт свои часы сразу, пасс — за 9.5 дней игры. Рациональный игрок брал
+# ящик, конверсии в пасс не было. Теперь премиум-трек платит тем, что не фармится
+# ни за какие печеньки: клетками доски, оффлайн-капом и эксклюзивным скином.
+# Этот блок держит ровно эти три выдачи — вместе с их сезонностью и отзывом.
+
+
+def _mkuser(uid, name):
+    """Игрок с полным пассом и чистыми сезонными полями. Сезон проставляется
+    руками: у свежей строки он нулевой, и первый же ensure_user_season внутри
+    клейма прогнал бы ролловер и обнулил только что выданный bp_xp."""
+    db.create_user(uid, name, name)
+    db.update_user(uid, season_id=gl.current_season(), level=1, cookies=0,
+                   bp_xp=cfg.bp_total_xp(cfg.BP_MAX_LEVEL), bp_premium=1,
+                   bp_premium_next=0, bp_bonus_cells=0, bp_offline_hours=0,
+                   offline_bonus_hours=0, active_skin="classic")
+    return {"Authorization": "tma " + sign(uid)}
+
+
+def _claim(uid, headers, level, track="premium"):
+    return c.post("/api/battlepass/claim", json={"level": level, "track": track},
+                  headers=headers)
+
+
+_BP = UID + 7000
+_HBP = _mkuser(_BP, "bpscarce")
+
+# --- клетки премиума реально открываются на доске ---
+# Награда лежала в конфиге, но выдавалась только печеньками: bp_bonus_cells не
+# писался, и уровни 8/16 были пустыми для всех, кроме витрины трека.
+_cells0 = gl.merge_cells_unlocked_for(db.get_user(_BP))
+check("fresh player starts on the base cells", _cells0 == cfg.MERGE_BASE_CELLS,
+      str(_cells0))
+r = _claim(_BP, _HBP, cfg.BP_PREMIUM_CELL_LEVELS[0])
+check("bp cell level pays a cell", r.status_code == 200
+      and r.json()["reward"]["cells"] == 1, r.text[:200])
+check("cell landed on the board",
+      gl.merge_cells_unlocked_for(db.get_user(_BP)) == _cells0 + 1,
+      gl.merge_cells_unlocked_for(db.get_user(_BP)))
+r = _claim(_BP, _HBP, cfg.BP_PREMIUM_CELL_LEVELS[1])
+check("second cell level pays too", r.status_code == 200
+      and r.json()["reward"]["cells"] == 1, r.text[:200])
+check("both pass cells are on the board",
+      gl.merge_cells_unlocked_for(db.get_user(_BP))
+      == _cells0 + len(cfg.BP_PREMIUM_CELL_LEVELS),
+      gl.merge_cells_unlocked_for(db.get_user(_BP)))
+# сетка 5x5 рисуется целиком: клетка сверх BOARD_SIZE не существует, и пасс не
+# имеет права её нарисовать — иначе доска уезжает за пределы поля
+check("pass cells never grow the grid past BOARD_SIZE",
+      cfg.merge_cells_unlocked(max(cfg.MERGE_CELL_LEVELS), max(cfg.MERGE_CELL_REFS),
+                               len(cfg.BP_PREMIUM_CELL_LEVELS)) == cfg.BOARD_SIZE,
+      cfg.merge_cells_unlocked(max(cfg.MERGE_CELL_LEVELS), max(cfg.MERGE_CELL_REFS),
+                               len(cfg.BP_PREMIUM_CELL_LEVELS)))
+
+# --- оффлайн-час пасса складывается с купленным за Stars, а не подменяет его ---
+# Внутри товара offline_cap_* тиры применяются как max(), и ровно эта привычка
+# съедала бы сезонный час: владелец 6ч купил бы пасс и не получил НИЧЕГО.
+db.update_user(_BP, offline_bonus_hours=cfg.SHOP_ITEMS["offline_cap_6h"][3]["hours"])
+_lvl_off, _add_off = next(iter(cfg.BP_PREMIUM_OFFLINE_LEVELS.items()))
+_cap0 = gl.passive_offline_cap_hours(db.get_user(_BP))
+r = _claim(_BP, _HBP, _lvl_off)
+check("bp offline level pays hours", r.status_code == 200
+      and r.json()["reward"]["offline_hours"] == _add_off, r.text[:200])
+_u = db.get_user(_BP)
+check("pass hours stack on top of the purchased tier",
+      abs(gl.passive_offline_cap_hours(_u) - (_cap0 + _add_off)) < 1e-9,
+      f"{gl.passive_offline_cap_hours(_u)} vs {_cap0 + _add_off}")
+check("farm cap moved by the same hours",
+      abs(gl.farm_offline_cap_hours(_u) - (cfg.FARM_OFFLINE_CAP_HOURS
+                                           + cfg.SHOP_ITEMS["offline_cap_6h"][3]["hours"]
+                                           + _add_off)) < 1e-9,
+      gl.farm_offline_cap_hours(_u))
+check("purchased tier is not overwritten",
+      _u["offline_bonus_hours"] == cfg.SHOP_ITEMS["offline_cap_6h"][3]["hours"],
+      _u["offline_bonus_hours"])
+
+# --- эксклюзивный скин: единственный источник — 24 уровень премиума ---
+# Как только скин появится в витрине за печеньки, статусная награда пасса
+# обесценится, а вместе с ней и причина платить.
+_lvl_skin, _skin = next(iter(cfg.BP_PREMIUM_SKIN_LEVELS.items()))
+r = _claim(_BP, _HBP, _lvl_skin)
+check("bp skin level pays the skin", r.status_code == 200
+      and r.json()["reward"]["skin"] == _skin, r.text[:200])
+check("skin row written",
+      db.q1("SELECT 1 x FROM skins WHERE user_id = ? AND skin_key = ?",
+            (_BP, _skin)) is not None)
+check("pass skin is in no shop at all",
+      _skin not in cfg.COOKIE_SKINS_SHOP and _skin not in cfg.SHOP_ITEMS)
+r = c.post("/api/farm/buy_skin", json={"key": _skin}, headers=_HBP)
+check("buy_skin refuses the pass skin", r.status_code == 400
+      and r.json()["detail"] == "err_no_item", r.text[:120])
+
+# --- мёртвая клетка не съедается молча, а подменяется печеньками ---
+# У игрока, уже собравшего все 25, клетка пасса не существует. Раньше такая
+# награда просто исчезала: заплатил 100⭐ и не получил за уровень ничего.
+_CAP = UID + 7100
+_HCAP = _mkuser(_CAP, "bpcapped")
+db.update_user(_CAP, level=max(cfg.MERGE_CELL_LEVELS))
+for _i in range(max(cfg.MERGE_CELL_REFS)):
+    _rid = _CAP + 100 + _i
+    db.create_user(_rid, f"bpref{_i}", "R")
+    db.update_user(_rid, level=cfg.REF_QUALIFY_LEVEL)
+    db.exec("INSERT INTO referrals (referrer_id, referred_id, created_at) "
+            "VALUES (?, ?, ?)", (_CAP, _rid, time.time()))
+db.exec("INSERT INTO board (user_id, cell, item_level) VALUES (?, 0, 8)", (_CAP,))
+gl.invalidate_income(_CAP)
+check("capped player really owns the whole grid",
+      gl.merge_cells_unlocked_for(db.get_user(_CAP)) == cfg.BOARD_SIZE,
+      gl.merge_cells_unlocked_for(db.get_user(_CAP)))
+_inc = gl.hourly_income(_CAP)
+check("capped player has income to be paid in", _inc > 0, str(_inc))
+r = _claim(_CAP, _HCAP, cfg.BP_PREMIUM_CELL_LEVELS[0])
+_rew = r.json().get("reward", {})
+check("dead cell is not granted", r.status_code == 200 and _rew.get("cells") == 0,
+      r.text[:200])
+check("substitution is announced to the client",
+      _rew.get("cookies_substituted") is True, str(_rew))
+check("board of a capped player did not grow",
+      db.get_user(_CAP)["bp_bonus_cells"] == 0, db.get_user(_CAP)["bp_bonus_cells"])
+# Компенсация НАМЕРЕННО не эквивалент клетки (та стоит десятки часов дохода):
+# платить по-честному значило бы открыть печатный станок самым прокачанным.
+# Проверяем ровно BP_CELL_FALLBACK_HOURS сверх обычной награды уровня.
+_plain = cfg.bp_reward(cfg.BP_PREMIUM_CELL_LEVELS[0], True, _inc)["cookies"]
+check("dead cell paid as BP_CELL_FALLBACK_HOURS of income",
+      abs((_rew.get("cookies", 0) - _plain) - _inc * cfg.BP_CELL_FALLBACK_HOURS)
+      < _inc * 1e-6,
+      f"{_rew.get('cookies')} - {_plain} vs {_inc * cfg.BP_CELL_FALLBACK_HOURS}")
+
+# --- дефицит сезонный: ролловер гасит клетки и оффлайн-часы, историю не трогает ---
+# Клетка, пережившая сезон, тихо ломает весь дефицит доски: за три сезона
+# премиума игрок собрал бы всю сетку 5x5 мимо уровней и друзей.
+_claims_before = db.q1("SELECT COUNT(*) c FROM bp_claims WHERE user_id = ?",
+                       (_BP,))["c"]
+check("claims were actually written", _claims_before >= 4, str(_claims_before))
+db.update_user(_BP, season_id=gl.current_season() - 1, bp_premium=1, bp_premium_next=0)
+gl.finalize_seasons()
+_u = db.get_user(_BP)
+check("rollover burns the seasonal cells", _u["bp_bonus_cells"] == 0,
+      _u["bp_bonus_cells"])
+check("rollover burns the seasonal offline hours", _u["bp_offline_hours"] == 0,
+      _u["bp_offline_hours"])
+check("board is back to the earned cells",
+      gl.merge_cells_unlocked_for(_u) == _cells0, gl.merge_cells_unlocked_for(_u))
+check("offline cap is back to the purchased tier",
+      abs(gl.passive_offline_cap_hours(_u) - _cap0) < 1e-9,
+      gl.passive_offline_cap_hours(_u))
+check("permanent Stars cap survives the rollover",
+      _u["offline_bonus_hours"] == cfg.SHOP_ITEMS["offline_cap_6h"][3]["hours"],
+      _u["offline_bonus_hours"])
+check("rollover does not erase claim history",
+      db.q1("SELECT COUNT(*) c FROM bp_claims WHERE user_id = ?", (_BP,))["c"]
+      == _claims_before)
+
+# --- возврат Stars отбирает дефицит обратно, но НЕ отметки о клейме ---
+# Схема «купить пасс, забрать 30 накопленных уровней, вернуть звёзды» иначе
+# оставляла бы игроку на весь сезон две клетки, удвоенный оффлайн и скин
+# бесплатно. Отметки при этом обязаны уцелеть: удалить их — значит разрешить
+# забрать те же печеньки второй раз после повторной покупки.
+_RF = UID + 7200
+_HRF = _mkuser(_RF, "bprefund")
+db.exec("DELETE FROM entitlements WHERE user_id = ?", (_RF,))
+db.update_user(_RF, bp_premium=0, bp_premium_next=0)
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'bp_premium', ?, 'charge-bp-scarce', 'paid', ?)",
+        (_RF, cfg.BP_PREMIUM_STARS, time.time()))
+check("premium fulfilled by the purchase", gl.fulfill_charge("charge-bp-scarce") is True
+      and db.get_user(_RF)["bp_premium"] == 1)
+for _lvl in (*cfg.BP_PREMIUM_CELL_LEVELS, _lvl_off, _lvl_skin):
+    _claim(_RF, _HRF, _lvl)
+db.update_user(_RF, active_skin=_skin)   # скин надет — так его и носят
+_u = db.get_user(_RF)
+check("scarce goods granted before the refund",
+      _u["bp_bonus_cells"] == len(cfg.BP_PREMIUM_CELL_LEVELS)
+      and _u["bp_offline_hours"] == _add_off, str((_u["bp_bonus_cells"],
+                                                   _u["bp_offline_hours"])))
+_claims_rf = db.q1("SELECT COUNT(*) c FROM bp_claims WHERE user_id = ?", (_RF,))["c"]
+check("refund processed", gl.revoke_charge("charge-bp-scarce") == "revoked")
+_u = db.get_user(_RF)
+check("refund claws back the cells", _u["bp_bonus_cells"] == 0, _u["bp_bonus_cells"])
+check("refund claws back the offline hours", _u["bp_offline_hours"] == 0,
+      _u["bp_offline_hours"])
+check("refund takes the exclusive skin",
+      db.q1("SELECT 1 x FROM skins WHERE user_id = ? AND skin_key = ?",
+            (_RF, _skin)) is None)
+check("refund unequips the skin it took", _u["active_skin"] == "classic",
+      _u["active_skin"])
+check("refund keeps every bp_claims row",
+      db.q1("SELECT COUNT(*) c FROM bp_claims WHERE user_id = ?", (_RF,))["c"]
+      == _claims_rf, _claims_rf)
+# и это не теория: повторная покупка не даёт забрать те же уровни ещё раз
+db.exec("INSERT INTO purchases (user_id, item_key, stars_amount, tg_payment_id, "
+        "status, created_at) VALUES (?, 'bp_premium', ?, 'charge-bp-scarce-2', 'paid', ?)",
+        (_RF, cfg.BP_PREMIUM_STARS, time.time()))
+gl.fulfill_charge("charge-bp-scarce-2")
+r = _claim(_RF, _HRF, cfg.BP_PREMIUM_CELL_LEVELS[0])
+check("re-buying cannot double-claim a level", r.status_code == 400
+      and r.json()["detail"] == "err_claimed", r.text[:120])
+
+# --- накопленное на взятых уровнях: витрина момента покупки ---
+# Клейм ретроактивен, поэтому у игрока без пасса к середине сезона лежит готовая
+# куча. Если посчитать её мимо bp_reward, показанное разойдётся с выданным — а
+# это ровно то число, за которое человек платит.
+_LK = UID + 7300
+_HLK = _mkuser(_LK, "bplocked")
+_lk_level = 10
+db.update_user(_LK, bp_xp=cfg.bp_total_xp(_lk_level), bp_premium=0)
+_lk_inc = gl.hourly_income(_LK)
+# забранные премиум-уровни у игрока БЕЗ пасса — не выдумка: ровно так выглядит
+# аккаунт после возврата звёзд, отметки клейма переживают отзыв права
+_lk_claimed = {3, 4}
+for _l in sorted(_lk_claimed):
+    db.exec("INSERT INTO bp_claims (user_id, season_id, track, level, claimed_at) "
+            "VALUES (?, ?, 'premium', ?, ?)",
+            (_LK, gl.current_season(), _l, time.time()))
+_lp = gl.bp_locked_premium(_LK, _lk_level, _lk_claimed, _lk_inc)
+_want = [cfg.bp_reward(l, True, _lk_inc)
+         for l in range(1, _lk_level + 1) if l not in _lk_claimed]
+check("locked counts every unclaimed reached level",
+      _lp["levels"] == len(_want), str(_lp))
+check("locked cookies match the track",
+      abs(_lp["cookies"] - sum(x["cookies"] for x in _want)) < 1e-6, str(_lp))
+check("locked energy matches the track",
+      _lp["energy"] == sum(x["energy"] for x in _want), str(_lp))
+check("locked cells match the track",
+      _lp["cells"] == sum(x["cells"] for x in _want), str(_lp))
+# уровень 12 не взят — его оффлайн-час в кучу попасть не имеет права
+check("locked stops at the reached level",
+      _lp["offline_hours"] == 0.0 and _lp["skins"] == 0, str(_lp))
+r = c.get("/api/battlepass", headers=_HLK)
+check("GET shows the pile to a non-owner",
+      r.status_code == 200 and r.json()["locked_premium"]["levels"] == len(_want),
+      r.text[:200])
+db.update_user(_LK, bp_premium=1)
+r = c.get("/api/battlepass", headers=_HLK)
+_lp_own = r.json()["locked_premium"]
+check("owner has nothing locked", all(not _lp_own[k] for k in _lp_own), str(_lp_own))
+
+# --- регрессия ценности: пасс обязан заметно бить ящик печенек за Star ---
+# ЭТО ИМЕННО ТА ОШИБКА, из-за которой блок написан. Считаем в часах дохода на
+# одну звезду — единственной валюте, в которой обе покупки сравнимы.
+_INC = 1_000_000.0        # доход, при котором bp_reward уходит в scaled-ветку
+_prem_h = sum(cfg.bp_reward(l, True, _INC)["cookies"]
+              for l in range(1, cfg.BP_MAX_LEVEL + 1)) / _INC
+_free_h = sum(cfg.bp_reward(l, False, _INC)["cookies"]
+              for l in range(1, cfg.BP_MAX_LEVEL + 1)) / _INC
+check("value guard reads the income branch, not the constant floor",
+      _prem_h * _INC > 400 * cfg.BP_MAX_LEVEL * (cfg.BP_MAX_LEVEL + 1) / 2,
+      f"{_prem_h:.3f} ч")
+_crate = cfg.SHOP_ITEMS["cookies_crate"]
+_crate_per_star = _crate[3]["income_hours"] / _crate[2]
+# Дефицит оцениваем по САМОЙ НИЗКОЙ планке, которую игра сама за него назначила:
+# клетка — по BP_CELL_FALLBACK_HOURS (столько платят, когда клетка мертва, и в
+# конфиге прямо написано, что живая стоит дороже), оффлайн-час — по одной
+# сработке за сезон (реально их 14, по одной за ночь). Скин считаем за ноль:
+# ценность статусная. Если пасс не выигрывает даже на таких числах — он снова
+# стал пачкой печенек по цене пачки печенек.
+_scarce_h = (len(cfg.BP_PREMIUM_CELL_LEVELS) * cfg.BP_CELL_FALLBACK_HOURS
+             + sum(cfg.BP_PREMIUM_OFFLINE_LEVELS.values()))
+_pass_per_star = (_prem_h - _free_h + _scarce_h) / cfg.BP_PREMIUM_STARS
+check("premium pass is worth clearly more per Star than the cookie crate",
+      _pass_per_star >= 2 * _crate_per_star,
+      f"пасс {_pass_per_star:.4f} против ящика {_crate_per_star:.4f} ч/Star")
+# Обратная сторона того же инварианта: догонять ящик ПЕЧЕНЬКАМИ нельзя. Печенька
+# — производная дохода, и накрутка её числа в пассе просто дублирует ящик
+# дешевле, каннибализируя его вместо того, чтобы продавать дефицит.
+check("cookies alone still lose to the crate",
+      (_prem_h - _free_h) / cfg.BP_PREMIUM_STARS < _crate_per_star,
+      f"печеньки пасса {(_prem_h - _free_h) / cfg.BP_PREMIUM_STARS:.4f} ч/Star")
+# Бесплатная выдача пасса за рефералов конкурирует с покупкой напрямую: при
+# REF_QUALIFY_LEVEL набрать порог заметно дешевле ста звёзд, поэтому порог
+# обязан оставаться высоким — иначе дефицит раздаётся даром.
+check("referral milestone does not undercut the paid pass",
+      cfg.REF_MILESTONES["refs_premium"]["count"] >= 50,
+      cfg.REF_MILESTONES["refs_premium"]["count"])
+
+for _u in (_BP, _CAP, _RF, _LK):
+    db.exec("DELETE FROM bp_claims WHERE user_id = ?", (_u,))
+    db.exec("DELETE FROM entitlements WHERE user_id = ?", (_u,))
+db.exec("DELETE FROM referrals WHERE referrer_id = ?", (_CAP,))
+
+
 # ================= закваска и ивенты =================
 
 # --- рецепт: рано / в окне / подгорело ---

@@ -177,6 +177,13 @@ class DataBase:
                 'bp_premium': 'INTEGER DEFAULT 0',
                 # премиум, купленный на стыке сезонов, переносится в новый сезон
                 'bp_premium_next': 'INTEGER DEFAULT 0',
+                # Дефицитные награды премиум-трека. Денормализованы в users, а не
+                # считаются по bp_claims: их читает merge_cells_unlocked_for на
+                # КАЖДОМ ходе доски и collect_offline на каждом сборе, а это
+                # лишний JOIN в самом горячем пути. Сезонные — гаснут вместе с
+                # пассом в _SEASON_RESET_SQL
+                'bp_bonus_cells': 'INTEGER DEFAULT 0',      # +клетки доски на сезон
+                'bp_offline_hours': 'REAL DEFAULT 0',       # +часы оффлайн-капа на сезон
                 # УСТАРЕЛИ: забранные награды пасса переехали в bp_claims
                 # (см. _backfill_bp_claims). Колонки не читаются и не пишутся, но
                 # оставлены — их данные единственный след истории до миграции.

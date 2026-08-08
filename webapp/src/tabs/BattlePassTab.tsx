@@ -100,7 +100,11 @@ export default function BattlePassTab() {
   // Накопленное за уже взятые уровни — момент конверсии: пас продаёт не «награды
   // когда-нибудь», а вот эту готовую пачку, которая выдаётся в секунду покупки.
   // Здесь карточка широкая, поэтому в отличие от трека пишем словами.
-  const lp = bp.locked_premium
+  // Дефолт, а не bp.locked_premium напрямую: у клиента, открытого до выкладки
+  // сервера с этим полем, вкладка иначе падала бы целиком на lp.levels
+  const lp: BPLockedPremium = bp.locked_premium ?? {
+    levels: 0, cookies: 0, energy: 0, cells: 0, offline_hours: 0, skins: 0,
+  }
   const lockedItems: string[] = []
   if (lp.cookies) lockedItems.push(`🍪 ${fmt(lp.cookies)}`)
   if (lp.energy) lockedItems.push(`⚡ +${lp.energy}`)

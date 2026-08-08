@@ -75,8 +75,9 @@ def _farm_payload(tg: dict) -> dict:
             "owned": key in owned_skins,
             "active": (user["active_skin"] or "classic") == key,
         })
-    # эксклюзивные скины (за рефералов) показываем только владельцам
-    for key, s in cfg.REF_EXCLUSIVE_SKIN.items():
+    # эксклюзивные скины (за рефералов и за премиум-пасс) показываем только
+    # владельцам: купить их нельзя, поэтому в витрине им делать нечего
+    for key, s in {**cfg.REF_EXCLUSIVE_SKIN, **cfg.BP_EXCLUSIVE_SKIN}.items():
         if key in owned_skins:
             skins.append({
                 "key": key, "cost": 0, "emoji": s["emoji"], "req_level": 1,
