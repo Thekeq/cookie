@@ -571,8 +571,41 @@ def inherited_socket() -> socket.socket | None:
     sock = socket.socket(fileno=3)
     # воркерам сокет достаётся через fork/spawn — иначе дети остались бы без него
     sock.set_inheritable(True)
+    check_listen_address(sock)
     logging.info("Слушающий сокет получен от systemd: %s", sock.getsockname())
     return sock
+
+
+def check_listen_address(sock: socket.socket) -> None:
+    """Сверка того, что слушает systemd, с тем, что записано в .env.
+
+    Под socket activation адрес задан в ListenStream, а HOST/PORT из .env на
+    него больше не влияют — и это ловушка. `settings.problems()` ругается на
+    TRUSTED_PROXY=1 при HOST=0.0.0.0, но с сокет-юнитом можно написать в .env
+    HOST=127.0.0.1, оставить в юните 0.0.0.0 и получить открытый наружу порт
+    при полной тишине проверок: с доверием к CF-Connecting-IP это значит, что
+    лимит по IP выбирает себе сам отправитель.
+
+    Порт сверяется отдельно: по settings.PORT ходят проверки состояния и
+    канарейка, и разъехавшийся порт выглядит как «сервис лежит».
+
+    Это предупреждения, а не отказ, ровно по той же причине, что и в
+    settings.problems(): закрыт ли порт файрволом, из процесса не видно, а
+    ронять единственную рабочую конфигурацию по догадке нельзя."""
+    try:
+        host, port = sock.getsockname()[:2]
+    except (OSError, ValueError):  # не IP-сокет (unix) — сверять нечего
+        return
+    if port != settings.PORT:
+        logging.warning("КОНФИГ: systemd слушает порт %s, а в .env PORT=%s — "
+                        "проверки состояния и канарейка ходят по PORT",
+                        port, settings.PORT)
+    loopback = host in ("127.0.0.1", "::1")
+    if settings.TRUSTED_PROXY and not loopback:
+        logging.warning("КОНФИГ: systemd слушает %s при TRUSTED_PROXY=1 — если "
+                        "порт доступен мимо Cloudflare, любой подделает себе "
+                        "IP заголовком и обойдёт лимит; в ListenStream нужен "
+                        "127.0.0.1 либо закрытый файрволом порт", host)
 
 
 async def run_api():

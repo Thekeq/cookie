@@ -572,6 +572,7 @@ print("\n=== 13bis. Слушающий сокет от systemd (окно рес�
 import asyncio
 import socket as _socket
 import threading as _threading
+from types import SimpleNamespace
 
 import uvicorn
 
@@ -659,8 +660,36 @@ import pathlib as _pl
 
 _sock_unit = _pl.Path("deploy", "cookie-api.socket").read_text(encoding="utf-8")
 _api_unit = _pl.Path("deploy", "cookie-api.service").read_text(encoding="utf-8")
-check("13bis.8 сокет-юнит слушает порт из .env",
-      f"ListenStream=0.0.0.0:{_settings.PORT}" in _sock_unit)
+check("13bis.8 сокет-юнит слушает петлю, а не весь мир (наружу ходят через "
+      "Cloudflare, и TRUSTED_PROXY=1 при открытом порте отдаёт лимит по IP)",
+      f"ListenStream=127.0.0.1:{_settings.PORT}" in _sock_unit)
+
+
+def _listen_warnings(addr, trusted):
+    """Что скажет check_listen_address про такой адрес и такой TRUSTED_PROXY."""
+    saved = _settings.TRUSTED_PROXY
+    _settings.TRUSTED_PROXY = trusted
+    said = []
+    real = main_module.logging.warning
+    main_module.logging.warning = lambda msg, *a: said.append(msg % a)
+    try:
+        main_module.check_listen_address(SimpleNamespace(getsockname=lambda: addr))
+    finally:
+        main_module.logging.warning = real
+        _settings.TRUSTED_PROXY = saved
+    return said
+
+
+# HOST из .env под socket activation ни на что не влияет, и проверка в
+# settings.problems() про TRUSTED_PROXY молчит: адрес теперь в юните
+check("13bis.12 открытый наружу сокет при TRUSTED_PROXY=1 виден в логе",
+      any("TRUSTED_PROXY" in w for w in
+          _listen_warnings(("0.0.0.0", _settings.PORT), True)))
+check("13bis.13 петля при TRUSTED_PROXY=1 претензий не вызывает",
+      _listen_warnings(("127.0.0.1", _settings.PORT), True) == [])
+check("13bis.14 разъехавшийся порт замечен (проверки состояния ходят по PORT)",
+      any("PORT" in w for w in
+          _listen_warnings(("127.0.0.1", _settings.PORT + 1), False)))
 check("13bis.9 сервис требует сокет, а не надеется на него",
       "Requires=cookie-api.socket" in _api_unit
       and "After=cookie-api.socket" in _api_unit)
@@ -672,7 +701,6 @@ check("13bis.11 очередь рассчитана на окно рестарт
 print("\n=== 14. Webhook: маршрут, секрет, регистрация ===")
 import asyncio
 import pathlib as _pathlib
-from types import SimpleNamespace
 
 from fastapi import FastAPI
 
