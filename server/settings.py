@@ -83,6 +83,23 @@ def _hosts() -> list[str]:
 
 ALLOWED_HOSTS = _hosts()
 
+# Верить ли заголовкам о том, КТО прислал запрос. По умолчанию — нет.
+#
+# Боевая схема: игрок -> Cloudflare -> uvicorn, nginx между ними нет. Настоящий
+# адрес игрока при этом виден только в заголовке (`CF-Connecting-IP`): в
+# `request.client.host` лежит адрес того, кто пришёл К НАМ, — это либо туннель
+# на 127.0.0.1, либо пограничный узел Cloudflare. Пока заголовку не верят,
+# лимитер считает всех игроков ОДНИМ адресом, и анонимный лимит они выжигают
+# друг другу: один перебор промокодов закрывает вход всем остальным.
+#
+# Чем грозит включение вслепую. Заголовок ставит кто угодно. Если до процесса
+# можно достучаться МИМО Cloudflare (порт открыт наружу, HOST=0.0.0.0 без
+# файрвола), то с TRUSTED_PROXY=1 отправитель сам выбирает себе адрес и берёт
+# чистый счётчик на КАЖДЫЙ запрос — лимит по IP не ослабевает, а перестаёт
+# существовать вовсе. Включать можно ровно тогда, когда иначе как через
+# Cloudflare до приложения не дойти (туннель на localhost или закрытый файрвол).
+TRUSTED_PROXY = _b("TRUSTED_PROXY")
+
 # ---------- Дев-режим ----------
 DEV_MODE = _b("DEV_MODE")
 DEV_URL = _s("DEV_URL", "http://127.0.0.1:8000")
@@ -183,6 +200,7 @@ def summary() -> str:
         f"db={'postgres' if DATABASE_URL else DATABASE_PATH}",
         f"redis={'on' if REDIS_URL else 'off (in-process)'}",
         f"logs={'json' if LOG_JSON else 'text'}",
+        f"proxy={'trusted' if TRUSTED_PROXY else 'off'}",
         f"metrics={'on' if METRICS_TOKEN else 'off'}",
         f"sentry={'on' if SENTRY_DSN else 'off'}",
         f"backup={'offsite' if BACKUP_UPLOAD_CMD else 'local-only'}"
@@ -249,6 +267,14 @@ def problems() -> list[tuple[str, bool]]:
     if WEB_CONCURRENCY > 1 and BOT_MODE == "polling":
         out.append(("WEB_CONCURRENCY > 1 при BOT_MODE=polling: апдейты будет "
                     "тянуть каждый воркер, Telegram отдаст их случайному", True))
+    if TRUSTED_PROXY and HOST == "0.0.0.0":
+        # Предупреждение, а не отказ: закрыт ли порт файрволом, из процесса не
+        # видно, и запретить единственную рабочую конфигурацию по догадке
+        # нельзя. Но сочетание опасное — с доверием к заголовку и открытым
+        # наружу портом адрес игрока выбирает сам отправитель.
+        out.append(("TRUSTED_PROXY=1 при HOST=0.0.0.0: если порт доступен мимо "
+                    "Cloudflare, любой подделает себе IP заголовком и обойдёт "
+                    "лимит — слушать надо 127.0.0.1 или закрыть порт", False))
     if DATABASE_URL and not DATABASE_URL.startswith(
             ("postgresql://", "postgres://")):
         # опечатка вроде sqlite:///data.db в этом ключе не «включит SQLite», а

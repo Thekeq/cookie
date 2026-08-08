@@ -6,6 +6,7 @@ all) и BOT_MODE (polling / webhook). Дефолт остался прежним
 import asyncio
 import hmac
 import logging
+import mimetypes
 import os
 import time
 from contextlib import asynccontextmanager
@@ -277,16 +278,22 @@ HSTS = "max-age=15552000; includeSubDomains"
 async def security_headers(request: Request, call_next):
     """Заголовки безопасности на КАЖДЫЙ ответ, включая ошибки и статику.
 
-    Дублируются в deploy/nginx-cookie.conf. Это не лишняя работа: nginx
-    защищает то, что раздаёт он, а приложение — то, что оно отдаёт при прямом
-    обращении (дев-режим, канарейка, порт 8000, открытый мимо прокси)."""
+    Единственное место, где они ставятся: перед приложением стоит Cloudflare, а
+    не свой веб-сервер, и своего конфига, куда их можно было бы положить, нет
+    вовсе. Отсюда и место в цепочке: регистрируется ПОСЛЕ CORS, лимита тела и
+    TrustedHost и потому оказывается снаружи них (Starlette кладёт новое
+    middleware в начало цепочки). Заголовки получают в том числе 400 от
+    TrustedHost, 413 от лимита тела и предзапросы CORS — иначе голым уходил бы
+    ровно тот ответ, который сгенерирован не роутером."""
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Content-Security-Policy", CSP)
     # HSTS имеет смысл только на https и только там его и ставим: на локальном
     # http браузер его игнорирует, а вот забытый на дев-домене max-age
-    # запоминается всерьёз
+    # запоминается всерьёз. Заголовок ставит Cloudflare (сам процесс слушает
+    # обычный http); подделать его может и клиент, но HSTS, приехавший по
+    # незащищённому соединению, браузер обязан выбросить — подделка бесполезна.
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     if proto == "https":
         response.headers.setdefault("Strict-Transport-Security", HSTS)
@@ -472,10 +479,54 @@ async def metrics(request: Request):
                              media_type="text/plain; version=0.0.4")
 
 
+# Кеш на год + immutable. Безопасен ровно потому, что имя файла содержит хеш
+# содержимого (assets/, см. webapp/vite.config.ts) или версию семейства
+# (fonts/rubik-v31-…): изменилось содержимое — изменился URL, и старый ответ в
+# кеше никому не мешает. Файлу со СТАБИЛЬНЫМ именем такое ставить нельзя —
+# отозвать год из чужого браузера нечем.
+IMMUTABLE = "public, max-age=31536000, immutable"
+_IMMUTABLE_DIRS = frozenset({"assets", "fonts"})
+
+# Тип содержимого для шрифтов: таблицу mime брал веб-сервер из своей mime.types,
+# а StaticFiles берёт из mimetypes, и там woff2 есть не везде (на Windows тип
+# приходит из реестра и оказывается text/plain). Вместе с nosniff это ровно тот
+# случай, ради которого nosniff и ставят, — поэтому тип задаём явно.
+mimetypes.add_type("font/woff2", ".woff2")
+mimetypes.add_type("font/woff", ".woff")
+
+
+class MiniAppStatic(StaticFiles):
+    """Собранный фронт + политика кеша на него.
+
+    Раньше статику раздавал веб-сервер перед приложением, и Cache-Control
+    ставил он. Его нет: игрок ходит через Cloudflare прямо в uvicorn, то есть
+    файлы отдаёт вот этот класс. Без заголовка браузер решает срок кеша сам, по
+    догадке из Last-Modified, и хешированный бандл, который не изменится
+    никогда, перекачивается заново.
+
+    index.html — наоборот, `no-cache`: в нём лежат ссылки на хешированные
+    бандлы. Закешированный старый index указывает на файлы, которых после
+    выкладки уже нет, и это не «устаревшая версия», а белый экран. no-cache не
+    запрещает хранить — он требует переспросить, и ETag превращает переспрос в
+    304 без тела.
+
+    Остальное (sfx/*.mp3) остаётся как есть: имена стабильные, содержимое тоже,
+    и год кеша тут был бы обещанием, которое нечем взять назад."""
+
+    def file_response(self, full_path, *args, **kwargs):
+        response = super().file_response(full_path, *args, **kwargs)
+        name = os.path.basename(str(full_path))
+        if os.path.basename(os.path.dirname(str(full_path))) in _IMMUTABLE_DIRS:
+            response.headers["Cache-Control"] = IMMUTABLE
+        elif name.endswith(".html"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 # собранный фронт (webapp/dist) раздаём как статику с корня
 DIST = os.path.join(os.path.dirname(__file__), "webapp", "dist")
 if os.path.isdir(DIST):
-    app.mount("/", StaticFiles(directory=DIST, html=True), name="webapp")
+    app.mount("/", MiniAppStatic(directory=DIST, html=True), name="webapp")
 
 
 async def run_bot():

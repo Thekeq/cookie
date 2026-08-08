@@ -16,29 +16,48 @@
    latin + latin-ext (en) и cyrillic (ru/uk). Arabic, hebrew,
    devanagari, vietnamese выкинуты.
 
-   ВАЖНО: у Baloo 2 кириллицы нет в принципе — Google её и не
-   отдавал. Русские и украинские заголовки как падали на системный
-   шрифт, так и падают; это не регресс self-hosting'а.
+   Display-шрифт — Nunito, а не Baloo 2. Причина ровно одна: у Baloo 2
+   кириллицы нет в принципе (Google её и не отдавал), и русские с
+   украинскими заголовками падали на системный шрифт. Проверено по
+   css2-API: Baloo 2 отдаёт devanagari/vietnamese/latin-ext/latin,
+   Fredoka — hebrew/latin-ext/latin, кириллицы нет ни у той, ни у
+   другой. Из кандидатов с кириллицей Nunito ближе всех к Baloo 2 по
+   характеру: скруглённые окончания, высокий x-height, ось веса до 900
+   (Comfortaa — монолинейная геометрия с потолком 700, на кнопках-
+   печеньках выглядит тонкой и чужой).
+
+   Семейство одно на всю латиницу и кириллицу намеренно. Схема
+   «Baloo 2 на латиницу + другое семейство на кириллицу» разваливается
+   на первой же смешанной строке: «Собрать 1.2K» и «Уровень 12» —
+   это буквы из одного шрифта и цифры из другого, с разными метриками.
 
    font-display: swap — текст виден сразу системным шрифтом и
    перерисовывается, когда приедет woff2; блокировать первый кадр
    ради начертания в кликере незачем.
    ------------------------------------------------------------ */
 @font-face {
-  font-family: 'Baloo 2';
+  font-family: 'Nunito';
   font-style: normal;
-  font-weight: 400 800;
+  font-weight: 400 900;
   font-display: swap;
-  src: url('/fonts/baloo2-v23-latin.woff2') format('woff2');
+  src: url('/fonts/nunito-v32-latin.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-  font-family: 'Baloo 2';
+  font-family: 'Nunito';
   font-style: normal;
-  font-weight: 400 800;
+  font-weight: 400 900;
   font-display: swap;
-  src: url('/fonts/baloo2-v23-latin-ext.woff2') format('woff2');
+  src: url('/fonts/nunito-v32-latin-ext.woff2') format('woff2');
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Nunito';
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url('/fonts/nunito-v32-cyrillic.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
 }
 @font-face {
   font-family: 'Rubik';
@@ -84,7 +103,7 @@
   --baked: #b0691f;         /* румяная корка */
   --chip: #4a2a0c;          /* шоколад */
   --radius: 18px;
-  --font-display: 'Baloo 2', -apple-system, sans-serif;
+  --font-display: 'Nunito', -apple-system, sans-serif;
   --font-body: 'Rubik', -apple-system, 'Segoe UI', Roboto, sans-serif;
 }
 

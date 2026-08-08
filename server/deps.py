@@ -134,20 +134,41 @@ RATE_LIMIT_EXEMPT = frozenset({
     "/livez", "/readyz", "/healthz", "/metrics", settings.WEBHOOK_PATH,
 })
 
-# Кому верим, когда он представляется чужим адресом. X-Forwarded-For ставит
-# кто угодно: приняв его от произвольного клиента, мы бы дали ему бесконечный
-# запас «разных IP» — то есть отключили бы лимит для анонимов ровно там, где
-# он единственный. Заголовок читается только от локального nginx.
+# Кому верим, когда он представляется чужим адресом. Заголовок с адресом
+# ставит кто угодно: приняв его от произвольного клиента, мы бы дали ему
+# бесконечный запас «разных IP» — то есть отключили бы лимит для анонимов ровно
+# там, где он единственный.
+#
+# Локальный сосед по машине — это либо туннель Cloudflare (cloudflared держит
+# соединение наружу и ходит к нам на 127.0.0.1), либо сам сервис: снаружи так
+# не представишься, пакет с чужого адреса до петлевого интерфейса не доедет.
+# Всё остальное — только с явным TRUSTED_PROXY (см. settings).
 TRUSTED_PROXIES = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
 
 def client_ip(request: Request) -> str:
-    """Адрес игрока с точки зрения лимитера."""
+    """Адрес игрока с точки зрения лимитера.
+
+    За Cloudflare `request.client.host` — это адрес прокси, а не игрока, и без
+    заголовка все игроки схлопываются в один счётчик: анонимный лимит они
+    выжигают друг другу.
+
+    Порядок источников не косметический. `CF-Connecting-IP` Cloudflare
+    ПЕРЕЗАПИСЫВАЕТ своим значением, а `X-Forwarded-For` — дописывает: пришедшее
+    от клиента остаётся в начале списка, поэтому первый элемент выбирает сам
+    отправитель, а последний ставит прокси. Отсюда `[-1]`, а не `[0]` — со
+    старым `[0]` строка `X-Forwarded-For: 1.2.3.4` давала свежий IP на каждый
+    запрос. `X-Real-IP` не читаем вовсе: его ставил nginx, которого больше нет,
+    а Cloudflare чужой заголовок с таким именем пропускает как есть.
+    """
     peer = (request.client.host if request.client else "") or "-"
-    if peer in TRUSTED_PROXIES:
-        fwd = (request.headers.get("x-real-ip")
-               or request.headers.get("x-forwarded-for", "").split(",")[0])
-        fwd = fwd.strip()
+    if settings.TRUSTED_PROXY or peer in TRUSTED_PROXIES:
+        fwd = request.headers.get("cf-connecting-ip", "").strip()
+        if not fwd:
+            hops = [p.strip() for p
+                    in request.headers.get("x-forwarded-for", "").split(",")]
+            hops = [p for p in hops if p]
+            fwd = hops[-1] if hops else ""
         if fwd:
             return fwd[:64]
     return peer[:64]

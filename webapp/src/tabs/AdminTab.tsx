@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { fmt, useGame } from '../App'
+import { useBusy } from '../useBusy'
+import Spinner from './Spinner'
 
 interface Promo {
   code: string
@@ -63,6 +65,11 @@ export default function AdminTab() {
   const [sTitle, setSTitle] = useState('')
   const [bcText, setBcText] = useState('')
   const [bcBusy, setBcBusy] = useState(false)
+  // Двойной тап по «Создать» выдавал два промокода / две source-ссылки, а это
+  // уже лишние награды, а не косметика. Тот же useBusy, что и в остальных
+  // вкладках; рассылка живёт на своём bcBusy — её «занятость» тянется на всё
+  // время опроса прогресса, а не на один запрос.
+  const { busy, run } = useBusy()
 
   const load = () => {
     api.get('/api/admin/stats').then(setStats)
@@ -73,7 +80,7 @@ export default function AdminTab() {
     load()
   }, [])
 
-  const createPromo = async () => {
+  const createPromo = () => run('promo', async () => {
     try {
       await api.post('/api/admin/promo', {
         code: pCode,
@@ -86,14 +93,14 @@ export default function AdminTab() {
     } catch (e: any) {
       toast(e.detail || 'Ошибка', true)
     }
-  }
+  })
 
   const togglePromo = async (code: string, active: boolean) => {
     await api.post('/api/admin/promo/toggle', { code, active })
     load()
   }
 
-  const createSource = async () => {
+  const createSource = () => run('source', async () => {
     try {
       const r = await api.post('/api/admin/sources', { code: sCode, title: sTitle })
       toast('Ссылка создана ✅')
@@ -104,7 +111,7 @@ export default function AdminTab() {
     } catch (e: any) {
       toast(e.detail || 'Ошибка', true)
     }
-  }
+  })
 
   const sendBroadcast = async (test: boolean) => {
     if (!bcText.trim() || bcBusy) return
@@ -282,8 +289,8 @@ export default function AdminTab() {
           <input className="field" placeholder="Макс. использований (0=∞)" value={pUses}
                  onChange={(e) => setPUses(e.target.value)} inputMode="numeric" />
         </div>
-        <button className="btn" onClick={createPromo} disabled={!pCode.trim()}>
-          Создать
+        <button className="btn" onClick={createPromo} disabled={!pCode.trim() || busy !== null}>
+          {busy === 'promo' ? <Spinner /> : 'Создать'}
         </button>
         {promos.map((p) => (
           <div className="row" key={p.code} style={{ padding: '8px 0', fontSize: 13 }}>
@@ -306,8 +313,8 @@ export default function AdminTab() {
                value={sCode} onChange={(e) => setSCode(e.target.value)} />
         <input className="field" placeholder="Название (TikTok реклама #1)" value={sTitle}
                onChange={(e) => setSTitle(e.target.value)} />
-        <button className="btn" onClick={createSource} disabled={!sCode.trim()}>
-          Создать ссылку
+        <button className="btn" onClick={createSource} disabled={!sCode.trim() || busy !== null}>
+          {busy === 'source' ? <Spinner /> : 'Создать ссылку'}
         </button>
         {sources.map((s) => (
           <div key={s.code} style={{ padding: '8px 0', fontSize: 13 }}>

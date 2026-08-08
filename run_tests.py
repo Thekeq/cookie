@@ -27,6 +27,7 @@ if hasattr(sys.stdout, "reconfigure"):
 SUITES = (
     "test_dialect.py",        # перевод схемы: SQLite -> PostgreSQL
     "test_db_core.py",        # слой доступа к базе: транзакции, ретраи, снимки
+    "test_migrations.py",     # миграции: замок на старте, копирование пачками
     "test_economy.py",        # книга операций, идемпотентность, сверка
     "test_board_economy.py",  # доска, ферма, дуэли, рецепты
     "test_concurrency.py",    # гонки: параллельные клеймы и покупки

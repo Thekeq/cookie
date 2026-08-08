@@ -65,7 +65,11 @@ DAILY_CAP = 4
 MIN_GAP_S = 45 * 60
 CATEGORY_CAP = {
     "recipe": 2,        # готово + подгорает
-    "duel": 2,          # заканчивается + результат
+    # Три, а не два: соперник найден, час до конца, итог. Дуэль длится сутки, и
+    # при лимите в два «соперник найден» съедал бы место у итога — а итог
+    # единственный из трёх, за которым игрока действительно зовут: приз
+    # забирают руками, сам он не начислится.
+    "duel": 3,
     "order": 1,
     "season": 1,
     "event": 1,
@@ -105,12 +109,20 @@ TTL_DAYS = 14
 
 # Категория и цель диплинка на каждый вид. Вкладки Mini App: clicker, merge,
 # bakery, farm, progress, profile; у progress и profile есть ещё сегменты.
+# Дуэль живёт внутри progress/top — туда же ведут все три дуэльных вида.
+#
+# «Сколько событие живёт» — это возраст СТРОКИ, а не время до отправки, и для
+# заранее запланированных видов разница принципиальна: duel_ending ложится в
+# очередь в момент старта дуэли, а уходит сутки спустя, поэтому его TTL обязан
+# покрывать всю дуэль целиком. Возрастом его свежесть и не измеряется — она
+# измеряется самой дуэлью (см. still_relevant).
 KINDS: dict[str, tuple[str, str, str, float]] = {
     # kind: (категория, вкладка, сегмент, сколько событие живёт)
     "recipe_ready":   ("recipe",   "farm",     "",      6 * 3600),
     "recipe_burning": ("recipe",   "farm",     "",      2 * 3600),
     "offline_cap":    ("offline",  "farm",     "",      12 * 3600),
-    "duel_ending":    ("duel",     "progress", "top",   3 * 3600),
+    "match_found":    ("duel",     "progress", "top",   12 * 3600),
+    "duel_ending":    ("duel",     "progress", "top",   (cfg.DUEL_HOURS + 2) * 3600),
     "duel_result":    ("duel",     "progress", "top",   48 * 3600),
     "order_waiting":  ("order",    "bakery",   "",      12 * 3600),
     "season_end":     ("season",   "progress", "top",   24 * 3600),
@@ -120,6 +132,12 @@ KINDS: dict[str, tuple[str, str, str, float]] = {
     "streak":         ("legacy",   "clicker",  "",      4 * 3600),
     "energy_full":    ("legacy",   "clicker",  "",      12 * 3600),
 }
+
+# За сколько до конца дуэли предупреждать. Строку ставит сам модуль дуэлей
+# (server/duels.py) в момент старта — сразу на будущее время. Планировщику
+# иначе пришлось бы каждые 15 минут перебирать активные дуэли ради события,
+# время которого известно с первой секунды.
+DUEL_ENDING_LEAD_S = 3600
 
 # Виды, которые не тревожат игрока, если он только что был в игре: интерфейс
 # показал бы ему это сам. Дуэль, конец сезона и старт ивента сюда не входят —
@@ -144,6 +162,14 @@ TEXTS: dict[str, dict[str, str]] = {
               "to collect the bonus!",
         "uk": "🔥 Тісто ось-ось підгорить — менше години, щоб забрати бонус!",
         "ru": "🔥 Тесто вот-вот подгорит — меньше часа, чтобы забрать бонус!",
+    },
+    "match_found": {
+        "en": "⚔️ An opponent has been found — the duel is on! You have {hours} h "
+              "to out-bake them 🍪",
+        "uk": "⚔️ Суперника знайдено — дуель почалася! У тебе {hours} год, "
+              "щоб перепекти його 🍪",
+        "ru": "⚔️ Соперник найден — дуэль началась! У тебя {hours} ч, "
+              "чтобы перепечь его 🍪",
     },
     "duel_ending": {
         "en": "⚔️ Your duel ends soon — a few more clicks may decide it!",
@@ -532,7 +558,11 @@ def still_relevant(row: dict, user: dict, now: float) -> bool:
         # отметку до секунды нельзя — «вернулся» решается сравнением, и
         # усечённое до int значение всегда меньше собственного оригинала
         return (user.get("last_seen_at") or 0) <= p.get("seen", 0)
-    if kind == "duel_ending":
+    if kind in ("match_found", "duel_ending"):
+        # дуэль ещё идёт. Строка про старт могла пролежать в тихих часах, а
+        # строка про конец лежит в очереди с самого начала дуэли — и за это
+        # время дуэль успевает закрыться досрочно, а заявка (status 'waiting')
+        # и вовсе исчезнуть из таблицы, если игрок снял поиск
         r = d.q1("SELECT status, ends_at FROM duels WHERE id = ?", (p.get("duel"),))
         return bool(r and r["status"] == "active" and r["ends_at"] > now)
     if kind == "duel_result":
@@ -705,16 +735,17 @@ def _plan_comeback(now: float) -> int:
 
 
 def _plan_duels(now: float) -> int:
-    """Дуэль заканчивается (за час до конца) и дуэль закончилась."""
+    """Итог дуэли — подстраховка к хуку в server/duels.py.
+
+    Старт дуэли и «час до конца» этот проход не ищет и искать не может: переход
+    waiting -> active виден только в момент подбора, а начатую дуэль от вчерашней
+    здесь уже не отличить. Оба сообщения ставит сам модуль дуэлей, причём
+    duel_ending — сразу на будущее время (см. DUEL_ENDING_LEAD_S).
+
+    Итог остаётся и здесь: строку мог не дописать упавший запрос, а дуэли,
+    закрытые до появления хука, не видел никто. Ключ тот же самый, поэтому
+    второй копии сообщения не будет — вставка просто ничего не сделает."""
     d, made = _db(), 0
-    ending = d.q("SELECT id, user_a, user_b, ends_at FROM duels "
-                 "WHERE status = 'active' AND ends_at > ? AND ends_at <= ? "
-                 "LIMIT ?", (now, now + 3600, PLAN_CHUNK))
-    for row in ending:
-        for uid in (row["user_a"], row["user_b"]):
-            if uid and enqueue(uid, "duel_ending", {"duel": row["id"]},
-                               dedup_key=f"duel_ending:{row['id']}:{uid}"):
-                made += 1
     done = d.q("SELECT id, user_a, user_b, claimed_a, claimed_b FROM duels "
                "WHERE status = 'done' AND ends_at > ? "
                "AND (claimed_a = 0 OR claimed_b = 0) LIMIT ?",

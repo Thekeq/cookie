@@ -4,6 +4,8 @@ data.db
 data.db-shm
 data.db-wal
 *.db.bak
+# межпроцессный замок миграций на SQLite: создаётся рядом с базой в рантайме
+*.migrate.lock
 
 # python
 __pycache__/

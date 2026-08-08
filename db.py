@@ -101,6 +101,26 @@ class DataBase:
     # за которое залипший запрос успеет утопить базу блокировками.
     PG_STATEMENT_TIMEOUT_MS = 60_000
 
+    # Ключ межпроцессного замка миграций на PostgreSQL. Advisory-замки лежат в
+    # одном пространстве имён на всю базу, поэтому число обязано быть
+    # ПОСТОЯННЫМ (вычисляемое, скажем, из имени схемы развело бы воркеров по
+    # разным замкам, и замок перестал бы быть замком) и достаточно своим, чтобы
+    # не столкнуться с чужим кодом на той же базе. Влезает в bigint, которого
+    # ждёт pg_advisory_lock.
+    MIGRATION_LOCK_KEY = 0x600DC0071E
+
+    # Сколько ждать чужие миграции, прежде чем сдаться, с. Пять минут — заведомо
+    # больше самой долгой из них (перенос аналитики пачками, CREATE UNIQUE INDEX
+    # по таблице игроков) и заведомо меньше терпения оркестратора. Не дождавшись,
+    # процесс ПАДАЕТ, а не идёт работать: схема, которую прямо сейчас меняют, —
+    # это не та схема, под которую написан код.
+    MIGRATION_LOCK_TIMEOUT = 300.0
+
+    # Размер пачки при переносе старой таблицы events в аналитику. Порядок
+    # тысяч: меньше — лишние обороты и лишний шум в логе, больше — снова длинная
+    # блокирующая запись, ради ухода от которой пачки и заводились.
+    ANALYTICS_MIGRATION_BATCH = 2000
+
     # Журнал миграций: единственная таблица, которую создаём вручную, — на неё
     # опирается всё остальное. Держим спекой, а не строкой, чтобы DDL для неё
     # переводился тем же кодом, что и для остальных таблиц.
@@ -129,11 +149,6 @@ class DataBase:
         self._local = threading.local()
         self._memory_conn = None
         self.last_insert_id = None
-
-        # журнал применённых миграций. Создаётся ДО всего остального: на него
-        # опирается и _auto_migrate (__after_create__), и дедуп
-        self.cursor.execute(
-            self._create_table_sql("schema_migrations", self.MIGRATIONS_SCHEMA))
 
         self.tables_schema = {
             'users': {
@@ -620,6 +635,23 @@ class DataBase:
         # DDL и разовые миграции идут без предохранителя по времени: создание
         # уникального индекса по таблице игроков — законно долгая работа
         self._set_statement_timeout(ms=0)
+        # Схема правится ПОД МЕЖПРОЦЕССНЫМ ЗАМКОМ целиком, а не по миграции:
+        # гонка есть у каждой из них, а не только у переноса аналитики
+        with self._migration_lock():
+            self._migrate_schema(db_file)
+        self._set_statement_timeout(ms=self.PG_STATEMENT_TIMEOUT_MS)
+
+    def _migrate_schema(self, db_file: str):
+        """Привести схему к текущей: таблицы, колонки, индексы, разовые миграции.
+
+        Отдельным методом — чтобы у замка миграций была ровно одна точка входа.
+        Всё, что здесь делается, обязано быть идемпотентным: сюда заходит каждый
+        процесс на старте, просто по очереди.
+        """
+        # журнал применённых миграций. Создаётся ДО всего остального: на него
+        # опирается и _auto_migrate (__after_create__), и дедуп
+        self.cursor.execute(
+            self._create_table_sql("schema_migrations", self.MIGRATIONS_SCHEMA))
         self._auto_migrate()
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_board_user ON board(user_id)")
@@ -734,7 +766,6 @@ class DataBase:
         self._dedupe_and_unique(db_file)
         self._install_invariants()
         self.connection.commit()
-        self._set_statement_timeout(ms=self.PG_STATEMENT_TIMEOUT_MS)
 
     # Наборы колонок, которые обязаны быть уникальными; код и так это проверяет,
     # но параллельные запросы могли бы создать дубли — БД теперь не даст.
@@ -1017,6 +1048,104 @@ class DataBase:
 
     # ---------- миграции ----------
 
+    def _wait_for_lock(self, grab) -> None:
+        """Дождаться замка, повторяя попытку `grab()` до победы или потолка.
+
+        Ожидание вынесено из способа блокировки: и pg_try_advisory_lock, и
+        файловая блокировка умеют отвечать только «получилось или нет», а ждать
+        надо одинаково — с сообщением в лог (иначе молчащий старт выглядит
+        зависшим) и с потолком по времени."""
+        if grab():
+            return
+        log.info("миграции уже идут в соседнем процессе, ждём замок (до %.0f с)",
+                 self.MIGRATION_LOCK_TIMEOUT)
+        started = time.monotonic()
+        while time.monotonic() - started < self.MIGRATION_LOCK_TIMEOUT:
+            time.sleep(0.2)
+            if grab():
+                log.info("замок миграций получен через %.1f с",
+                         time.monotonic() - started)
+                return
+        raise RuntimeError(
+            f"Замок миграций занят дольше {self.MIGRATION_LOCK_TIMEOUT:.0f} с — "
+            f"процесс не стартует. Работать по схеме, которую прямо сейчас "
+            f"меняет соседний процесс, нельзя; проверь, не завис ли он.")
+
+    @contextmanager
+    def _migration_lock(self):
+        """Межпроцессный замок вокруг ВСЕГО прогона миграций.
+
+        Зачем он нужен. Слой БД поднимается в КАЖДОМ процессе, а при
+        WEB_CONCURRENCY > 1 воркеры стартуют одновременно. Отметка в
+        schema_migrations от гонки не спасает: она пишется ПОСЛЕ выполнения, то
+        есть все воркеры одинаково видят «не применено» и лезут мигрировать
+        разом. Для переноса аналитики это означало бы DROP TABLE events из-под
+        читающего соседа и задвоенные строки в analytics_events.
+
+        Проигравший ЖДЁТ, а не проскакивает вперёд: работать по схеме, которой
+        сейчас меняют форму, нельзя — первый же запрос ушёл бы в таблицу,
+        которой через миллисекунду не станет. Дождавшись, он перечитывает
+        отметки (см. _migration) и просто ничего не делает.
+
+        Что будет, если процесс с замком убьют. Замок снимает операционная
+        система: на PostgreSQL advisory-замок сессионный и умирает вместе с
+        соединением, на SQLite блокировка файла — вместе с дескриптором. Ни в
+        одном из случаев не остаётся «залипшего» замка, который пришлось бы
+        снимать руками; следующий старт спокойно его подберёт и догонит
+        недоделанную миграцию (она для этого идемпотентна).
+        """
+        if self.DIALECT == "postgres":
+            # statement_timeout к этому моменту уже снят (см. __init__), так что
+            # ожидание замка не убьётся предохранителем
+            key = self.MIGRATION_LOCK_KEY
+            self._wait_for_lock(
+                lambda: bool(self.q1("SELECT pg_try_advisory_lock(?) AS ok",
+                                     (key,))["ok"]))
+            try:
+                yield
+            finally:
+                # Снимаем явно, а не полагаемся на конец сессии: соединение
+                # живёт всё время жизни потока, и незакрытый замок держал бы
+                # следующие старты этой же машины
+                self.q1("SELECT pg_advisory_unlock(?) AS ok", (key,))
+            return
+
+        if self.db_file == ":memory:":
+            # у in-memory базы каждый процесс живёт в своей копии — делить нечего
+            yield
+            return
+
+        try:                       # POSIX
+            import fcntl
+            msvcrt = None
+        except ImportError:        # Windows
+            import msvcrt
+            fcntl = None
+
+        # Блокируется отдельный файл, а не сама база: блокировки самой базы
+        # берёт и снимает sqlite на каждом операторе, и опереться на них нельзя
+        path = f"{self.db_file}.migrate.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+        def grab() -> bool:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False       # занято другим процессом
+            return True
+
+        try:
+            self._wait_for_lock(grab)
+            yield
+        finally:
+            # закрытие дескриптора снимает и блокировку — на обоих семействах
+            # ОС и при любом выходе, включая исключение и kill
+            os.close(fd)
+
     def _migration(self, name: str) -> bool:
         """True, если миграция ещё не применялась к этой базе.
 
@@ -1174,17 +1303,18 @@ class DataBase:
         # Сначала — то, что аналитикой никогда не было: снимки конфига ивентов
         # и отметки kill switch жили в этой же таблице. Уехав в аналитику, они
         # были бы удалены её TTL (то есть ивент воскрес бы сам) и выгружены
-        # наружу как события, которых не было
+        # наружу как события, которых не было.
+        # NOT EXISTS — на случай, если прошлый прогон убили посреди переноса:
+        # уникального индекса на app_state.name в этот момент ещё нет (его
+        # вешает _dedupe_and_unique, он идёт после миграций), и без проверки
+        # повторный старт вставил бы снимок конфига второй раз
         state = self.exec(
             "INSERT INTO app_state (name, value, created_at) "
             "SELECT event, COALESCE(value, 0), COALESCE(created_at, 0) "
-            "FROM events WHERE event LIKE ?", (EVENT_CFG_PREFIX,))
-        moved = self.exec(
-            "INSERT INTO analytics_events (event_id, user_id, event, value, "
-            "created_at, exported_at) "
-            "SELECT 'legacy:' || id, COALESCE(user_id, 0), COALESCE(event, ''), "
-            "       COALESCE(value, 0), COALESCE(created_at, 0), 0 FROM events "
-            "WHERE event NOT LIKE ?", (EVENT_CFG_PREFIX,))
+            "FROM events WHERE event LIKE ? AND NOT EXISTS "
+            "(SELECT 1 FROM app_state s WHERE s.name = events.event)",
+            (EVENT_CFG_PREFIX,))
+        moved = self._copy_events_batched()
         # DROP, а не переименование: имя `events` не должно остаться доступным
         # ни коду, ни руке в psql — иначе первый же ручной INSERT воскресит
         # вторую систему
@@ -1192,6 +1322,82 @@ class DataBase:
         print(f"[*] Миграция: аналитика переехала в analytics_events, "
               f"перенесено строк {moved}, состояние ивентов в app_state "
               f"({state}), старая таблица events удалена")
+
+    def _copy_events_batched(self) -> int:
+        """Переносит строки events в analytics_events ПАЧКАМИ, с прогрессом.
+
+        Одним оператором по всей таблице этого делать нельзя. events росла по
+        строке на каждое открытие приложения и жила 30 дней, то есть на бою в
+        ней миллионы строк: такой INSERT ... SELECT — это минуты блокирующей
+        записи прямо в старте процесса, без единой строчки в логе. Пачками
+        старт хотя бы не выглядит зависшим, а база успевает дышать между ними
+        (каждая пачка коммитится сама — соединение в автокоммите).
+
+        Идемпотентность держится на event_id ('legacy:<id>'): убитый на
+        середине перенос догоняется повторным прогоном, а уже скопированные
+        строки отсекает ON CONFLICT DO NOTHING. Ради этого уникальный индекс
+        создаётся ЗДЕСЬ, а не позже в _dedupe_and_unique: без него у ON CONFLICT
+        нет арбитра."""
+        self._ensure_analytics_event_id_unique()
+        total = self.q1("SELECT COUNT(*) AS n FROM events WHERE event NOT LIKE ?",
+                        (EVENT_CFG_PREFIX,))["n"]
+        if not total:
+            return 0
+        log.info("миграция аналитики: переносим %d строк пачками по %d",
+                 total, self.ANALYTICS_MIGRATION_BATCH)
+        moved, low = 0, 0
+        while True:
+            # Правая граница пачки берётся по id, а не OFFSET'ом: OFFSET на
+            # каждом шаге перечитывает всё начало таблицы (перенос становится
+            # квадратичным), а окно фиксированной ШИРИНЫ по id гоняло бы пустые
+            # обороты — id разрежены, старые строки выкусывала чистилка по TTL
+            top = self.q1(
+                "SELECT MAX(id) AS top FROM (SELECT id FROM events "
+                "WHERE event NOT LIKE ? AND id >= ? ORDER BY id LIMIT ?) t",
+                (EVENT_CFG_PREFIX, low, self.ANALYTICS_MIGRATION_BATCH))["top"]
+            if top is None:
+                break                    # строк выше low не осталось
+            moved += self.exec(
+                "INSERT INTO analytics_events (event_id, user_id, event, value, "
+                "created_at, exported_at) "
+                "SELECT 'legacy:' || id, COALESCE(user_id, 0), COALESCE(event, ''), "
+                "       COALESCE(value, 0), COALESCE(created_at, 0), 0 FROM events "
+                "WHERE event NOT LIKE ? AND id >= ? AND id <= ? "
+                "ON CONFLICT (event_id) DO NOTHING",
+                (EVENT_CFG_PREFIX, low, top))
+            low = top + 1
+            # «вставлено» может отставать от «просмотрено»: на повторном прогоне
+            # часть строк уже перенесена и отсекается конфликтом. Поэтому в логе
+            # обе величины — иначе догоняющий перенос выглядит стоящим на месте
+            log.info("миграция аналитики: дошли до id %d, вставлено %d из %d",
+                     top, moved, total)
+        return moved
+
+    def _ensure_analytics_event_id_unique(self):
+        """Уникальный индекс по event_id — арбитр для ON CONFLICT DO NOTHING.
+
+        Обычно его вешает _dedupe_and_unique, но тот работает ПОСЛЕ миграций, а
+        идемпотентность переноса нужна во время. Имя то же самое, так что второй
+        раз индекс не создастся.
+
+        Дубли по event_id на этот момент бывают ровно одного происхождения:
+        недобитый прогон СТАРОГО кода, где два воркера копировали events
+        одновременно. Схлопываем их тем же правилом, что и дедуп, — выживает
+        строка с минимальным id, — иначе индекс не создать, а без индекса
+        миграция теряет идемпотентность."""
+        create = ("CREATE UNIQUE INDEX IF NOT EXISTS uq_analytics_event_id "
+                  "ON analytics_events(event_id)")
+        try:
+            self.cursor.execute(create)
+            return
+        except INTEGRITY_ERRORS:
+            pass
+        removed = self.exec(
+            "DELETE FROM analytics_events WHERE id NOT IN "
+            "(SELECT MIN(id) FROM analytics_events GROUP BY event_id)")
+        log.warning("миграция аналитики: схлопнуто %d задвоенных событий "
+                    "(след прошлой гонки воркеров)", removed)
+        self.cursor.execute(create)
 
     def _backfill_entitlements(self):
         """Записывает уже поднятый premium-пасс как право источника 'legacy'.

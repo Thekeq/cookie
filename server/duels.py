@@ -13,11 +13,14 @@
 Асинхронность здесь принципиальна: обоим игрокам не нужно быть онлайн
 одновременно, что для Mini App единственный работающий вариант.
 """
+import logging
 import time
 
 from server import game_config as cfg
 from server import game_logic as gl
 from server.game_logic import db
+
+log = logging.getLogger(__name__)
 
 
 def _prize(user_id: int) -> float:
@@ -53,18 +56,42 @@ def _norm(user_id: int, raw: float) -> float:
 
 
 def _notify(kind: str, user_ids, payload: dict) -> None:
-    """Точка врезки очереди уведомлений (server/notifications.py).
+    """Врезка очереди уведомлений (server/notifications.py).
 
-    Здесь СОЗНАТЕЛЬНО ничего не отправляется: очередь и её воркер живут в
-    другом модуле, и дуэли не имеют права знать про Telegram. Нужны эти три
-    вида:
-      match_found  — соперник найден (ловится ТОЛЬКО здесь: переход
-                     waiting -> active фоновым планировщиком не виден);
-      duel_ending  — час до конца, и duel_result — итог: оба уже планируются
-                     проходом notifications._plan_duels по строкам таблицы.
-    Когда очередь будет готова, тело функции — один вызов enqueue на игрока с
-    dedup_key вида f"{kind}:{duel_id}:{user_id}"."""
-    return None
+    Здесь по-прежнему ничего не отправляется, и это не формальность: прямая
+    отправка отсюда прошла бы мимо тихих часов игрока и частотных лимитов —
+    единственных двух вещей, которые отделяют уведомления от спама. Дуэли
+    кладут строку в очередь, а шлёт её воркер, и он же перед самой отправкой
+    переспрашивает, жива ли ещё дуэль (notifications.still_relevant).
+
+    Ключ дедупликации описывает СОБЫТИЕ, а не сообщение: f"{kind}:{id}:{uid}".
+    Повторный вызов ручки, ретрай и перезапуск планировщика дают тот же ключ, и
+    второе «соперник найден» игрок не получит никогда.
+
+    duel_ending кладётся сразу, но на БУДУЩЕЕ время — за DUEL_ENDING_LEAD_S до
+    конца дуэли. Время конца известно с первой секунды, и перебирать ради него
+    активные дуэли каждые 15 минут незачем.
+
+    Провал очереди не имеет права отменить саму дуэль: матч уже состоялся, и
+    потерянное сообщение — беда меньшая, чем откат. Поэтому исключение здесь
+    только пишется в лог."""
+    # локально, а не на импорте: очередь тянет за собой половину серверного
+    # слоя (db, obs, settings, i18n), а дуэлям она нужна ровно в трёх местах
+    from server import notifications as notif
+
+    duel_id = payload.get("duel")
+    at = None
+    if kind == "duel_ending":
+        at = float(payload.get("ends_at") or 0) - notif.DUEL_ENDING_LEAD_S
+    for uid in user_ids:
+        if not uid:
+            continue
+        try:
+            notif.enqueue(uid, kind, payload, scheduled_at=at,
+                          dedup_key=f"{kind}:{duel_id}:{uid}")
+        except Exception:                       # noqa: BLE001
+            log.warning("дуэль %s: %s не встал в очередь игроку %s",
+                        duel_id, kind, uid, exc_info=True)
 
 
 def _finish_if_due(row: dict) -> dict:
@@ -207,9 +234,16 @@ def find(user: dict) -> dict:
             if taken == 0:                   # заявку перехватил кто-то ещё
                 raise ValueError("err_duel_taken")
             gl.track("duel_start", uid)
-            # единственное место, где виден переход waiting -> active
-            _notify("match_found", (uid, foe["user_a"]),
-                    {"duel": foe["id"], "ends_at": now + cfg.DUEL_HOURS * 3600})
+            # единственное место, где виден переход waiting -> active. Оба
+            # сообщения ставим здесь же: «час до конца» тоже не с чего искать
+            # потом — начатую минуту назад дуэль от вчерашней проход по таблице
+            # уже не отличит, а её конец известен ровно сейчас
+            ends_at = now + cfg.DUEL_HOURS * 3600
+            both = (uid, foe["user_a"])
+            payload = {"duel": foe["id"], "ends_at": ends_at,
+                       "hours": cfg.DUEL_HOURS}
+            _notify("match_found", both, payload)
+            _notify("duel_ending", both, payload)
             return state(db.get_user(uid))
 
         # INSERT ... SELECT ... WHERE NOT EXISTS, а не VALUES: право встать в
